@@ -3,7 +3,8 @@ use crate::error::{CoreError, Result};
 use crate::scope::{PublishedDatagramEndpoint, PublishedStreamEndpoint, TrustScope};
 use crate::seams::access::{AccessRequest, Action, Decision, Grant};
 use crate::seams::channel::{
-    BoxedAsyncStream, DatagramChannel, DatagramForwardChannel, StreamChannel, StreamForwardChannel,
+    BoxedAsyncStream, BoxedDatagramForwardHandle, DatagramChannel, DatagramForwardChannel,
+    SetupOutcome, StreamChannel, StreamForwardChannel,
 };
 use crate::seams::edge::InboundStream;
 use crate::seams::routing::{ExplicitPath, PathSource};
@@ -20,9 +21,9 @@ use crate::types::{
     ChannelAddr, ChannelId, CircuitId, EndpointName, HopLabel, PeerId, Plane, ScopeId, TargetTag,
 };
 use crate::wire::{
-    append_stream_segment, pack_chain_segments, read_stream_reply, read_stream_segment,
-    write_stream_reply, DgramCtrlPacket, E2eHandshakeReq, E2eHandshakeResp, StreamSegmentMode,
-    StreamSetupReply,
+    append_stream_segment, pack_chain_segments, pop_chain_segment, read_stream_reply,
+    read_stream_segment, write_stream_reply, DgramCtrlPacket, E2eHandshakeReq, E2eHandshakeResp,
+    StreamSegmentMode, StreamSetupReply,
 };
 use dashmap::DashMap;
 use std::collections::HashMap;
@@ -30,7 +31,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{oneshot, Semaphore};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
 /// Minimum MTU required on a Datagram Plane carrier.
 pub const MIN_DATAGRAM_MTU: usize = 512;
@@ -41,10 +42,48 @@ enum PendingDgramOutcome {
     Reject { target_tag: TargetTag, reason: String },
 }
 
+#[derive(Clone)]
+enum SwitchTarget {
+    /// Upstream -> Downstream: transmit via the channel plugin's Grant-enforced handle.
+    ForwardHandle(BoxedDatagramForwardHandle),
+    /// Downstream -> Upstream: account against the circuit's Grant and transmit back upstream.
+    ReturnLink {
+        carrier: Arc<dyn DatagramChannel>,
+        addr: ChannelAddr,
+        handle: BoxedDatagramForwardHandle,
+    },
+}
+
+#[derive(Clone)]
+struct LabelSwitchEntry {
+    out_label: u32,
+    pair_label: u32,
+    target: SwitchTarget,
+}
+
+struct PendingHopCircuit {
+    up_label: u32,
+    down_label: u32,
+    upstream_carrier: Arc<dyn DatagramChannel>,
+    upstream_addr: ChannelAddr,
+    upstream_return_label: u32,
+    target_tag: TargetTag,
+    handle: BoxedDatagramForwardHandle,
+}
+
+struct InstalledHopCircuit {
+    upstream_carrier: Arc<dyn DatagramChannel>,
+    upstream_addr: ChannelAddr,
+    target_tag: TargetTag,
+    handle: BoxedDatagramForwardHandle,
+}
+
 /// A self-contained Confluence Node instance.
 ///
-/// Multiple independent `Node` instances can coexist in user space without shared state,
-/// host-wide privileges, or merged Trust Scopes (Cleanroom Invariant #9).
+/// Implements the Two-Plane E2E Engine and the Blind Single-Pass Multi-Hop Path Engine:
+/// - Zero application protocol parsing (Cleanroom Invariant #1).
+/// - Strict Datagram vs. Stream plane separation (Cleanroom Invariant #2).
+/// - Relay-agnostic, hop-ACL-agnostic, hop-crypto-agnostic Path Engine (Cleanroom Invariants #3, #5, #6).
 pub struct Node {
     path_source: Arc<dyn PathSource>,
     scopes_by_id: DashMap<ScopeId, Arc<TrustScope>>,
@@ -54,8 +93,12 @@ pub struct Node {
     dgram_fwd_channels: DashMap<TargetTag, Arc<dyn DatagramForwardChannel>>,
     stream_fwd_channels: DashMap<TargetTag, Arc<dyn StreamForwardChannel>>,
     dgram_sessions: Arc<DashMap<u32, Arc<ConfluenceDatagramSession>>>,
+    dgram_label_switches: Arc<DashMap<u32, LabelSwitchEntry>>,
+    pending_hop_circuits: Arc<DashMap<CircuitId, PendingHopCircuit>>,
+    installed_hop_circuits: Arc<DashMap<CircuitId, InstalledHopCircuit>>,
     pending_dgram_setups: DashMap<CircuitId, oneshot::Sender<PendingDgramOutcome>>,
     pending_ctrl_reqs: DashMap<u64, oneshot::Sender<Vec<u8>>>,
+    pending_circuit_renews: DashMap<(CircuitId, TargetTag), oneshot::Sender<Vec<u8>>>,
     next_label: AtomicU32,
     next_ctrl_req_id: AtomicU64,
     preauth_sem: Arc<Semaphore>,
@@ -80,8 +123,12 @@ impl Node {
             dgram_fwd_channels: DashMap::new(),
             stream_fwd_channels: DashMap::new(),
             dgram_sessions: Arc::new(DashMap::new()),
+            dgram_label_switches: Arc::new(DashMap::new()),
+            pending_hop_circuits: Arc::new(DashMap::new()),
+            installed_hop_circuits: Arc::new(DashMap::new()),
             pending_dgram_setups: DashMap::new(),
             pending_ctrl_reqs: DashMap::new(),
+            pending_circuit_renews: DashMap::new(),
             next_label: AtomicU32::new(1),
             next_ctrl_req_id: AtomicU64::new(1),
             preauth_sem: Arc::new(Semaphore::new(256)),
@@ -130,7 +177,10 @@ impl Node {
     }
 
     /// Attaches a Datagram Plane transport carrier and starts its packet demultiplexer loop.
-    pub fn attach_datagram_channel(self: &Arc<Self>, carrier: Arc<dyn DatagramChannel>) -> Result<()> {
+    pub fn attach_datagram_channel(
+        self: &Arc<Self>,
+        carrier: Arc<dyn DatagramChannel>,
+    ) -> Result<()> {
         let caps = carrier.caps();
         if caps.plane != Plane::Datagram {
             return Err(CoreError::PlaneMismatch {
@@ -152,7 +202,8 @@ impl Node {
             return Ok(());
         }
         let cid = carrier.id().clone();
-        self.dgram_carriers.insert(cid.clone(), Arc::clone(&carrier));
+        self.dgram_carriers
+            .insert(cid.clone(), Arc::clone(&carrier));
 
         let node = Arc::clone(self);
         tokio::spawn(async move {
@@ -164,10 +215,11 @@ impl Node {
                             continue;
                         }
                         let pkt = buf[..n].to_vec();
-                        node.dispatch_inbound_datagram(&carrier, src_addr, pkt).await;
+                        node.dispatch_inbound_datagram(&carrier, src_addr, pkt)
+                            .await;
                     }
                     Err(e) => {
-                        // Carrier failed or closed -> tear down all datagram sessions bound to it honestly!
+                        // Carrier failed or closed -> tear down bound E2E sessions & hop circuits honestly!
                         let reason = format!("carrier '{cid}' failed: {e}");
                         let affected: Vec<Arc<ConfluenceDatagramSession>> = node
                             .dgram_sessions
@@ -177,6 +229,21 @@ impl Node {
                             .collect();
                         for sess in affected {
                             sess.terminate_locally(reason.clone());
+                        }
+
+                        let dead_labels: Vec<(u32, u32)> = node
+                            .dgram_label_switches
+                            .iter()
+                            .filter_map(|entry| match &entry.value().target {
+                                SwitchTarget::ReturnLink { carrier: c, .. } if c.id() == &cid => {
+                                    Some((*entry.key(), entry.value().pair_label))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        for (l1, l2) in dead_labels {
+                            node.dgram_label_switches.remove(&l1);
+                            node.dgram_label_switches.remove(&l2);
                         }
                         break;
                     }
@@ -205,17 +272,13 @@ impl Node {
         tokio::spawn(async move {
             while let Ok((stream, src_addr)) = carrier.accept().await {
                 let Ok(permit) = Arc::clone(&node.preauth_sem).try_acquire_owned() else {
-                    // Pre-auth overload protection: drop excess unauthenticated inbound connections immediately.
                     continue;
                 };
                 let n_clone = Arc::clone(&node);
                 tokio::spawn(async move {
-                    let _permit = permit;
-                    let _ = tokio::time::timeout(
-                        n_clone.setup_timeout,
-                        n_clone.handle_inbound_stream(stream, src_addr),
-                    )
-                    .await;
+                    let _ = n_clone
+                        .handle_inbound_stream(stream, src_addr, permit)
+                        .await;
                 });
             }
         });
@@ -242,10 +305,7 @@ impl Node {
     }
 
     /// Mounts a composable forwardable Stream channel plugin by its `TargetTag`.
-    pub fn mount_stream_forward_channel(
-        &self,
-        fwd: Arc<dyn StreamForwardChannel>,
-    ) -> Result<()> {
+    pub fn mount_stream_forward_channel(&self, fwd: Arc<dyn StreamForwardChannel>) -> Result<()> {
         let caps = fwd.caps();
         if caps.plane != Plane::Stream {
             return Err(CoreError::PlaneMismatch {
@@ -257,8 +317,12 @@ impl Node {
         Ok(())
     }
 
-    /// Sends an opaque control request to a remote `DatagramForwardChannel` (e.g., for passive relay registration)
-    /// and awaits its `ChannelControlResp`.
+    /// Number of currently installed flat datagram label-switch entries on this Node.
+    pub fn active_label_switch_count(&self) -> usize {
+        self.dgram_label_switches.len()
+    }
+
+    /// Sends an opaque control request to a remote `DatagramForwardChannel` and awaits `ChannelControlResp`.
     pub async fn send_datagram_channel_control(
         &self,
         carrier_id: &ChannelId,
@@ -292,7 +356,45 @@ impl Node {
             .map_err(|_| CoreError::Closed("control request cancelled".into()))
     }
 
+    /// Renews a hop channel's `DatagramForwardHandle` along an active datagram circuit.
+    pub async fn send_circuit_renew(
+        &self,
+        carrier_id: &ChannelId,
+        entry_addr: &ChannelAddr,
+        circuit_id: CircuitId,
+        target_tag: TargetTag,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        let carrier = self.validate_datagram_carrier(carrier_id)?;
+        let key = (circuit_id, target_tag);
+        let (tx, rx) = oneshot::channel();
+        self.pending_circuit_renews.insert(key, tx);
+
+        let pkt = DgramCtrlPacket::CircuitRenew {
+            circuit_id,
+            target_tag,
+            payload,
+        }
+        .encode()?;
+
+        if let Err(e) = carrier.send_to(entry_addr, &pkt).await {
+            self.pending_circuit_renews.remove(&key);
+            return Err(e);
+        }
+
+        tokio::time::timeout(self.setup_timeout, rx)
+            .await
+            .map_err(|_| {
+                self.pending_circuit_renews.remove(&key);
+                CoreError::Timeout
+            })?
+            .map_err(|_| CoreError::Closed("circuit renew cancelled".into()))
+    }
+
     /// Opens an end-to-end authenticated Stream to `endpoint` on `target_peer` within `scope` (Seam 4 Outbound).
+    ///
+    /// Executes **single-pass 1-RTT pipelined chain setup**: all intermediate hop segments plus
+    /// the final E2E segment are sent in one burst (`0` per-hop round-trips, `1` RTT total).
     pub async fn open_stream(
         self: &Arc<Self>,
         scope_id: &ScopeId,
@@ -309,10 +411,9 @@ impl Node {
         let carrier = self.validate_stream_carrier(&path.entry_channel)?;
         let mut cookies: HashMap<TargetTag, [u8; COOKIE_BYTES]> = HashMap::new();
 
-        for attempt in 0..2 {
+        for attempt in 0..=path.hops.len() + 1 {
             let mut raw_stream = carrier.open(&path.entry_addr).await?;
 
-            // Build single-pass pipelined setup burst `[Seg_1 | ... | Seg_k | FinalE2e]`.
             let mut sent_mac1s: HashMap<TargetTag, ([u8; HANDSHAKE_MAC_BYTES], PeerId)> =
                 HashMap::new();
             let mut burst = Vec::new();
@@ -408,7 +509,7 @@ impl Node {
                 StreamSetupReply::Challenge {
                     target_tag,
                     challenge,
-                } if attempt == 0 => {
+                } if attempt <= path.hops.len() && !cookies.contains_key(&target_tag) => {
                     let (sent_mac1, responder_pk) = sent_mac1s
                         .get(&target_tag)
                         .ok_or(CoreError::AuthFailed)?;
@@ -433,6 +534,9 @@ impl Node {
     }
 
     /// Opens an end-to-end authenticated Datagram session to `endpoint` on `target_peer` within `scope` (Seam 4 Outbound).
+    ///
+    /// Executes **single-pass 1-RTT pipelined chain setup** and installs flat 4-byte `HopLabel`
+    /// switches on intermediate hops (**29 bytes** constant data-plane overhead regardless of hop count).
     pub async fn open_datagram(
         self: &Arc<Self>,
         scope_id: &ScopeId,
@@ -450,7 +554,7 @@ impl Node {
         let mtu = carrier.caps().max_payload_bytes.unwrap_or(1200);
         let mut cookies: HashMap<TargetTag, [u8; COOKIE_BYTES]> = HashMap::new();
 
-        for attempt in 0..2 {
+        for attempt in 0..=path.hops.len() + 1 {
             let circuit_id = CircuitId::random();
             let in_label = self.alloc_label();
             let mut sent_mac1s: HashMap<TargetTag, ([u8; HANDSHAKE_MAC_BYTES], PeerId)> =
@@ -571,7 +675,7 @@ impl Node {
                 PendingDgramOutcome::Challenge {
                     target_tag,
                     challenge,
-                } if attempt == 0 => {
+                } if attempt <= path.hops.len() && !cookies.contains_key(&target_tag) => {
                     let (sent_mac1, responder_pk) = sent_mac1s
                         .get(&target_tag)
                         .ok_or(CoreError::AuthFailed)?;
@@ -598,7 +702,10 @@ impl Node {
     fn alloc_label(&self) -> u32 {
         loop {
             let l = self.next_label.fetch_add(1, Ordering::Relaxed);
-            if l != 0 && !self.dgram_sessions.contains_key(&l) {
+            if l != 0
+                && !self.dgram_sessions.contains_key(&l)
+                && !self.dgram_label_switches.contains_key(&l)
+            {
                 return l;
             }
         }
@@ -625,6 +732,13 @@ impl Node {
             return Err(CoreError::InvalidInput(
                 "ExplicitPath target_scope_tag does not match target_pubkey".into(),
             ));
+        }
+        for hop in &path.hops {
+            if hop.target_tag != hop.channel_pubkey.target_tag() {
+                return Err(CoreError::InvalidInput(
+                    "PathHop target_tag does not match channel_pubkey".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -669,17 +783,71 @@ impl Node {
         self: &Arc<Self>,
         carrier: &Arc<dyn DatagramChannel>,
         src_addr: ChannelAddr,
-        pkt: Vec<u8>,
+        mut pkt: Vec<u8>,
     ) {
         let label = HopLabel::from_be_bytes([pkt[0], pkt[1], pkt[2], pkt[3]]);
         if !label.is_control() {
+            // 1. Check local E2E datagram sessions.
             if let Some(sess) = self.dgram_sessions.get(&label.0).map(|r| Arc::clone(r.value())) {
                 sess.handle_inbound_packet(&pkt[4..]).await;
+                return;
+            }
+
+            // 2. Blind Flat Label Switching fast path: overwrite 4-byte HopLabel in place!
+            let Some(entry) = self
+                .dgram_label_switches
+                .get(&label.0)
+                .map(|r| r.value().clone())
+            else {
+                return;
+            };
+            pkt[..4].copy_from_slice(&entry.out_label.to_be_bytes());
+            match entry.target {
+                SwitchTarget::ForwardHandle(handle) => {
+                    if let Err(e) = handle.send(&pkt).await {
+                        if matches!(
+                            e,
+                            CoreError::GrantRevoked
+                                | CoreError::GrantExpired
+                                | CoreError::Closed(_)
+                                | CoreError::ChannelUnhealthy(_)
+                        ) {
+                            self.dgram_label_switches.remove(&label.0);
+                            self.dgram_label_switches.remove(&entry.pair_label);
+                        }
+                    }
+                }
+                SwitchTarget::ReturnLink {
+                    carrier: ret_carrier,
+                    addr: ret_addr,
+                    handle,
+                } => {
+                    match handle.check_and_record_reverse(pkt.len()) {
+                        Ok(()) => {
+                            if let Err(e) = ret_carrier.send_to(&ret_addr, &pkt).await {
+                                if matches!(e, CoreError::Closed(_) | CoreError::ChannelUnhealthy(_))
+                                {
+                                    self.dgram_label_switches.remove(&label.0);
+                                    self.dgram_label_switches.remove(&entry.pair_label);
+                                }
+                            }
+                        }
+                        Err(
+                            CoreError::GrantRevoked
+                            | CoreError::GrantExpired
+                            | CoreError::Closed(_),
+                        ) => {
+                            self.dgram_label_switches.remove(&label.0);
+                            self.dgram_label_switches.remove(&entry.pair_label);
+                        }
+                        Err(_) => {}
+                    }
+                }
             }
             return;
         }
 
-        // Control packet (`HopLabel(0)`) — parse silently dropping malformed pre-auth packets.
+        // Control packet (`HopLabel(0)`) — drop malformed packets silently.
         let Ok(ctrl) = DgramCtrlPacket::decode(&pkt) else {
             return;
         };
@@ -702,8 +870,18 @@ impl Node {
                         &seg_payload,
                     )
                     .await;
+                } else {
+                    self.handle_hop_datagram_setup(
+                        carrier,
+                        &src_addr,
+                        circuit_id,
+                        sender_return_label,
+                        target_tag,
+                        &seg_payload,
+                        &remaining_tail,
+                    )
+                    .await;
                 }
-                // Non-empty `remaining_tail` is handled by the Multi-Hop Path Engine (Phase 3a).
             }
             DgramCtrlPacket::ChainSetupResp {
                 circuit_id,
@@ -715,6 +893,9 @@ impl Node {
                         responder_label,
                         msg2,
                     });
+                } else if let Some((_, hop)) = self.pending_hop_circuits.remove(&circuit_id) {
+                    self.install_hop_datagram_circuit(circuit_id, hop, responder_label, msg2)
+                        .await;
                 }
             }
             DgramCtrlPacket::ChainSetupChallenge {
@@ -727,6 +908,16 @@ impl Node {
                         target_tag,
                         challenge,
                     });
+                } else if let Some((_, hop)) = self.pending_hop_circuits.remove(&circuit_id) {
+                    if let Ok(raw) = (DgramCtrlPacket::ChainSetupChallenge {
+                        circuit_id,
+                        target_tag,
+                        challenge,
+                    })
+                    .encode()
+                    {
+                        let _ = hop.upstream_carrier.send_to(&hop.upstream_addr, &raw).await;
+                    }
                 }
             }
             DgramCtrlPacket::ChainSetupReject {
@@ -736,6 +927,16 @@ impl Node {
             } => {
                 if let Some((_, waiter)) = self.pending_dgram_setups.remove(&circuit_id) {
                     let _ = waiter.send(PendingDgramOutcome::Reject { target_tag, reason });
+                } else if let Some((_, hop)) = self.pending_hop_circuits.remove(&circuit_id) {
+                    if let Ok(raw) = (DgramCtrlPacket::ChainSetupReject {
+                        circuit_id,
+                        target_tag,
+                        reason,
+                    })
+                    .encode()
+                    {
+                        let _ = hop.upstream_carrier.send_to(&hop.upstream_addr, &raw).await;
+                    }
                 }
             }
             DgramCtrlPacket::ChannelControl {
@@ -749,7 +950,8 @@ impl Node {
                     .map(|r| Arc::clone(r.value()))
                 {
                     if let Ok(Some(resp_payload)) =
-                        fwd.handle_control(Arc::clone(carrier), &src_addr, &payload).await
+                        fwd.handle_control(Arc::clone(carrier), &src_addr, &payload)
+                            .await
                     {
                         if let Ok(raw) = (DgramCtrlPacket::ChannelControlResp {
                             req_id,
@@ -770,7 +972,244 @@ impl Node {
                     let _ = waiter.send(payload);
                 }
             }
-            DgramCtrlPacket::CircuitRenew { .. } | DgramCtrlPacket::CircuitRenewResp { .. } => {}
+            DgramCtrlPacket::CircuitRenew {
+                circuit_id,
+                target_tag,
+                payload,
+            } => {
+                let hop_entry = self.installed_hop_circuits.get(&circuit_id).map(|e| {
+                    (
+                        e.target_tag,
+                        Arc::clone(&e.handle),
+                    )
+                });
+                if let Some((local_tag, handle)) = hop_entry {
+                    if local_tag == target_tag {
+                        if let Ok(resp_payload) = handle.renew(&payload).await {
+                            if let Ok(raw) = (DgramCtrlPacket::CircuitRenewResp {
+                                circuit_id,
+                                target_tag,
+                                payload: resp_payload,
+                            })
+                            .encode()
+                            {
+                                let _ = carrier.send_to(&src_addr, &raw).await;
+                            }
+                        }
+                    } else if let Ok(raw) = (DgramCtrlPacket::CircuitRenew {
+                        circuit_id,
+                        target_tag,
+                        payload,
+                    })
+                    .encode()
+                    {
+                        // Forward CircuitRenew transparently toward downstream hop!
+                        let _ = handle.send(&raw).await;
+                    }
+                }
+            }
+            DgramCtrlPacket::CircuitRenewResp {
+                circuit_id,
+                target_tag,
+                payload,
+            } => {
+                if let Some((_, waiter)) =
+                    self.pending_circuit_renews.remove(&(circuit_id, target_tag))
+                {
+                    let _ = waiter.send(payload);
+                } else if let Some(hop) = self.installed_hop_circuits.get(&circuit_id) {
+                    let up_carrier = Arc::clone(&hop.upstream_carrier);
+                    let up_addr = hop.upstream_addr.clone();
+                    drop(hop);
+                    if let Ok(raw) = (DgramCtrlPacket::CircuitRenewResp {
+                        circuit_id,
+                        target_tag,
+                        payload,
+                    })
+                    .encode()
+                    {
+                        let _ = up_carrier.send_to(&up_addr, &raw).await;
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_hop_datagram_setup(
+        self: &Arc<Self>,
+        in_carrier: &Arc<dyn DatagramChannel>,
+        src_addr: &ChannelAddr,
+        circuit_id: CircuitId,
+        sender_return_label: u32,
+        target_tag: TargetTag,
+        seg_payload: &[u8],
+        remaining_tail: &[u8],
+    ) {
+        // Blind dispatch to mounted DatagramForwardChannel matching `target_tag`!
+        let Some(fwd_chan) = self
+            .dgram_fwd_channels
+            .get(&target_tag)
+            .map(|r| Arc::clone(r.value()))
+        else {
+            return;
+        };
+
+        let Ok((next_tag, next_seg, next_tail)) = pop_chain_segment(remaining_tail) else {
+            return;
+        };
+
+        // Bound concurrent pending circuits against pre-auth state exhaustion.
+        if self.pending_hop_circuits.len() >= 1024 {
+            return;
+        }
+
+        match fwd_chan.handle_setup(src_addr, seg_payload).await {
+            Ok(SetupOutcome::Accept { handle, .. }) => {
+                let up_label = self.alloc_label();
+                let down_label = self.alloc_label();
+
+                let fwd_pkt = match (DgramCtrlPacket::ChainSetup {
+                    circuit_id,
+                    sender_return_label: down_label,
+                    target_tag: next_tag,
+                    seg_payload: next_seg,
+                    remaining_tail: next_tail,
+                })
+                .encode()
+                {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+
+                self.pending_hop_circuits.insert(
+                    circuit_id,
+                    PendingHopCircuit {
+                        up_label,
+                        down_label,
+                        upstream_carrier: Arc::clone(in_carrier),
+                        upstream_addr: src_addr.clone(),
+                        upstream_return_label: sender_return_label,
+                        target_tag,
+                        handle: Arc::clone(&handle),
+                    },
+                );
+
+                // Automatic pending circuit expiry if downstream never responds within setup_timeout.
+                let pending_map = Arc::clone(&self.pending_hop_circuits);
+                let ttl = self.setup_timeout;
+                tokio::spawn(async move {
+                    tokio::time::sleep(ttl).await;
+                    pending_map.remove(&circuit_id);
+                });
+
+                if let Err(e) = handle.send(&fwd_pkt).await {
+                    self.pending_hop_circuits.remove(&circuit_id);
+                    if let Ok(raw) = (DgramCtrlPacket::ChainSetupReject {
+                        circuit_id,
+                        target_tag,
+                        reason: e.to_string(),
+                    })
+                    .encode()
+                    {
+                        let _ = in_carrier.send_to(src_addr, &raw).await;
+                    }
+                }
+            }
+            Ok(SetupOutcome::Challenge(challenge)) => {
+                if let Ok(raw) = (DgramCtrlPacket::ChainSetupChallenge {
+                    circuit_id,
+                    target_tag,
+                    challenge,
+                })
+                .encode()
+                {
+                    let _ = in_carrier.send_to(src_addr, &raw).await;
+                }
+            }
+            Ok(SetupOutcome::Reject(reason)) => {
+                if let Ok(raw) = (DgramCtrlPacket::ChainSetupReject {
+                    circuit_id,
+                    target_tag,
+                    reason,
+                })
+                .encode()
+                {
+                    let _ = in_carrier.send_to(src_addr, &raw).await;
+                }
+            }
+            Err(e) => {
+                if let Ok(raw) = (DgramCtrlPacket::ChainSetupReject {
+                    circuit_id,
+                    target_tag,
+                    reason: e.to_string(),
+                })
+                .encode()
+                {
+                    let _ = in_carrier.send_to(src_addr, &raw).await;
+                }
+            }
+        }
+    }
+
+    async fn install_hop_datagram_circuit(
+        &self,
+        circuit_id: CircuitId,
+        hop: PendingHopCircuit,
+        downstream_label: u32,
+        msg2: Vec<u8>,
+    ) {
+        self.dgram_label_switches.insert(
+            hop.up_label,
+            LabelSwitchEntry {
+                out_label: downstream_label,
+                pair_label: hop.down_label,
+                target: SwitchTarget::ForwardHandle(Arc::clone(&hop.handle)),
+            },
+        );
+        self.dgram_label_switches.insert(
+            hop.down_label,
+            LabelSwitchEntry {
+                out_label: hop.upstream_return_label,
+                pair_label: hop.up_label,
+                target: SwitchTarget::ReturnLink {
+                    carrier: Arc::clone(&hop.upstream_carrier),
+                    addr: hop.upstream_addr.clone(),
+                    handle: Arc::clone(&hop.handle),
+                },
+            },
+        );
+        self.installed_hop_circuits.insert(
+            circuit_id,
+            InstalledHopCircuit {
+                upstream_carrier: Arc::clone(&hop.upstream_carrier),
+                upstream_addr: hop.upstream_addr.clone(),
+                target_tag: hop.target_tag,
+                handle: Arc::clone(&hop.handle),
+            },
+        );
+
+        // Immediate revocation teardown: purge both label switches as soon as handle closes!
+        let mut closed_rx = hop.handle.closed();
+        let switches = Arc::clone(&self.dgram_label_switches);
+        let circuits = Arc::clone(&self.installed_hop_circuits);
+        let up_l = hop.up_label;
+        let down_l = hop.down_label;
+        tokio::spawn(async move {
+            let _ = closed_rx.wait_for(|&c| c).await;
+            switches.remove(&up_l);
+            switches.remove(&down_l);
+            circuits.remove(&circuit_id);
+        });
+
+        if let Ok(raw) = (DgramCtrlPacket::ChainSetupResp {
+            circuit_id,
+            responder_label: hop.up_label,
+            msg2,
+        })
+        .encode()
+        {
+            let _ = hop.upstream_carrier.send_to(&hop.upstream_addr, &raw).await;
         }
     }
 
@@ -788,11 +1227,9 @@ impl Node {
             .get(&target_tag)
             .map(|r| Arc::clone(r.value()))
         else {
-            // Unrecognized target_tag -> silent pre-auth drop!
             return;
         };
 
-        // 1. Pre-DH MAC1 + stateless MAC2 flood cookie check!
         let inner_msg1 = match scope
             .cookie_protector()
             .verify_envelope(src_addr.as_bytes(), envelope)
@@ -813,7 +1250,6 @@ impl Node {
             EnvelopeCheck::Drop => return,
         };
 
-        // 2. Cryptographic `Noise_IK` initiator verification.
         let Ok(verified) =
             VerifiedInitiation::read_msg1(scope.keypair(), DEFAULT_PROLOGUE, inner_msg1)
         else {
@@ -821,7 +1257,6 @@ impl Node {
         };
         let remote_peer = verified.initiator_peer();
 
-        // 3. Decode inner E2E request & check TAI64N replay window BEFORE calling AccessControl!
         let Ok(req) = E2eHandshakeReq::decode(verified.payload()) else {
             return;
         };
@@ -836,7 +1271,6 @@ impl Node {
             return;
         }
 
-        // 4. Verify endpoint is explicitly published in this isolated TrustScope.
         let Some((ep_tx, unpublish_rx)) = scope
             .endpoints()
             .datagram_endpoints
@@ -855,7 +1289,6 @@ impl Node {
             return;
         };
 
-        // 5. Evaluate AccessControl on control event (fail-closed on error).
         let ac_req = AccessRequest {
             scope: scope.id().clone(),
             peer: remote_peer,
@@ -931,7 +1364,6 @@ impl Node {
         );
         self.dgram_sessions.insert(in_label, Arc::clone(&session));
 
-        // Deliver authenticated session to published endpoint and send ChainSetupResp!
         if ep_tx.send(Arc::clone(&session)).await.is_err() {
             session.terminate_locally("endpoint listener dropped".into());
             return;
@@ -952,35 +1384,99 @@ impl Node {
         self: &Arc<Self>,
         mut stream: BoxedAsyncStream,
         src_addr: ChannelAddr,
+        preauth_permit: OwnedSemaphorePermit,
     ) -> Result<()> {
-        let (mode, target_tag, envelope) = read_stream_segment(&mut stream).await?;
+        let (mode, target_tag, envelope) = tokio::time::timeout(
+            self.setup_timeout,
+            read_stream_segment(&mut stream),
+        )
+        .await
+        .map_err(|_| CoreError::Timeout)??;
+
         match mode {
             StreamSegmentMode::FinalE2e => {
-                self.handle_final_stream_setup(stream, &src_addr, target_tag, &envelope)
-                    .await
+                let res = tokio::time::timeout(
+                    self.setup_timeout,
+                    self.handle_final_stream_setup(stream, &src_addr, target_tag, &envelope),
+                )
+                .await
+                .map_err(|_| CoreError::Timeout)?;
+                drop(preauth_permit);
+                res
             }
             StreamSegmentMode::ChannelControl => {
+                drop(preauth_permit);
                 if let Some(fwd) = self
                     .stream_fwd_channels
                     .get(&target_tag)
                     .map(|r| Arc::clone(r.value()))
                 {
-                    fwd.handle_control_stream(stream, &src_addr, &envelope).await
+                    fwd.handle_control_stream(stream, &src_addr, &envelope)
+                        .await
                 } else {
                     Ok(())
                 }
             }
             StreamSegmentMode::ForwardHop => {
-                // Handled by Multi-Hop Path Engine in Phase 3a.
-                let _ = write_stream_reply(
-                    &mut stream,
-                    &StreamSetupReply::Reject {
-                        target_tag,
-                        reason: "forward channel not mounted".into(),
-                    },
+                // Blind Single-Pass Stream Splice: dispatch opaque hop segment to target channel plugin!
+                let Some(fwd) = self
+                    .stream_fwd_channels
+                    .get(&target_tag)
+                    .map(|r| Arc::clone(r.value()))
+                else {
+                    return Ok(());
+                };
+
+                let setup_res = tokio::time::timeout(
+                    self.setup_timeout,
+                    fwd.handle_setup(&src_addr, &envelope),
                 )
-                .await;
-                Ok(())
+                .await
+                .map_err(|_| CoreError::Timeout)?;
+
+                drop(preauth_permit);
+
+                match setup_res {
+                    Ok(SetupOutcome::Accept {
+                        handle: mut downstream,
+                        ..
+                    }) => {
+                        // Immediately splice remaining pipelined setup segments & subsequent E2E
+                        // AEAD frames bidirectionally with zero per-hop round-trip!
+                        let _ = tokio::io::copy_bidirectional(&mut stream, &mut downstream).await;
+                        Ok(())
+                    }
+                    Ok(SetupOutcome::Challenge(challenge)) => {
+                        let _ = write_stream_reply(
+                            &mut stream,
+                            &StreamSetupReply::Challenge {
+                                target_tag,
+                                challenge,
+                            },
+                        )
+                        .await;
+                        Ok(())
+                    }
+                    Ok(SetupOutcome::Reject(reason)) => {
+                        let _ = write_stream_reply(
+                            &mut stream,
+                            &StreamSetupReply::Reject { target_tag, reason },
+                        )
+                        .await;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let _ = write_stream_reply(
+                            &mut stream,
+                            &StreamSetupReply::Reject {
+                                target_tag,
+                                reason: e.to_string(),
+                            },
+                        )
+                        .await;
+                        Ok(())
+                    }
+                }
             }
         }
     }
@@ -997,7 +1493,6 @@ impl Node {
             .get(&target_tag)
             .map(|r| Arc::clone(r.value()))
         else {
-            // Silent pre-auth drop!
             return Ok(());
         };
 

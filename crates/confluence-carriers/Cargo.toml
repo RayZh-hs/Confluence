@@ -1,0 +1,16 @@
+[package]
+name = "confluence-carriers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native UDP/TCP carriers and composable NoiseAclChannel middleware for Confluence"
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+confluence-core.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true

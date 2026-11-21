@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/confluence-core",
+    "crates/confluence-carriers",
+    "crates/confluence-relay",
+    "crates/confluence-testkit",
+    "crates/confluence-policy",
+    "crates/confluence-routing",
+    "crates/confluence-edge",
+    "crates/confluence-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.80"
+
+[workspace.dependencies]
+confluence-core = { path = "crates/confluence-core" }
+confluence-carriers = { path = "crates/confluence-carriers" }
+confluence-relay = { path = "crates/confluence-relay" }
+confluence-testkit = { path = "crates/confluence-testkit" }
+confluence-policy = { path = "crates/confluence-policy" }
+confluence-routing = { path = "crates/confluence-routing" }
+confluence-edge = { path = "crates/confluence-edge" }
+
+async-trait = "0.1.88"
+base64 = "0.22"
+blake2 = "0.10.6"
+bytes = "1.10"
+chacha20poly1305 = { version = "0.10.1", features = ["std"] }
+clap = { version = "4.5", features = ["derive"] }
+dashmap = "6.1"
+futures = "0.3.31"
+hex = "0.4.3"
+hmac = "0.12.1"
+parking_lot = "0.12.3"
+rand = "0.8.5"
+serde = { version = "1.0.215", features = ["derive"] }
+serde_json = "1.0.133"
+subtle = "2.6.1"
+thiserror = "2.0.11"
+tokio = { version = "1.43", features = ["full"] }
+tokio-util = { version = "0.7.13", features = ["io"] }
+toml = "0.8.22"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+x25519-dalek = { version = "2.0.1", features = ["static_secrets", "getrandom", "zeroize"] }
+zeroize = { version = "1.8.2", features = ["derive"] }

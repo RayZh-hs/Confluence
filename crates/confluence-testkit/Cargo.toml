@@ -1,0 +1,18 @@
+[package]
+name = "confluence-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Deterministic in-memory transport hubs, fault injection, and Cleanroom Invariant verification suite"
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+confluence-carriers.workspace = true
+confluence-core.workspace = true
+confluence-relay.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+tokio.workspace = true
+tracing.workspace = true

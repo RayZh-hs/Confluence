@@ -1,0 +1,13 @@
+[package]
+name = "confluence-edge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local TCP and UDP port-forward edge adapters implementing Confluence Seam 4"
+
+[dependencies]
+bytes.workspace = true
+confluence-core.workspace = true
+dashmap.workspace = true
+tokio.workspace = true
+tracing.workspace = true

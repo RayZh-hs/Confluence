@@ -11,3 +11,6 @@ confluence-core.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 toml.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

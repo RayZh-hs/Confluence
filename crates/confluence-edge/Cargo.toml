@@ -11,3 +11,9 @@ confluence-core.workspace = true
 dashmap.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+confluence-carriers.workspace = true
+confluence-policy.workspace = true
+confluence-relay.workspace = true
+confluence-routing.workspace = true

@@ -1,7 +1,8 @@
 use bytes::BytesMut;
 
 pub const HEADROOM_BYTES: usize = 64;
-pub const TAILROOM_BYTES: usize = 16;
+/// Tailroom reserved for up to four stacked 16-byte AEAD tags (E2E + outer link wrappers).
+pub const TAILROOM_BYTES: usize = 64;
 
 /// A single-owner packet with space reserved for in-place framing and AEAD tags.
 #[derive(Debug)]
@@ -57,12 +58,17 @@ impl PacketBuf {
         self.tail -= count;
         true
     }
-    pub(crate) fn append_tag(&mut self, tag: &[u8; TAILROOM_BYTES]) -> bool {
-        if self.buf.len() - self.tail < tag.len() {
+    /// Appends a 16-byte AEAD tag into reserved tailroom in place.
+    pub fn append_tag(&mut self, tag: &[u8; 16]) -> bool {
+        self.extend_tail(tag)
+    }
+    /// Appends `bytes` into reserved tailroom in place without reallocating.
+    pub fn extend_tail(&mut self, bytes: &[u8]) -> bool {
+        if self.buf.len() - self.tail < bytes.len() {
             return false;
         }
-        self.buf[self.tail..self.tail + tag.len()].copy_from_slice(tag);
-        self.tail += tag.len();
+        self.buf[self.tail..self.tail + bytes.len()].copy_from_slice(bytes);
+        self.tail += bytes.len();
         true
     }
     pub fn as_slice(&self) -> &[u8] {
@@ -76,5 +82,13 @@ impl PacketBuf {
     }
     pub fn is_empty(&self) -> bool {
         self.head == self.tail
+    }
+    /// Remaining reserved headroom bytes available for [`Self::prepend_header`].
+    pub fn headroom(&self) -> usize {
+        self.head
+    }
+    /// Remaining reserved tailroom bytes available for [`Self::extend_tail`] / [`Self::append_tag`].
+    pub fn tailroom(&self) -> usize {
+        self.buf.len() - self.tail
     }
 }

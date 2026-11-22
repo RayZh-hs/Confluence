@@ -7,6 +7,9 @@ use super::aead::{open, seal};
 use super::{PublicKey, ScopeKeypair, mac_key, mac1, replay::SetupReplay, scope_kid};
 use crate::{CoreErr, wire::e2e::CREDENTIAL_MAX, wire::u16_at, wire::u64_at};
 
+/// Wire length of a `Noise_IK` reply (`32B ephemeral + 10B ack + 16B tag`).
+pub const REPLY_LEN: usize = 58;
+
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SessionKeys {
     pub tx: [u8; 32],
@@ -114,6 +117,32 @@ impl HopKey {
         )?;
         Ok(plaintext)
     }
+    /// Seals an intermediate hop's 8-byte `ttl_ms` lease into a 24-byte `SETUP_OK` trailer
+    /// using a domain-separated subkey derived from `K_hop_i`.
+    pub fn setup_lease(&self, lease: [u8; 8]) -> [u8; 24] {
+        let key = *blake3::keyed_hash(&self.0, b"hop setup lease").as_bytes();
+        let mut out = [0u8; 24];
+        out[..8].copy_from_slice(&lease);
+        let tag = seal(&key, 0, b"confluence-v1 setup hop lease", &mut out[..8]);
+        out[8..].copy_from_slice(&tag);
+        out
+    }
+    /// Opens an intermediate hop's 24-byte `SETUP_OK` lease trailer, verifying hop authenticity.
+    pub fn open_setup_lease(&self, body: &[u8]) -> Result<[u8; 8], CoreErr> {
+        if body.len() != 24 {
+            return Err(CoreErr::Malformed);
+        }
+        let key = *blake3::keyed_hash(&self.0, b"hop setup lease").as_bytes();
+        let mut plaintext: [u8; 8] = body[..8].try_into().unwrap();
+        open(
+            &key,
+            0,
+            b"confluence-v1 setup hop lease",
+            &mut plaintext,
+            &body[8..],
+        )?;
+        Ok(plaintext)
+    }
     pub fn control(&self, initiator: bool) -> super::aead::ControlCipher {
         let fwd = *blake3::keyed_hash(&self.0, b"hop forward").as_bytes();
         let rev = *blake3::keyed_hash(&self.0, b"hop reverse").as_bytes();
@@ -125,8 +154,7 @@ impl HopKey {
     }
 }
 
-/// The initiator needs its ephemeral secret again for both ee and se. A static
-/// secret generated for one use supplies the reusable X25519 operations.
+/// The initiator needs its ephemeral secret again for both ee and se.
 pub struct Initiator {
     state: State,
     ephemeral: x25519_dalek::StaticSecret,
@@ -166,8 +194,8 @@ impl Initiator {
         &self,
         identity: &ScopeKeypair,
         reply: &[u8],
-    ) -> Result<([u8; 18], SessionKeys), CoreErr> {
-        if reply.len() != 66 {
+    ) -> Result<([u8; 10], SessionKeys), CoreErr> {
+        if reply.len() != REPLY_LEN {
             return Err(CoreErr::Malformed);
         }
         let ephemeral = XPublic::from(<[u8; 32]>::try_from(&reply[..32]).unwrap());
@@ -175,7 +203,7 @@ impl Initiator {
         state.mix_hash(ephemeral.as_bytes());
         state.mix_key(self.ephemeral.diffie_hellman(&ephemeral).as_bytes())?;
         state.mix_key(identity.secret.diffie_hellman(&ephemeral).as_bytes())?;
-        let mut ack = [0; 18];
+        let mut ack = [0; 10];
         state.decrypt(&reply[32..], &mut ack)?;
         Ok((ack, state.split(true)))
     }
@@ -218,7 +246,6 @@ impl Responder {
         let mut plaintext = vec![0; segment.len() - 120];
         state.decrypt(&segment[88..segment.len() - 16], &mut plaintext)?;
 
-        // The timestamp is inside the authenticated ciphertext on the v1 wire.
         if plaintext.len() < 8
             || now_ms.abs_diff(u64_at(&plaintext, 0)) > 30_000
             || !replay.check(originator_ephemeral.as_bytes(), true)
@@ -235,7 +262,7 @@ impl Responder {
     pub fn hop_key(&self) -> HopKey {
         self.state.hop_key()
     }
-    pub fn reply(mut self, ack: &[u8; 18]) -> Result<([u8; 66], SessionKeys), CoreErr> {
+    pub fn reply(mut self, ack: &[u8; 10]) -> Result<([u8; REPLY_LEN], SessionKeys), CoreErr> {
         let eph = x25519_dalek::StaticSecret::random_from_rng(OsRng);
         let public = XPublic::from(&eph);
         self.state.mix_hash(public.as_bytes());
@@ -243,74 +270,69 @@ impl Responder {
             .mix_key(eph.diffie_hellman(&self.originator_ephemeral).as_bytes())?;
         self.state
             .mix_key(eph.diffie_hellman(&XPublic::from(self.peer.0)).as_bytes())?;
-        let mut reply = [0; 66];
+        let mut reply = [0; REPLY_LEN];
         reply[..32].copy_from_slice(public.as_bytes());
-        reply[32..50].copy_from_slice(ack);
-        let tag = self.state.encrypt(&mut reply[32..50]);
-        reply[50..].copy_from_slice(&tag);
+        reply[32..42].copy_from_slice(ack);
+        let tag = self.state.encrypt(&mut reply[32..42]);
+        reply[42..].copy_from_slice(&tag);
         Ok((reply, self.state.split(false)))
     }
 }
 
-pub fn hop_plaintext(
-    timestamp: u64,
-    credential: &[u8],
-    locator: &[u8],
-) -> Result<Vec<u8>, CoreErr> {
-    let locator_len = u16::try_from(locator.len()).map_err(|_| CoreErr::Malformed)?;
-    if credential.len() > CREDENTIAL_MAX {
-        return Err(CoreErr::Malformed);
-    }
-    let mut data = timestamp.to_be_bytes().to_vec();
-    data.extend_from_slice(&(credential.len() as u16).to_be_bytes());
-    data.extend_from_slice(credential);
-    data.extend_from_slice(&locator_len.to_be_bytes());
-    data.extend_from_slice(locator);
-    Ok(data)
-}
-pub fn parse_hop(data: &[u8]) -> Result<(&[u8], &[u8]), CoreErr> {
-    if data.len() < 12 {
-        return Err(CoreErr::Malformed);
-    }
-    let cred = u16_at(data, 8) as usize;
-    if cred > CREDENTIAL_MAX || data.len() < 12 + cred {
-        return Err(CoreErr::Malformed);
-    }
-    let locator = u16_at(data, 10 + cred) as usize;
-    if data.len() != 12 + cred + locator {
-        return Err(CoreErr::Malformed);
-    }
-    Ok((&data[10..10 + cred], &data[12 + cred..]))
-}
-pub fn endpoint_plaintext(
-    timestamp: u64,
-    name: &str,
-    credential: &[u8],
-) -> Result<Vec<u8>, CoreErr> {
+/// Encodes an authenticated named-target setup payload (used identically for endpoints and transits):
+/// `[timestamp(8B) | name_len(1B) | name_utf8(1..=255B) | cred_len(2B) | credential(0..=512B)]`.
+pub fn target_plaintext(timestamp: u64, name: &str, credential: &[u8]) -> Result<Vec<u8>, CoreErr> {
     if name.is_empty() || name.len() > 255 || credential.len() > CREDENTIAL_MAX {
         return Err(CoreErr::Malformed);
     }
-    let mut data = timestamp.to_be_bytes().to_vec();
+    let mut data = Vec::with_capacity(11 + name.len() + credential.len());
+    data.extend_from_slice(&timestamp.to_be_bytes());
     data.push(name.len() as u8);
     data.extend_from_slice(name.as_bytes());
     data.extend_from_slice(&(credential.len() as u16).to_be_bytes());
     data.extend_from_slice(credential);
     Ok(data)
 }
-pub fn parse_endpoint(data: &[u8]) -> Result<(&str, &[u8]), CoreErr> {
+
+/// Decodes a named-target setup payload into `(name, credential)`.
+pub fn parse_target(data: &[u8]) -> Result<(&str, &[u8]), CoreErr> {
     if data.len() < 11 {
         return Err(CoreErr::Malformed);
     }
-    let name = data[8] as usize;
-    if name == 0 || data.len() < 11 + name {
+    let name_len = data[8] as usize;
+    if name_len == 0 || data.len() < 11 + name_len {
         return Err(CoreErr::Malformed);
     }
-    let cred = u16_at(data, 9 + name) as usize;
-    if cred > CREDENTIAL_MAX || data.len() != 11 + name + cred {
+    let cred_len = u16_at(data, 9 + name_len) as usize;
+    if cred_len > CREDENTIAL_MAX || data.len() != 11 + name_len + cred_len {
         return Err(CoreErr::Malformed);
     }
     Ok((
-        std::str::from_utf8(&data[9..9 + name]).map_err(|_| CoreErr::Malformed)?,
-        &data[11 + name..],
+        std::str::from_utf8(&data[9..9 + name_len]).map_err(|_| CoreErr::Malformed)?,
+        &data[11 + name_len..],
     ))
+}
+
+/// Semantic alias for encoding an intermediate hop's named transit payload.
+pub fn hop_plaintext(timestamp: u64, target: &str, credential: &[u8]) -> Result<Vec<u8>, CoreErr> {
+    target_plaintext(timestamp, target, credential)
+}
+
+/// Semantic alias for decoding an intermediate hop's named transit payload into `(target, credential)`.
+pub fn parse_hop(data: &[u8]) -> Result<(&str, &[u8]), CoreErr> {
+    parse_target(data)
+}
+
+/// Semantic alias for encoding a destination endpoint setup payload.
+pub fn endpoint_plaintext(
+    timestamp: u64,
+    name: &str,
+    credential: &[u8],
+) -> Result<Vec<u8>, CoreErr> {
+    target_plaintext(timestamp, name, credential)
+}
+
+/// Semantic alias for decoding a destination endpoint setup payload into `(name, credential)`.
+pub fn parse_endpoint(data: &[u8]) -> Result<(&str, &[u8]), CoreErr> {
+    parse_target(data)
 }

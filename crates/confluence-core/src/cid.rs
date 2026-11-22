@@ -57,30 +57,29 @@ impl<T> SlabTable<T> {
         if self.active >= self.limit {
             return None;
         }
-        let index = if let Some(index) = self.free {
-            self.free = self.entries[index].next_free.take();
-            self.entries[index].value = Some(value);
-            index
-        } else if self
-            .quarantine
-            .front()
-            .is_some_and(|(_, retired_at)| now.saturating_duration_since(*retired_at) >= COOLDOWN)
-        {
-            let (index, _) = self.quarantine.pop_front().unwrap();
-            self.entries[index].value = Some(value);
-            index
-        } else {
-            if self.entries.len() == 1 << 24 {
-                return None;
-            }
-            let index = self.entries.len();
-            self.entries.push(Entry {
-                generation: 1,
-                value: Some(value),
-                next_free: None,
-            });
-            index
-        };
+        let index =
+            if let Some(index) = self.free {
+                self.free = self.entries[index].next_free.take();
+                self.entries[index].value = Some(value);
+                index
+            } else if self.quarantine.front().is_some_and(|(_, retired_at)| {
+                now.saturating_duration_since(*retired_at) >= COOLDOWN
+            }) {
+                let (index, _) = self.quarantine.pop_front().unwrap();
+                self.entries[index].value = Some(value);
+                index
+            } else {
+                if self.entries.len() == 1 << 24 {
+                    return None;
+                }
+                let index = self.entries.len();
+                self.entries.push(Entry {
+                    generation: 1,
+                    value: Some(value),
+                    next_free: None,
+                });
+                index
+            };
         self.active += 1;
         Some(Cid::from_raw(
             (u32::from(self.entries[index].generation) << 24) | index as u32,

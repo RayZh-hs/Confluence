@@ -1,3 +1,5 @@
+//! Steady-state hop-layer header codecs for Datagram and Stream planes.
+
 use crate::{
     CoreErr, STREAM_CHUNK,
     cid::Cid,
@@ -13,28 +15,34 @@ pub const ST_DATA: u8 = 0x30;
 pub const ST_RENEW: u8 = 0x31;
 pub const ST_RENEW_OK: u8 = 0x32;
 pub const ST_CLOSE: u8 = 0x33;
-pub const MAX_CONTROL: usize = 128;
+/// Maximum encrypted hop control payload (`8B seq + 512B credential + 16B tag = 536 <= 560`).
+pub const MAX_CONTROL: usize = 560;
 
 pub fn datagram_data(cid: Cid) -> [u8; 5] {
     let mut buf = [DG_DATA; 5];
     buf[1..].copy_from_slice(&cid.raw().to_be_bytes());
     buf
 }
+
 pub fn datagram_control(kind: u8, ttl: u8, cid: Cid) -> [u8; 6] {
     let mut buf = [kind, ttl, 0, 0, 0, 0];
     buf[2..].copy_from_slice(&cid.raw().to_be_bytes());
     buf
 }
+
+/// Extracts the routing `Cid` for an inbound datagram packet, or `Cid::UNBOUND` for
+/// initial `SETUP_FWD` frames.
 pub fn route_cid(buf: &[u8]) -> Option<Cid> {
     let offset = match *buf.first()? {
         DG_DATA => 1,
         DG_RENEW..=DG_MTU_HINT => 2,
-        super::setup::OK | super::setup::ERR => 4,
+        super::setup::OK | super::setup::ERR | super::setup::COOKIE => 4,
         super::setup::FWD => return Some(Cid::UNBOUND),
         _ => return None,
     };
     (buf.len() >= offset + 4).then(|| Cid::from_raw(u32_at(buf, offset)))
 }
+
 pub fn stream_header(kind: u8, ttl: u8, len: usize) -> Result<[u8; 4], CoreErr> {
     if len > u16::MAX as usize {
         return Err(CoreErr::Malformed);
@@ -44,6 +52,7 @@ pub fn stream_header(kind: u8, ttl: u8, len: usize) -> Result<[u8; 4], CoreErr> 
     parse_stream(header)?;
     Ok(header)
 }
+
 pub fn parse_stream(header: [u8; 4]) -> Result<(u8, u8, usize), CoreErr> {
     let kind = header[0];
     let ttl = header[1];

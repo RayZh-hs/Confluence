@@ -1,9 +1,11 @@
-pub mod acl;
+//! The narrow extension seams of Confluence Core plus the runtime-agnostic [`TaskSpawner`].
+
+pub mod auth;
 pub mod channel;
 pub mod endpoint;
 pub mod path_source;
 
-pub use acl::*;
+pub use auth::*;
 pub use channel::*;
 pub use endpoint::*;
 pub use path_source::*;

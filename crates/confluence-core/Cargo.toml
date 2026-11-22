@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+serde = ["dep:serde"]
+
 [dependencies]
 bytes.workspace = true
 blake3.workspace = true
@@ -13,10 +17,13 @@ rand_core.workspace = true
 subtle.workspace = true
 zeroize.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync", "time"] }
+parking_lot.workspace = true
+tracing.workspace = true
+serde = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["sync", "time", "macros"] }
 
 [[bench]]
-name = "grant_contention"
+name = "lease_contention"
 harness = false
 
 [lints]

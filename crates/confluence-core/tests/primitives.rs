@@ -1,5 +1,5 @@
 use confluence_core::{
-    CoreErr, PacketBuf, ScopeKeypair,
+    CoreErr, FailureClass, LinkId, MtuWatch, PacketBuf, ScopeKeypair,
     cid::{Cid, SlabTable},
     crypto::{
         aead::{DatagramRx, DatagramTx},
@@ -114,7 +114,7 @@ fn nested_tail_and_prefix_mutations_fail_authentication_and_flight_cannot_replay
     let prefix = [1, 1, 0, 0, 42];
     let tail = b"remaining hops plus B's terminal frame";
     let original = setup::tail_aad(&prefix, tail);
-    let plain = noise_ik::hop_plaintext(now, b"credential", b"locator").unwrap();
+    let plain = noise_ik::hop_plaintext(now, "to-prod", b"credential").unwrap();
     let (segment, initiate) = noise_ik::initiate(&a, h.public_key(), &original, &plain).unwrap();
     for offset in 0..tail.len() {
         let mut changed = tail.to_vec();
@@ -133,6 +133,10 @@ fn nested_tail_and_prefix_mutations_fail_authentication_and_flight_cannot_replay
     let opened = Responder::accept(&h, &replay, &segment, &original, now).unwrap();
     assert_eq!(opened.peer, a.public_key());
     assert_eq!(opened.plaintext, plain);
+    assert_eq!(
+        noise_ik::parse_hop(&opened.plaintext).unwrap(),
+        ("to-prod", b"credential".as_slice())
+    );
     assert!(Responder::accept(&h, &replay, &segment, &original, now).is_err());
     assert!(
         Responder::accept(
@@ -145,7 +149,7 @@ fn nested_tail_and_prefix_mutations_fail_authentication_and_flight_cannot_replay
         .is_err()
     );
 
-    let ack = [12; 18];
+    let ack = [12; 10];
     let (reply, remote) = opened.reply(&ack).unwrap();
     let (clear, local) = initiate.finish(&a, &reply).unwrap();
     assert_eq!(clear, ack);
@@ -175,6 +179,85 @@ fn datagram_corruption_does_not_consume_a_sequence_or_advance_replay() {
     );
     assert!(matches!(rx.open(sent), Err(CoreErr::Authentication)));
 }
+
+#[test]
+fn stacked_outer_datagram_encryption_stays_zero_copy_in_place() {
+    let mut e2e_tx = DatagramTx::new([7; 32]);
+    let mut e2e_rx = DatagramRx::new([7; 32]);
+    let mut outer_tx = DatagramTx::new([8; 32]);
+    let mut outer_rx = DatagramRx::new([8; 32]);
+
+    let payload = b"zero-copy through both e2e and outer link encryption";
+    let mut packet = PacketBuf::with_payload_cap(payload.len());
+    packet.spare_payload().copy_from_slice(payload);
+    assert!(packet.advance_payload(payload.len()));
+    assert!(packet.tailroom() >= 64);
+    let ptr = packet.as_slice().as_ptr();
+
+    ALLOCS.with(|count| count.set(Some(0)));
+    let mut packet = e2e_tx.seal(e2e::DG_DATA, packet).unwrap();
+    assert!(packet.prepend_header(&hop::datagram_data(Cid::from_raw(5))));
+    let packet = outer_tx.seal(0xAA, packet).unwrap();
+    let (outer_kind, mut packet) = outer_rx.open(packet).unwrap();
+    assert_eq!(outer_kind, 0xAA);
+    assert!(packet.strip_header(5));
+    let (inner_kind, packet) = e2e_rx.open(packet).unwrap();
+    let allocs = ALLOCS.with(|count| count.replace(None));
+
+    assert_eq!(allocs, Some(0));
+    assert_eq!(inner_kind, e2e::DG_DATA);
+    assert_eq!(packet.as_slice().as_ptr(), ptr);
+    assert_eq!(packet.as_slice(), payload);
+}
+
+#[test]
+fn setup_lease_trailer_authenticates_and_rejects_tampering() {
+    let a = ScopeKeypair::generate();
+    let h = ScopeKeypair::generate();
+    let now = now_ms();
+    let aad = [1; 32];
+    let (seg, init) = noise_ik::initiate(&a, h.public_key(), &aad, &now.to_be_bytes()).unwrap();
+    let opened = Responder::accept(&h, &SetupReplay::default(), &seg, &aad, now).unwrap();
+
+    let wire = e2e::lease_bytes(30_000);
+    let mut trailer = opened.hop_key().setup_lease(wire);
+    assert_eq!(init.hop_key().open_setup_lease(&trailer).unwrap(), wire);
+    trailer[5] ^= 1;
+    assert!(matches!(
+        init.hop_key().open_setup_lease(&trailer),
+        Err(CoreErr::Authentication)
+    ));
+}
+
+#[test]
+fn failure_class_mtu_watch_and_link_id_invariants() {
+    assert_eq!(CoreErr::Timeout.failure_class(), FailureClass::PathFailure);
+    assert!(
+        CoreErr::HopRejected {
+            index: 0,
+            reason: Box::new(CoreErr::Denied),
+        }
+        .is_path_failure()
+    );
+    assert_eq!(
+        CoreErr::Denied.failure_class(),
+        FailureClass::DestinationPolicy
+    );
+    assert_eq!(
+        CoreErr::TargetRefused.failure_class(),
+        FailureClass::DestinationApp
+    );
+    assert!(!CoreErr::Denied.is_path_failure());
+
+    let (tx, rx) = tokio::sync::watch::channel(1500u16);
+    let watch = MtuWatch::new(rx).with_overhead(30).with_cap(1400);
+    assert_eq!(watch.mtu(), 1400);
+    tx.send_replace(1300);
+    assert_eq!(watch.mtu(), 1270);
+
+    assert_ne!(LinkId::allocate(), LinkId::allocate());
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

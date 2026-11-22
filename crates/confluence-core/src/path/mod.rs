@@ -29,9 +29,9 @@ pub(crate) async fn best_effort(future: impl Future<Output = Result<(), CoreErr>
     let _ = tokio::time::timeout(Duration::from_millis(50), future).await;
 }
 
-pub(crate) async fn below_floor(mut mtu: tokio::sync::watch::Receiver<u16>, floor: u16) -> CoreErr {
+pub(crate) async fn below_floor(mut mtu: crate::MtuWatch, floor: u16) -> CoreErr {
     loop {
-        let limit = *mtu.borrow_and_update();
+        let limit = mtu.mtu_and_update();
         if limit < floor {
             return CoreErr::MtuTooSmall(limit);
         }

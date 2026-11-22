@@ -9,8 +9,8 @@ use tokio::{
 };
 
 use crate::{
-    ActionRef, BoxFut, CoreErr, PendingSetup, Plane, PublicKey, crypto::noise_ik::HopKey,
-    grant::GrantEnforcer, scope::Scope,
+    AuthRequest, BoxFut, CoreErr, Lease, LeaseHandle, PendingSetup, Plane, PublicKey, SessionAuth,
+    TargetRef, crypto::noise_ik::HopKey, scope::Scope,
 };
 
 pub(crate) struct AwaitingConfirm {
@@ -33,29 +33,35 @@ pub(crate) struct EndpointAuth {
     pub name: String,
     pub peer: PublicKey,
     pub plane: Plane,
-    pub grant: Arc<GrantEnforcer>,
+    pub lease: Arc<LeaseHandle>,
     pub terminal_key: HopKey,
 }
 impl EndpointAuth {
-    pub fn renewal(&self, credential: Vec<u8>) -> BoxFut<'static, Result<[u8; 16], CoreErr>> {
-        let (scope, name, peer, plane, enforcer) = (
+    pub fn session_auth(&self) -> SessionAuth {
+        self.lease.session_auth(self.peer)
+    }
+
+    pub fn renewal(&self, credential: Vec<u8>) -> BoxFut<'static, Result<[u8; 8], CoreErr>> {
+        let (scope, name, peer, plane, lease) = (
             self.scope.clone(),
             self.name.clone(),
             self.peer,
             self.plane,
-            self.grant.clone(),
+            self.lease.clone(),
         );
         Box::pin(async move {
-            let grant = scope
-                .policy
-                .verify(
-                    &peer,
-                    ActionRef::EndpointOpen { ep: &name, plane },
-                    &credential,
-                )
+            let renewed = scope
+                .auth
+                .authorize(AuthRequest {
+                    peer,
+                    target: TargetRef::Endpoint { name: &name, plane },
+                    credential: &credential,
+                    is_renewal: true,
+                })
                 .await?;
-            enforcer.renew(grant)?;
-            Ok(grant.to_wire())
+            let wire_ttl = Lease::wire_ttl_bytes(renewed.ttl);
+            scope.auth.renew_lease_from(&lease, renewed)?;
+            Ok(wire_ttl)
         })
     }
 }

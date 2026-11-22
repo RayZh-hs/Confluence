@@ -1,9 +1,15 @@
+//! End-to-end authenticated Datagram Plane session (`E2eDatagram`) with zero-copy sealing,
+//! silent bad-AEAD discard, in-band lease renewal, and authenticated E2E DPLPMTUD probing.
+
 use rand_core::{OsRng, RngCore};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU16, Ordering},
+use std::{
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicU16, Ordering},
+    },
+    time::Duration,
 };
-use std::time::Duration;
 use tokio::{
     sync::{Mutex, OwnedSemaphorePermit, mpsc, watch},
     time::Instant,
@@ -11,26 +17,27 @@ use tokio::{
 
 use super::{
     AwaitingConfirm, EndpointAuth, Lifetime, cancellation, record_error,
-    renewal::{Ack, Renewals, Request},
+    renewal::{Ack, LeaseSlot, Renewals, Request},
 };
 use crate::{
-    CoreErr, CredentialTarget, DatagramEndpointHandler, Either, PacketBuf, PathOutcome,
+    CoreErr, DatagramAction, DatagramLinkExt, Direction, DynDatagramEndpointHandler, Lease,
+    LeaseHandle, MtuWatch, PacketBuf, PathOutcome,
     cid::Cid,
     crypto::{
         aead::{ControlCipher, DatagramRx, DatagramTx},
         noise_ik::SessionKeys,
     },
-    grant::{GrantEnforcer, GrantSpec},
+    lease::GateCache,
     path::{
         best_effort,
         dg_switch::{self, Binding},
         timed,
     },
-    race,
     scope::Scope,
     wire::{e2e, hop, setup, u16_at, u64_at},
 };
 
+/// Handle to an end-to-end authenticated Datagram Plane session.
 #[derive(Clone)]
 pub struct E2eDatagram {
     life: Arc<Lifetime>,
@@ -38,12 +45,15 @@ pub struct E2eDatagram {
     incoming: Arc<Mutex<mpsc::Receiver<PacketBuf>>>,
     outgoing: mpsc::Sender<PacketBuf>,
 }
+
 impl E2eDatagram {
+    /// Current maximum application payload size in bytes (wire MTU minus 30B overhead).
     pub fn max_payload(&self) -> usize {
         usize::from(self.mtu.load(Ordering::Acquire)).saturating_sub(e2e::DG_OVERHEAD)
     }
-    /// Check size and queue space synchronously. An oversize message leaves the
-    /// connection open, and never enters the carrier's send queue.
+
+    /// Synchronously validates size and enqueues `packet`. An oversize message returns
+    /// [`CoreErr::MessageTooLarge`] without closing the session or sending on the wire.
     pub fn send(&self, packet: PacketBuf) -> Result<(), CoreErr> {
         self.check(&packet)?;
         self.outgoing.try_send(packet).map_err(|error| match error {
@@ -51,6 +61,8 @@ impl E2eDatagram {
             mpsc::error::TrySendError::Closed(_) => self.failure(),
         })
     }
+
+    /// Waits for send-queue capacity and enqueues `packet`.
     pub async fn send_wait(&self, packet: PacketBuf) -> Result<(), CoreErr> {
         self.check(&packet)?;
         let slot = self.outgoing.reserve().await.map_err(|_| self.failure())?;
@@ -58,13 +70,17 @@ impl E2eDatagram {
         slot.send(packet);
         Ok(())
     }
+
+    /// Receives the next authenticated discrete datagram from the remote peer.
     pub async fn recv(&self) -> Result<PacketBuf, CoreErr> {
         let mut incoming = self.incoming.lock().await;
-        match race(cancellation(&self.life.0), incoming.recv()).await {
-            Either::Left(error) => Err(error),
-            Either::Right(packet) => packet.ok_or_else(|| self.failure()),
+        tokio::select! {
+            biased;
+            error = cancellation(&self.life.0) => Err(error),
+            packet = incoming.recv() => packet.ok_or_else(|| self.failure()),
         }
     }
+
     fn check(&self, packet: &PacketBuf) -> Result<(), CoreErr> {
         if let Some(error) = self.life.0.borrow().clone() {
             return Err(error);
@@ -75,16 +91,19 @@ impl E2eDatagram {
         }
         Ok(())
     }
+
     fn failure(&self) -> CoreErr {
         self.life.0.borrow().clone().unwrap_or(CoreErr::Closed)
     }
 }
+
 pub(crate) struct Wire {
     binding: Binding,
     remote: Cid,
     tx: DatagramTx,
     rx: DatagramRx,
 }
+
 impl Wire {
     pub fn new(binding: Binding, remote: Cid, keys: SessionKeys) -> Self {
         Self {
@@ -94,6 +113,7 @@ impl Wire {
             rx: DatagramRx::new(keys.rx),
         }
     }
+
     async fn record(&mut self, kind: u8, packet: PacketBuf) -> Result<(), CoreErr> {
         let mut frame = self.tx.seal(kind, packet)?;
         if !frame.prepend_header(&hop::datagram_data(self.remote)) {
@@ -101,11 +121,13 @@ impl Wire {
         }
         self.binding.send(frame).await
     }
+
     async fn control(&self, kind: u8, ttl: u8, body: &[u8]) -> Result<(), CoreErr> {
         self.binding
             .send(dg_switch::control(kind, ttl, self.remote, body))
             .await
     }
+
     fn decode(&mut self, mut packet: PacketBuf) -> Result<(u64, u8, PacketBuf), CoreErr> {
         if packet.as_slice().first() != Some(&hop::DG_DATA) || !packet.strip_header(5) {
             return Err(CoreErr::Malformed);
@@ -119,75 +141,189 @@ pub(crate) struct Mtu {
     pub floor: u16,
 }
 
-pub(crate) async fn connect(
-    scope: &Scope,
-    mut wire: Wire,
+/// A 1-RTT authenticated Datagram session whose destination `EndpointHandler` has **not** yet
+/// been invoked (`B` is still in `AwaitingConfirm`).
+pub struct StagedDatagram {
+    inner: Option<StagedDatagramInner>,
+}
+
+struct StagedDatagramInner {
+    scope: Arc<Scope>,
+    wire: Wire,
     mtu: Mtu,
-    grant: Arc<GrantEnforcer>,
+    lease: Arc<LeaseHandle>,
     origin: Renewals,
     session: OwnedSemaphorePermit,
-) -> Result<E2eDatagram, CoreErr> {
-    timed(wire.record(e2e::DG_DATA, PacketBuf::from_slice(&[]))).await?;
-    let (handle, worker) = worker(wire, mtu, grant, Role::Origin(origin), None, session);
-    scope.tasks.spawn(Box::pin(worker));
-    Ok(handle)
 }
+
+impl StagedDatagram {
+    pub(crate) fn new(
+        scope: Arc<Scope>,
+        wire: Wire,
+        mtu: Mtu,
+        lease: Arc<LeaseHandle>,
+        origin: Renewals,
+        session: OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            inner: Some(StagedDatagramInner {
+                scope,
+                wire,
+                mtu,
+                lease,
+                origin,
+                session,
+            }),
+        }
+    }
+
+    /// Negotiated wire MTU ceiling for this staged path.
+    pub fn mtu(&self) -> u16 {
+        self.inner.as_ref().map_or(0, |s| s.mtu.ceiling)
+    }
+
+    /// Maximum application payload size in bytes for this staged path.
+    pub fn max_payload(&self) -> usize {
+        usize::from(self.mtu()).saturating_sub(e2e::DG_OVERHEAD)
+    }
+
+    /// Caller-chosen path identifier supplied in `ExplicitPath::id`.
+    pub fn path_id(&self) -> u64 {
+        self.inner.as_ref().map_or(0, |s| s.origin.path_id)
+    }
+
+    /// Transmits the `ee`-authenticated confirmation frame (opening `B`'s handler), spawns the
+    /// session worker, reports [`PathOutcome::Established`], and returns [`E2eDatagram`].
+    pub async fn confirm(mut self) -> Result<E2eDatagram, CoreErr> {
+        let mut inner = self.inner.take().ok_or(CoreErr::Closed)?;
+        let mtu = inner.mtu.ceiling;
+        let path_id = inner.origin.path_id;
+        let source = inner.origin.source.clone();
+        timed(inner.wire.record(e2e::DG_DATA, PacketBuf::from_slice(&[]))).await?;
+        let (handle, worker) = worker(
+            inner.wire,
+            inner.mtu,
+            inner.lease,
+            Role::Origin(inner.origin),
+            None,
+            inner.session,
+        );
+        inner.scope.tasks.spawn(Box::pin(worker));
+        source.report_outcome(path_id, PathOutcome::Established { mtu });
+        Ok(handle)
+    }
+}
+
+impl Drop for StagedDatagram {
+    fn drop(&mut self) {
+        let Some(mut inner) = self.inner.take() else {
+            return;
+        };
+        inner.origin.report(PathOutcome::Closed);
+        let tasks = inner.scope.tasks.clone();
+        tasks.spawn(Box::pin(async move {
+            let mut ciphers: Vec<_> = inner
+                .origin
+                .hops
+                .iter()
+                .map(|key| key.control(true))
+                .collect();
+            let close = async {
+                let _ = inner
+                    .wire
+                    .record(
+                        e2e::DG_CLOSE,
+                        PacketBuf::from_slice(&record_error(&CoreErr::Closed)),
+                    )
+                    .await;
+                for (index, cipher) in ciphers.iter_mut().enumerate().rev() {
+                    if let Ok(body) = cipher.seal(hop::DG_CLOSE, &record_error(&CoreErr::Closed)) {
+                        let _ = inner.wire.control(hop::DG_CLOSE, index as u8, &body).await;
+                    }
+                }
+                Ok(())
+            };
+            best_effort(close).await;
+        }));
+    }
+}
+
 pub(crate) async fn serve(
     mut wire: Wire,
     mtu: Mtu,
-    handler: Arc<dyn DatagramEndpointHandler>,
+    handler: Arc<dyn DynDatagramEndpointHandler>,
     auth: EndpointAuth,
     pending: AwaitingConfirm,
     session: OwnedSemaphorePermit,
 ) -> Result<(), CoreErr> {
-    let grant = auth.grant.clone();
+    let lease = auth.lease.clone();
     let setup = async {
         loop {
             let frame = wire.binding.recv().await?;
             if frame.len() > usize::from(mtu.ceiling) {
                 continue;
             }
-            if let Ok((seq, e2e::DG_DATA, packet)) = wire.decode(frame) {
-                if seq == 0 && packet.is_empty() {
-                    return Ok(None);
+            if let Ok((seq, kind, packet)) = wire.decode(frame) {
+                if kind == e2e::DG_CLOSE {
+                    return Err(CoreErr::Closed);
                 }
-                if grant.check_and_deduct(packet.len()) {
-                    return Ok(Some(packet));
+                if kind == e2e::DG_DATA {
+                    if seq == 0 && packet.is_empty() {
+                        return Ok(None);
+                    }
+                    if lease.is_active() {
+                        return Ok(Some(packet));
+                    }
                 }
             }
         }
     };
-    let first = match race(
-        grant.cancelled(),
-        crate::path::before(pending.deadline, setup),
-    )
-    .await
-    {
-        Either::Left(error) => return Err(error),
-        Either::Right(result) => result?,
+    let mut first = tokio::select! {
+        error = lease.cancelled() => return Err(error),
+        res = crate::path::before(pending.deadline, setup) => res?,
     };
     drop(pending);
-    let app = match race(grant.cancelled(), timed(handler.open(auth.peer))).await {
-        Either::Right(Ok(link)) => link,
-        other => {
-            let reason = match other {
-                Either::Left(error) | Either::Right(Err(error)) => error,
-                _ => unreachable!(),
-            };
-            best_effort(wire.record(e2e::DG_CLOSE, PacketBuf::from_slice(&record_error(&reason))))
+    if let Some(pkt) = &first {
+        let mut gate = lease.gate_cache();
+        if let Some(active_gate) = gate.current(&lease) {
+            match active_gate.check_datagram(Direction::Ingress, pkt.len()) {
+                DatagramAction::Allow => {}
+                DatagramAction::Drop => first = None,
+                DatagramAction::Close(error) => {
+                    best_effort(
+                        wire.record(e2e::DG_CLOSE, PacketBuf::from_slice(&record_error(&error))),
+                    )
+                    .await;
+                    return Err(error);
+                }
+            }
+        }
+    }
+    let session_auth = auth.session_auth();
+    let app = tokio::select! {
+        error = lease.cancelled() => {
+            best_effort(wire.record(e2e::DG_CLOSE, PacketBuf::from_slice(&record_error(&error))))
                 .await;
-            return Err(reason);
+            return Err(error);
+        }
+        res = timed(handler.dyn_open(session_auth)) => match res {
+            Ok(link) => link,
+            Err(error) => {
+                best_effort(wire.record(e2e::DG_CLOSE, PacketBuf::from_slice(&record_error(&error))))
+                    .await;
+                return Err(error);
+            }
         }
     };
     let tasks = auth.scope.tasks.clone();
-    let (handle, worker) = worker(wire, mtu, grant, Role::Destination(auth), first, session);
+    let (handle, worker) = worker(wire, mtu, lease, Role::Destination(auth), first, session);
     tasks.spawn(Box::pin(worker));
     let upload = async {
         loop {
             let packet = app.recv().await?;
             match handle.send_wait(packet).await {
                 Ok(()) | Err(CoreErr::MessageTooLarge(_)) => {}
-                Err(error) => return Err(error),
+                Err(error) => return Err::<(), CoreErr>(error),
             }
         }
     };
@@ -195,18 +331,26 @@ pub(crate) async fn serve(
         loop {
             app.send(handle.recv().await?).await?;
         }
+        #[allow(unreachable_code)]
+        Ok::<(), CoreErr>(())
     };
-    let application = async { same(race(upload, download).await) };
-    match race(cancellation(&handle.life.0), application).await {
-        Either::Left(error) => Err(error),
-        Either::Right(result) => {
-            if let Err(error) = &result {
+    tokio::select! {
+        error = cancellation(&handle.life.0) => Err(error),
+        res = upload => {
+            if let Err(error) = &res {
                 handle.life.0.send_replace(Some(error.clone()));
             }
-            result
+            res
+        }
+        res = download => {
+            if let Err(error) = &res {
+                handle.life.0.send_replace(Some(error.clone()));
+            }
+            res
         }
     }
 }
+
 enum Role {
     Origin(Renewals),
     Destination(EndpointAuth),
@@ -215,7 +359,7 @@ enum Role {
 fn worker(
     wire: Wire,
     limits: Mtu,
-    grant: Arc<GrantEnforcer>,
+    lease: Arc<LeaseHandle>,
     role: Role,
     first: Option<PacketBuf>,
     permit: OwnedSemaphorePermit,
@@ -240,7 +384,7 @@ fn worker(
             max: limits.ceiling,
             min: limits.floor,
             mtu,
-            grant,
+            lease,
             role,
             incoming,
             probe: None,
@@ -256,12 +400,13 @@ struct Session {
     max: u16,
     min: u16,
     mtu: Arc<AtomicU16>,
-    grant: Arc<GrantEnforcer>,
+    lease: Arc<LeaseHandle>,
     role: Role,
     incoming: mpsc::Sender<PacketBuf>,
     probe: Option<Probe>,
     last_hint: Option<Instant>,
 }
+
 impl Session {
     async fn run(
         &mut self,
@@ -274,13 +419,11 @@ impl Session {
         };
         let (requests, to_send) = mpsc::channel::<Request>(16);
         let (acks, replies) = mpsc::channel::<Ack>(16);
-        let grant = self.grant.clone();
+        let lease = self.lease.clone();
         let (manage, peer) = match &mut self.role {
             Role::Origin(origin) => (Some(origin), None),
             Role::Destination(auth) => (None, Some(auth)),
         };
-        // Move the driver out of the I/O borrow so policy refresh and I/O are
-        // independently pollable, including while receiving a burst of data.
         let origin = manage.is_some();
         let mut context = Context {
             origin,
@@ -299,7 +442,8 @@ impl Session {
             mtu: &self.mtu,
             probe: &mut self.probe,
             last_hint: &mut self.last_hint,
-            grant: &grant,
+            lease: &lease,
+            gate: lease.gate_cache(),
             incoming: &self.incoming,
             route: manage
                 .as_ref()
@@ -307,27 +451,22 @@ impl Session {
         };
         let drive = async {
             if let Some(driver) = manage {
-                driver.drive(requests, replies, &grant).await
+                driver.drive(requests, replies, &lease).await
             } else {
                 let (_requests, _replies) = (requests, replies);
                 std::future::pending().await
             }
         };
-        let result = match race(
-            race(cancellation(signal), grant.cancelled()),
-            race(drive, pump.run(&mut context)),
-        )
-        .await
-        {
-            Either::Left(Either::Left(error) | Either::Right(error)) => Err(error),
-            Either::Right(Either::Left(result) | Either::Right(result)) => result,
+        let result = tokio::select! {
+            error = cancellation(signal) => Err(error),
+            error = lease.cancelled() => Err(error),
+            res = drive => res,
+            res = pump.run(&mut context) => res,
         };
         let error = result.err().unwrap_or(CoreErr::Closed);
         signal.send_replace(Some(error.clone()));
         let wire = &mut self.wire;
         let close = async {
-            // A received E2E_CLOSE can be echoed once without a loop: the
-            // receiving session removes its CID when its worker returns.
             let _ = wire
                 .record(e2e::DG_CLOSE, PacketBuf::from_slice(&record_error(&error)))
                 .await;
@@ -355,9 +494,10 @@ struct Context<'a> {
     outbound: mpsc::Receiver<PacketBuf>,
     ciphers: &'a mut [ControlCipher],
     peer: Option<&'a mut EndpointAuth>,
-    policy: Option<crate::BoxFut<'static, Result<[u8; 16], CoreErr>>>,
-    mtu_watch: watch::Receiver<u16>,
+    policy: Option<crate::BoxFut<'static, Result<[u8; 8], CoreErr>>>,
+    mtu_watch: MtuWatch,
 }
+
 struct Pump<'a> {
     wire: &'a mut Wire,
     min: u16,
@@ -365,99 +505,72 @@ struct Pump<'a> {
     mtu: &'a AtomicU16,
     probe: &'a mut Option<Probe>,
     last_hint: &'a mut Option<Instant>,
-    grant: &'a GrantEnforcer,
+    lease: &'a LeaseHandle,
+    gate: GateCache,
     incoming: &'a mpsc::Sender<PacketBuf>,
     route: Option<(Arc<dyn crate::PathSource>, u64)>,
 }
-enum Work {
-    Probe,
-    Mtu,
-    Grant(Result<[u8; 16], CoreErr>),
-    Renewal(Option<Request>),
-    App(Option<PacketBuf>),
-    Wire(Result<PacketBuf, CoreErr>),
-}
+
 impl Pump<'_> {
     async fn run(&mut self, context: &mut Context<'_>) -> Result<(), CoreErr> {
-        let mut prefer_app = false;
         loop {
-            let timer = async {
-                match self.probe.as_ref() {
-                    Some(probe) => tokio::time::sleep_until(probe.deadline()).await,
-                    None => std::future::pending().await,
+            let probe_deadline = self.probe.as_ref().map(Probe::deadline);
+            tokio::select! {
+                _ = async { tokio::time::sleep_until(probe_deadline.unwrap()).await }, if probe_deadline.is_some() => {
+                    self.probe_step().await?;
                 }
-                Work::Probe
-            };
-            let mtu = async {
-                dg_switch::mtu_changed(&mut context.mtu_watch).await;
-                Work::Mtu
-            };
-            let policy = async {
-                let result = match context.policy.as_mut() {
-                    Some(policy) => policy.await,
-                    None => std::future::pending().await,
-                };
-                Work::Grant(result)
-            };
-            let requests = async { Work::Renewal(context.to_send.recv().await) };
-            let input = async { Work::Wire(self.wire.binding.recv().await) };
-            let output = async { Work::App(context.outbound.recv().await) };
-            let traffic = async {
-                if prefer_app {
-                    same(race(output, input).await)
-                } else {
-                    same(race(input, output).await)
-                }
-            };
-            let work = same(
-                race(timer, async {
-                    same(
-                        race(mtu, async {
-                            same(race(policy, async { same(race(requests, traffic).await) }).await)
-                        })
-                        .await,
-                    )
-                })
-                .await,
-            );
-            prefer_app = !prefer_app;
-            match work {
-                Work::Probe => self.probe_step().await?,
-                Work::Mtu => {
+                _ = dg_switch::mtu_changed(&mut context.mtu_watch) => {
                     let mtu = self.wire.binding.mtu();
                     if mtu < self.mtu.load(Ordering::Acquire) {
                         self.changed(mtu, context.origin).await?;
                     }
                 }
-                Work::Grant(result) => {
+                result = async { context.policy.as_mut().unwrap().await }, if context.policy.is_some() => {
                     context.policy = None;
                     let body = PacketBuf::from_slice(&result?);
                     self.send(e2e::DG_RENEW_OK, body, context.origin).await?;
                 }
-                Work::Renewal(Some((CredentialTarget::Endpoint, value))) => {
-                    self.send(e2e::DG_RENEW, PacketBuf::from_slice(&value), context.origin)
-                        .await?;
-                }
-                Work::Renewal(Some((CredentialTarget::Hop(index), value))) => {
-                    let body = context.ciphers[usize::from(index)].seal(hop::DG_RENEW, &value)?;
-                    match self.wire.control(hop::DG_RENEW, index, &body).await {
-                        Ok(()) | Err(CoreErr::WouldBlock) => {}
-                        Err(error) => return Err(error),
+                req = context.to_send.recv() => match req {
+                    Some((LeaseSlot::Endpoint, value)) => {
+                        self.send(e2e::DG_RENEW, PacketBuf::from_slice(&value), context.origin)
+                            .await?;
                     }
-                }
-                Work::Renewal(None) | Work::App(None) => return Err(CoreErr::Closed),
-                Work::App(Some(packet)) => {
-                    if packet.len() + e2e::DG_OVERHEAD
-                        <= usize::from(self.mtu.load(Ordering::Acquire))
-                        && self.grant.check_and_deduct(packet.len())
-                    {
-                        self.send(e2e::DG_DATA, packet, context.origin).await?;
+                    Some((LeaseSlot::Hop(index), value)) => {
+                        let body = context.ciphers[usize::from(index)].seal(hop::DG_RENEW, &value)?;
+                        match self.wire.control(hop::DG_RENEW, index, &body).await {
+                            Ok(()) | Err(CoreErr::WouldBlock) => {}
+                            Err(error) => return Err(error),
+                        }
                     }
+                    None => return Err(CoreErr::Closed),
+                },
+                app = context.outbound.recv() => match app {
+                    Some(packet) => {
+                        if packet.len() + e2e::DG_OVERHEAD
+                            <= usize::from(self.mtu.load(Ordering::Acquire))
+                            && self.lease.is_active()
+                        {
+                            if !context.origin
+                                && let Some(active_gate) = self.gate.current(self.lease)
+                            {
+                                match active_gate.check_datagram(Direction::Egress, packet.len()) {
+                                    DatagramAction::Allow => {}
+                                    DatagramAction::Drop => continue,
+                                    DatagramAction::Close(err) => return Err(err),
+                                }
+                            }
+                            self.send(e2e::DG_DATA, packet, context.origin).await?;
+                        }
+                    }
+                    None => return Err(CoreErr::Closed),
+                },
+                wire = self.wire.binding.recv() => {
+                    self.receive(wire?, context).await?;
                 }
-                Work::Wire(packet) => self.receive(packet?, context).await?,
             }
         }
     }
+
     async fn send(&mut self, kind: u8, packet: PacketBuf, origin: bool) -> Result<(), CoreErr> {
         match self.wire.record(kind, packet).await {
             Ok(()) | Err(CoreErr::WouldBlock) => Ok(()),
@@ -465,6 +578,7 @@ impl Pump<'_> {
             Err(error) => Err(error),
         }
     }
+
     async fn receive(
         &mut self,
         packet: PacketBuf,
@@ -477,8 +591,6 @@ impl Pump<'_> {
             }
             let (kind, distance, body) = (wire[0], wire[1], &wire[6..]);
             if kind == hop::DG_MTU_HINT && body.len() == 2 {
-                // A relay can advise a lower MTU, but only a local link or an
-                // authenticated failure can tear the session down.
                 if self.probe.is_none() {
                     self.changed(u16_at(body, 0).max(self.min), true).await?;
                 }
@@ -494,10 +606,8 @@ impl Pump<'_> {
                         });
                     }
                     hop::DG_RENEW_OK => {
-                        let spec = GrantSpec::from_wire(&plaintext)?;
-                        let _ = context
-                            .acks
-                            .try_send((CredentialTarget::Hop(distance), spec));
+                        let ttl = Lease::from_wire_ttl(&plaintext)?;
+                        let _ = context.acks.try_send((LeaseSlot::Hop(distance), ttl));
                     }
                     _ => {}
                 }
@@ -511,8 +621,17 @@ impl Pump<'_> {
             e2e::DG_DATA => {
                 if !(seq == 0 && body.is_empty() && !context.origin)
                     && body.len() + e2e::DG_OVERHEAD <= usize::from(self.max)
-                    && self.grant.check_and_deduct(body.len())
+                    && self.lease.is_active()
                 {
+                    if !context.origin
+                        && let Some(active_gate) = self.gate.current(self.lease)
+                    {
+                        match active_gate.check_datagram(Direction::Ingress, body.len()) {
+                            DatagramAction::Allow => {}
+                            DatagramAction::Drop => return Ok(()),
+                            DatagramAction::Close(err) => return Err(err),
+                        }
+                    }
                     let _ = self.incoming.try_send(body);
                 }
             }
@@ -526,13 +645,11 @@ impl Pump<'_> {
                 }
             }
             e2e::DG_RENEW_OK if context.origin => {
-                let spec = GrantSpec::from_wire(body.as_slice())?;
-                let _ = context.acks.try_send((CredentialTarget::Endpoint, spec));
+                let ttl = Lease::from_wire_ttl(body.as_slice())?;
+                let _ = context.acks.try_send((LeaseSlot::Endpoint, ttl));
             }
             e2e::DG_CLOSE => return Err(setup::decode_error(body.as_slice())?),
-            e2e::MTU_PROBE
-                if valid_probe(&body, self.max) && self.grant.check_and_deduct(body.len()) =>
-            {
+            e2e::MTU_PROBE if valid_probe(&body, self.max) && self.lease.is_active() => {
                 self.send(e2e::MTU_PROBE_ACK, body, context.origin).await?;
             }
             e2e::MTU_PROBE_ACK if valid_probe(&body, self.max) => {
@@ -547,13 +664,16 @@ impl Pump<'_> {
         }
         Ok(())
     }
+
     fn set_mtu(&self, mtu: u16) {
-        if self.mtu.swap(mtu, Ordering::AcqRel) != mtu
-            && let Some((source, id)) = &self.route
-        {
-            source.report_outcome(*id, PathOutcome::MtuChanged { mtu });
+        if self.mtu.swap(mtu, Ordering::AcqRel) != mtu {
+            tracing::debug!(mtu, "datagram session MTU updated");
+            if let Some((source, id)) = &self.route {
+                source.report_outcome(*id, PathOutcome::MtuChanged { mtu });
+            }
         }
     }
+
     async fn changed(&mut self, ceiling: u16, origin: bool) -> Result<(), CoreErr> {
         if ceiling < self.min {
             return Err(CoreErr::MtuTooSmall(ceiling));
@@ -578,8 +698,6 @@ impl Pump<'_> {
             self.wire
                 .control(hop::DG_MTU_HINT, 0, &ceiling.to_be_bytes())
                 .await?;
-            // Destination uses the same authenticated probing machinery for
-            // its send path. The hint wakes the originator independently.
             *self.probe = Some(Probe {
                 low: self.min,
                 high: ceiling.min(self.max),
@@ -588,8 +706,11 @@ impl Pump<'_> {
         }
         Ok(())
     }
+
     async fn probe_step(&mut self) -> Result<(), CoreErr> {
-        let probe = self.probe.as_mut().unwrap();
+        let Some(probe) = self.probe.as_mut() else {
+            return Ok(());
+        };
         let retry = probe.pending.take().and_then(|pending| {
             if pending.attempt == 1 {
                 probe.high = pending.size - 1;
@@ -624,11 +745,7 @@ impl Pump<'_> {
         Ok(())
     }
 }
-fn same<T>(value: Either<T, T>) -> T {
-    match value {
-        Either::Left(v) | Either::Right(v) => v,
-    }
-}
+
 fn valid_probe(body: &PacketBuf, max: u16) -> bool {
     if body.len() < 10 {
         return false;
@@ -636,23 +753,27 @@ fn valid_probe(body: &PacketBuf, max: u16) -> bool {
     let size = u16_at(body.as_slice(), 8);
     size <= max && usize::from(size) == body.len() + e2e::DG_OVERHEAD
 }
+
 struct PendingProbe {
     token: u64,
     size: u16,
     until: Instant,
     attempt: u8,
 }
+
 struct Probe {
     low: u16,
     high: u16,
     pending: Option<PendingProbe>,
 }
+
 impl Probe {
     fn deadline(&self) -> Instant {
         self.pending
             .as_ref()
             .map_or_else(Instant::now, |probe| probe.until)
     }
+
     fn ack(&mut self, token: u64, size: u16) -> bool {
         if self
             .pending

@@ -1,78 +1,73 @@
-# API Reference
+# Extension Seams & Rust API Reference
 
-Confluence exposes a local control API (accessible via CLI or Unix socket/loopback HTTP) for managing the user-space Node instance, alongside federated wire protocols for Rendezvous signaling and peer-to-peer data transport.
+`confluence-core` exposes a narrow programmatic surface centered on `Node`, `TrustScope`, and four extension seam traits in `confluence_core::seams`.
 
-## Local Daemon Control
+---
 
-Each Confluence instance runs independently under a user account and is controlled via its local socket.
+## 1. Core Runtime API (`confluence_core`)
 
-### Instance & Identity
+### `StaticKeypair`, `PeerId`, and `TargetTag`
+- `StaticKeypair::generate() -> StaticKeypair` — Generates a random X25519 static keypair (zeroized on drop).
+- `StaticKeypair::from_secret_hex(&str) -> Result<StaticKeypair>` — Loads a 32-byte hex secret key.
+- `keypair.peer_id() -> PeerId` — 32-byte X25519 public key (`Display` / `FromStr` as 64-char hex).
+- `keypair.target_tag() -> TargetTag` — 8-byte `BLAKE2s256(pubkey)[..8]` listener demux tag.
 
-- `POST /v1/node/init` — Generate a new `NodeKey` keypair and initialize local instance state.
-- `GET /v1/node/status` — Return Node identity (`PublicKey`, registered `node@server` addresses), active TUN state, and connected Rendezvous/Relay servers.
-- `PUT /v1/node/rendezvous` — Configure or update the list of federated Rendezvous servers used for discovery and NAT traversal.
-- `PUT /v1/node/tun` — Enable or disable the optional virtual L3 TUN interface for transparent subnet routing.
+### `TrustScope` & `Node`
+```rust
+let router = StaticRouter::new();
+let node = Node::new(router);
 
-## Group Management
+let scope_id = ScopeId::new("engineering")?;
+let scope = TrustScope::new(scope_id.clone(), keypair, policy);
+node.add_scope(scope)?;
 
-Groups define isolated sharing scopes. Membership and permissions are enforced via cryptographic certificates signed by the Group creator(s).
+// Attach Seam 1 carriers & composable forwardable channels
+node.attach_datagram_channel(udp_carrier)?;
+node.attach_stream_channel(tcp_carrier)?;
+node.mount_datagram_forward_channel(acl_or_relay_dgram_channel)?;
+node.mount_stream_forward_channel(acl_or_relay_stream_channel)?;
 
-- `POST /v1/groups` — Create a new Group and generate its genesis parameters.
-  - **Body:** `{ "name": "string", "enable_peer_relay": true }`
-- `POST /v1/groups/{group_id}/invites` — Issue a signed invite token with scoped capabilities.
-  - **Parameters:** `ttl` (expiration), `allowed_ports` (publish/bind restrictions), `can_relay` (permission to use or act as a Group relay).
-- `POST /v1/groups/join` — Join an existing Group using an invite token.
-  - **Body:** `{ "token": "conf_inv_..." }`
-- `GET /v1/groups` — List all joined Groups, active peers, and discovered routes.
-- `DELETE /v1/groups/{group_id}` — Leave a Group and tear down all associated peer sessions and bindings.
-- `DELETE /v1/groups/{group_id}/peers/{peer_id}` — Revoke a peer's membership certificate (creator only) and immediately terminate its active sessions.
+// Seam 4 Inbound: publish explicit endpoints
+let mut stream_ep = node.publish_stream_endpoint(&scope_id, EndpointName::new("ssh")?)?;
+let mut dgram_ep = node.publish_datagram_endpoint(&scope_id, EndpointName::new("game-udp")?)?;
 
-## Endpoint Publishing & Binding
+// Seam 4 Outbound: open end-to-end encrypted stream or datagram session
+let mut stream = node.open_stream(&scope_id, remote_peer_id, EndpointName::new("ssh")?).await?;
+let dgram = node.open_datagram(&scope_id, remote_peer_id, EndpointName::new("game-udp")?).await?;
+```
 
-Instead of exposing an entire host, Nodes selectively publish local `addrport` targets to a Group and bind remote services locally.
+---
 
-### Publishing Local Services
+## 2. The Four Extension Seams (`confluence_core::seams`)
 
-- `POST /v1/groups/{group_id}/publish` — Expose a local `addrport` to members of the Group.
-  - **Body:**
-    ```json
-    {
-      "name": "minecraft",
-      "protocol": "tcp+udp",
-      "local_addr": "127.0.0.1:25565",
-      "allowed_peers": ["*"]
-    }
-    ```
-- `DELETE /v1/groups/{group_id}/publish/{name}` — Unpublish a service and close active peer streams to that endpoint.
+### Seam 1: Composable Channels (`seams::channel`)
+Divided strictly by plane (`Plane::Datagram` vs `Plane::Stream`) and role:
+- **Transport Carriers:**
+  - `DatagramChannel`: `id()`, `caps()`, `send_to(addr, payload)`, `recv_from(buf)`, `health()`, `close()`
+  - `StreamChannel`: `id()`, `caps()`, `open(addr) -> BoxedAsyncStream`, `accept() -> (BoxedAsyncStream, ChannelAddr)`, `health()`, `close()`
+- **Forwardable Channel Plugins (mounted by `TargetTag`):**
+  - `DatagramForwardChannel`: `target_tag()`, `caps()`, `handle_setup(source_addr, setup_payload) -> Result<SetupOutcome<BoxedDatagramForwardHandle>>`, `handle_control(...)`
+  - `StreamForwardChannel`: `target_tag()`, `caps()`, `handle_setup(source_addr, setup_payload) -> Result<SetupOutcome<BoxedAsyncStream>>`, `handle_control_stream(...)`
 
-### Binding Remote Services
+Provided implementations:
+- `confluence_carriers::{UdpDatagramChannel, TcpStreamChannel}` — Pure native socket carriers.
+- `confluence_carriers::{NoiseAclDatagramChannel, NoiseAclStreamChannel}` — Vertical `channel <-> originator` auth + `AccessControl` + `GrantEnforcer` wrappers.
+- `confluence_relay::{RelayDatagramChannel, RelayStreamChannel, RelayDatagramClient, RelayIngressStreamChannel}` — Zero-outbound-dial passive relay slots and client pool adapters.
 
-- `POST /v1/groups/{group_id}/bind` — Map a remote peer's published endpoint to a local loopback `addrport`.
-  - **Body:**
-    ```json
-    {
-      "peer": "alice@rv.example.org",
-      "service": "minecraft",
-      "listen_addr": "127.0.0.1:25565"
-    }
-    ```
-- `GET /v1/groups/{group_id}/routes` — Inspect active path selection (direct LAN, STUN/ICE hole-punched UDP, or Relay fallback) and round-trip latency per peer.
-- `DELETE /v1/groups/{group_id}/bind/{binding_id}` — Remove a local port binding.
+### Seam 2: Route / Path Source (`seams::routing`)
+- `PathSource::resolve(&self, scope: &ScopeId, target: &PeerId, plane: Plane) -> Result<ExplicitPath>`
+- `ExplicitPath`: Specifies `plane`, `entry_channel`, `entry_addr`, `hops: Vec<PathHop>`, `target_scope_tag`, `target_pubkey`, and optional `target_credential`.
+- Provided implementation: `confluence_routing::StaticRouter`.
 
-## Wire Specifications
+### Seam 3: Access Control (`seams::access`)
+- `AccessControl::evaluate(&self, req: AccessRequest) -> Result<Decision>`
+  - Evaluated **only on control events** (`Action::OpenEndpoint`, `Action::ChannelForward`, `Action::ChannelCustom`, `Action::RenewGrant`).
+  - Returns `Decision::Allow(Grant)` (`expires_at`, `max_bytes_per_sec`, `max_datagrams_per_sec`, `max_concurrent_streams`) or `Decision::Deny { reason }`.
+- `AccessControl::revocations(&self) -> broadcast::Receiver<RevocationEvent>`
+- `IntersectAccessControl<L, E>` (in `confluence_core`): Enforces local host hard veto, bounded evaluation timeouts (fail-closed), strict minimum `Grant` intersection, and merged revocation broadcasts.
+- Provided implementation: `confluence_policy::StaticPolicy`.
 
-### Identity & Invite Tokens
-
-- **Node Identifier:** `<base58(NodePublicKey)>@<rendezvous_domain>` (or human-readable alias resolved via the Rendezvous server).
-- **Invite Token (`conf_inv_*`):** Base64url-encoded CBOR structure containing:
-  - `group_id`: 32-byte Group public identifier.
-  - `rendezvous`: Bootstrap Rendezvous server endpoint(s).
-  - `capabilities`: Bitmask of permissions (`PUBLISH`, `BIND`, `RELAY`, `ADMIN`).
-  - `exp`: Unix timestamp expiration.
-  - `sig`: Ed25519 signature by the Group authority key.
-
-### Rendezvous & Relay Protocol
-
-1. **Registration:** Nodes establish a persistent TLS/WebSocket or QUIC control stream to their Rendezvous server and authenticate possession of `NodeKey`.
-2. **Signaling:** To connect across a Group, Nodes exchange encrypted candidate endpoints (LAN IPs, STUN-reflexive `addrport`s, and Relay descriptors) accompanied by their Group membership certificate.
-3. **Path Probing & Data Plane:** Peers perform parallel UDP hole-punching and latency probes inside WireGuard/Noise (`Noise_IK`) handshakes. Traffic dynamically migrates to the lowest-latency verified path, falling back to end-to-end encrypted Relay forwarding when direct UDP is blocked.
+### Seam 4: Edge Adapters (`seams::edge`)
+- `DatagramSession` trait (implemented by `ConfluenceDatagramSession`): `send`, `recv`, `renew`, `close`.
+- `ConfluenceStream`: Implements `tokio::io::AsyncRead + AsyncWrite + Unpin + Send` plus `renew` and AEAD-authenticated `close`.
+- Provided implementations: `confluence_edge::{TcpInboundForwarder, TcpOutboundForwarder, UdpInboundForwarder, UdpOutboundForwarder}`.

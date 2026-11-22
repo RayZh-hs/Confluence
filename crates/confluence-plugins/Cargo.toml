@@ -1,0 +1,12 @@
+[package]
+name = "confluence-plugins"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+confluence-core.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "io-util"] }
+
+[lints]
+workspace = true

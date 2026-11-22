@@ -259,7 +259,11 @@ name = "confluence-edge"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "confluence-carriers",
  "confluence-core",
+ "confluence-policy",
+ "confluence-relay",
+ "confluence-routing",
  "dashmap",
  "tokio",
  "tracing",
@@ -300,6 +304,7 @@ dependencies = [
  "confluence-core",
  "parking_lot",
  "serde",
+ "tokio",
  "toml",
 ]
 

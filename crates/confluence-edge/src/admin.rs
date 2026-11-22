@@ -1,5 +1,6 @@
 //! Explicit local-only Unix administration. One bounded command per connection.
 use confluence_core::{CoreErr, PublicKey, PublishGuard, ScopeInstance};
+use parking_lot::Mutex;
 use std::{
     collections::HashMap,
     fs::{self, DirBuilder},
@@ -8,7 +9,7 @@ use std::{
     os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -150,7 +151,7 @@ async fn command(mut stream: UnixStream, state: Arc<AdminState>) -> io::Result<(
 impl AdminState {
     fn execute(&self, input: &str) -> Result<String, CoreErr> {
         let fields: Vec<_> = input.split_ascii_whitespace().collect();
-        let mut publications = self.publications.lock().unwrap();
+        let mut publications = self.publications.lock();
         match fields.as_slice() {
             ["publish-stream", name, address] => {
                 let target = Arc::new(TcpTarget(addr(address)?));

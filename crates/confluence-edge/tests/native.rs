@@ -9,15 +9,14 @@ use std::{
     time::Duration,
 };
 
-use confluence_core::grant::GrantSpec;
 use confluence_core::*;
 use confluence_edge::{
     Destination, TcpTarget, UdpTarget, admin::AdminSocket, serve_local_tcp, serve_local_udp,
 };
 use confluence_net::{TcpCarrier, TcpIo, UdpCarrier, serve_tcp};
 use confluence_plugins::{
-    AuthAclWrapper, MemDatagramChannel, MemStreamChannel, StaticAcl, StaticPathSource,
-    TokioSpawner, mem_datagram_pair,
+    MemDatagramChannel, MemStreamChannel, StaticAuthorizer, StaticPathSource, TokioSpawner,
+    mem_datagram_pair,
 };
 use confluence_relay::PassiveRelay;
 use tokio::{
@@ -27,40 +26,35 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-const ID: ScopeId = ScopeId(21);
-const TAG: u64 = 100;
+const CARRIER: &str = "net";
 const EP: &str = "echo";
 const WAIT: Duration = Duration::from_secs(5);
 
 fn local() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
 }
-fn node(acl: &Arc<StaticAcl>, routes: &Arc<StaticPathSource>) -> ScopeInstance {
-    ScopeInstance::new(
-        ID,
-        ScopeKeypair::generate(),
-        acl.clone(),
-        routes.clone(),
-        Arc::new(TokioSpawner),
-    )
+
+fn node(auth: &Arc<StaticAuthorizer>, routes: &Arc<StaticPathSource>) -> ScopeInstance {
+    ScopeInstance::builder(ScopeKeypair::generate(), Arc::new(TokioSpawner))
+        .authorizer(auth.clone())
+        .routes(routes.clone())
+        .build()
 }
+
 fn setup() -> (
-    Arc<StaticAcl>,
+    Arc<StaticAuthorizer>,
     Arc<StaticPathSource>,
     ScopeInstance,
     ScopeInstance,
 ) {
-    let acl = Arc::new(StaticAcl::default());
+    let auth = Arc::new(StaticAuthorizer::default());
     let routes = Arc::new(StaticPathSource::default());
-    let a = node(&acl, &routes);
-    let b = node(&acl, &routes);
-    acl.allow(
-        ID,
-        a.public_key(),
-        GrantSpec::new(Duration::from_secs(45), 0),
-    );
-    (acl, routes, a, b)
+    let a = node(&auth, &routes);
+    let b = node(&auth, &routes);
+    auth.allow(a.public_key(), Lease::new(Duration::from_secs(45)));
+    (auth, routes, a, b)
 }
+
 fn route(
     routes: &StaticPathSource,
     b: &ScopeInstance,
@@ -70,34 +64,33 @@ fn route(
     hops: Vec<HopSpec>,
 ) {
     routes.set(
-        ID,
         b.public_key(),
         name,
         plane,
         ExplicitPath {
             id: 40,
-            first_channel: TAG,
+            first_channel: CARRIER.into(),
             first_locator,
             min_mtu: 0,
             hops,
         },
     );
 }
-fn hop(at: &ScopeInstance, locator: impl Into<Vec<u8>>) -> HopSpec {
+
+fn hop(at: &ScopeInstance, target: &str) -> HopSpec {
     HopSpec {
         peer: at.public_key(),
-        channel: TAG,
-        locator: locator.into(),
-        credential: Vec::new(),
+        target: target.into(),
     }
 }
+
 fn destination(node: &ScopeInstance, endpoint: &str) -> Destination {
     Destination {
         peer: node.public_key(),
         endpoint: endpoint.into(),
-        credential: Vec::new(),
     }
 }
+
 fn start_udp_echo(socket: UdpSocket) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut bytes = vec![0; 65_507];
@@ -108,6 +101,7 @@ fn start_udp_echo(socket: UdpSocket) -> tokio::task::JoinHandle<()> {
         }
     })
 }
+
 fn start_tcp_echo(listener: TcpListener) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
@@ -119,16 +113,13 @@ fn start_tcp_echo(listener: TcpListener) -> tokio::task::JoinHandle<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tcp_port_forward_backpressures_a_stalled_reader_across_three_native_hops() {
-    let (acl, routes, a, b) = setup();
-    let h1 = node(&acl, &routes);
-    let h2 = node(&acl, &routes);
-    let h3 = node(&acl, &routes);
+    let (auth, routes, a, b) = setup();
+    let h1 = node(&auth, &routes);
+    let h2 = node(&auth, &routes);
+    let h3 = node(&auth, &routes);
     let carrier = TcpCarrier::default();
-    a.register_stream_channel(TAG, Arc::new(carrier)).unwrap();
-    for node in [&h1, &h2, &h3] {
-        node.register_stream_channel(TAG, Arc::new(AuthAclWrapper::new(node, TAG, carrier)))
-            .unwrap();
-    }
+    a.register_stream_carrier(CARRIER, Arc::new(carrier))
+        .unwrap();
     let mut ingress = Vec::new();
     let mut locators = Vec::new();
     for node in [&h1, &h2, &h3, &b] {
@@ -136,17 +127,22 @@ async fn tcp_port_forward_backpressures_a_stalled_reader_across_three_native_hop
         locators.push(listener.local_addr().unwrap().to_string().into_bytes());
         ingress.push(tokio::spawn(serve_tcp(listener, node.clone(), carrier)));
     }
+    let _g1 = h1
+        .publish_stream_route("next", carrier, locators[1].clone())
+        .unwrap();
+    let _g2 = h2
+        .publish_stream_route("next", carrier, locators[2].clone())
+        .unwrap();
+    let _g3 = h3
+        .publish_stream_route("next", carrier, locators[3].clone())
+        .unwrap();
     route(
         &routes,
         &b,
         Plane::Stream,
         EP,
         locators[0].clone(),
-        vec![
-            hop(&h1, locators[1].clone()),
-            hop(&h2, locators[2].clone()),
-            hop(&h3, locators[3].clone()),
-        ],
+        vec![hop(&h1, "next"), hop(&h2, "next"), hop(&h3, "next")],
     );
     let target = TcpListener::bind(local()).await.unwrap();
     let _published = b
@@ -209,6 +205,7 @@ async fn tcp_port_forward_backpressures_a_stalled_reader_across_three_native_hop
         listener.abort();
     }
 }
+
 fn rss_kib() -> usize {
     std::fs::read_to_string("/proc/self/status")
         .unwrap()
@@ -224,8 +221,8 @@ fn rss_kib() -> usize {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_udp_emsgsize_at_a_relay_triggers_authenticated_mtu_recovery() {
-    let (acl, routes, a, b) = setup();
-    let relay = node(&acl, &routes);
+    let (auth, routes, a, b) = setup();
+    let relay = node(&auth, &routes);
     let discovery = UdpCarrier::new(u16::MAX).unwrap();
     let ingress = discovery.bind(local()).unwrap();
     let native_addr = ingress.local_addr().unwrap();
@@ -242,8 +239,8 @@ async fn native_udp_emsgsize_at_a_relay_triggers_authenticated_mtu_recovery() {
     let advertised = physical.saturating_add(48);
     let carrier = UdpCarrier::new(advertised).unwrap();
     let native = tokio::spawn(ingress.serve(b.clone()));
-    relay
-        .register_datagram_channel(TAG, Arc::new(AuthAclWrapper::new(&relay, TAG, carrier)))
+    let _transit = relay
+        .publish_datagram_route("to-b", carrier, native_addr.to_string().into_bytes())
         .unwrap();
     let memory = MemDatagramChannel::new(advertised);
     let first = tokio::spawn(
@@ -252,14 +249,15 @@ async fn native_udp_emsgsize_at_a_relay_triggers_authenticated_mtu_recovery() {
             .unwrap()
             .serve_datagram(relay.clone()),
     );
-    a.register_datagram_channel(TAG, Arc::new(memory)).unwrap();
+    a.register_datagram_carrier(CARRIER, Arc::new(memory))
+        .unwrap();
     route(
         &routes,
         &b,
         Plane::Datagram,
         EP,
         b"relay".to_vec(),
-        vec![hop(&relay, native_addr.to_string().into_bytes())],
+        vec![hop(&relay, "to-b")],
     );
     let target = UdpSocket::bind(local()).await.unwrap();
     let _published = b
@@ -267,13 +265,10 @@ async fn native_udp_emsgsize_at_a_relay_triggers_authenticated_mtu_recovery() {
         .unwrap();
     let echo = start_udp_echo(target);
     let mut outcomes = routes.outcomes();
-    let session = a
-        .dial_datagram(b.public_key(), EP, 1232, &[])
-        .await
-        .unwrap();
+    let session = a.dial_datagram(b.public_key(), EP, 1232).await.unwrap();
     assert_eq!(session.max_payload(), usize::from(advertised) - 30);
 
-    // This ciphertext exceeds the real DF limit on H → B, while the first
+    // This ciphertext exceeds the real DF limit on H -> B, while the first
     // (in-memory) link accepts it intact.
     session
         .send(PacketBuf::from_slice(&vec![13; session.max_payload()]))
@@ -312,12 +307,13 @@ async fn native_udp_emsgsize_at_a_relay_triggers_authenticated_mtu_recovery() {
 
 #[tokio::test]
 async fn native_udp_port_forward_flushes_packets_sent_during_setup() {
-    let (_acl, routes, a, b) = setup();
+    let (_auth, routes, a, b) = setup();
     let carrier = UdpCarrier::new(1232).unwrap();
     let link_in = carrier.bind(local()).unwrap();
     let address = link_in.local_addr().unwrap();
     let network = tokio::spawn(link_in.serve(b.clone()));
-    a.register_datagram_channel(TAG, Arc::new(carrier)).unwrap();
+    a.register_datagram_carrier(CARRIER, Arc::new(carrier))
+        .unwrap();
     route(
         &routes,
         &b,
@@ -354,12 +350,15 @@ async fn native_udp_port_forward_flushes_packets_sent_during_setup() {
 
 #[tokio::test]
 async fn passive_relay_uses_only_registered_streams_and_datagram_links() {
-    let (acl, routes, a, b) = setup();
-    let h = node(&acl, &routes);
+    let (auth, routes, a, b) = setup();
+    let h = node(&auth, &routes);
     let passive = PassiveRelay::new(16384, 1232).unwrap();
-    h.register_stream_channel(TAG, Arc::new(AuthAclWrapper::new(&h, TAG, passive.clone())))
+    let name = "opaque-presence";
+    let _ts = h
+        .publish_stream_transit(name, Arc::new(passive.clone()))
         .unwrap();
-    h.register_datagram_channel(TAG, Arc::new(AuthAclWrapper::new(&h, TAG, passive.clone())))
+    let _td = h
+        .publish_datagram_transit(name, Arc::new(passive.clone()))
         .unwrap();
 
     let listener = TcpListener::bind(local()).await.unwrap();
@@ -368,16 +367,19 @@ async fn passive_relay_uses_only_registered_streams_and_datagram_links() {
         .unwrap();
     let (registered, _) = listener.accept().await.unwrap();
     drop(listener);
-    let name = b"opaque-presence";
     passive
-        .register_stream(name, Box::new(TcpIo::new(registered, 16384).unwrap()))
+        .register_stream(
+            name.as_bytes(),
+            Box::new(TcpIo::new(registered, 16384).unwrap()),
+        )
         .unwrap();
     b.accept_stream(Box::new(TcpIo::new(b_to_h, 16384).unwrap()))
         .unwrap();
 
     let stream = MemStreamChannel::new(16384, 2048);
     let accept = tokio::spawn(stream.listen(b"relay").unwrap().serve_stream(h.clone()));
-    a.register_stream_channel(TAG, Arc::new(stream)).unwrap();
+    a.register_stream_carrier(CARRIER, Arc::new(stream))
+        .unwrap();
     let tcp = TcpListener::bind(local()).await.unwrap();
     let _stream = b
         .publish_stream(EP, Arc::new(TcpTarget(tcp.local_addr().unwrap())))
@@ -389,10 +391,10 @@ async fn passive_relay_uses_only_registered_streams_and_datagram_links() {
         Plane::Stream,
         EP,
         b"relay".to_vec(),
-        vec![hop(&h, name.to_vec())],
+        vec![hop(&h, name)],
     );
 
-    let session = a.dial_stream(b.public_key(), EP, &[]).await.unwrap();
+    let session = a.dial_stream(b.public_key(), EP).await.unwrap();
     session.write_all(b"presence").await.unwrap();
     session.shutdown().await.unwrap();
     let mut bytes = [0; 16];
@@ -404,16 +406,16 @@ async fn passive_relay_uses_only_registered_streams_and_datagram_links() {
     assert_eq!(session.read(&mut bytes).await.unwrap(), 0);
     tcp_echo.await.unwrap();
     assert!(matches!(
-        passive.dial_stream(name).await,
+        passive.dial_stream(name.as_bytes()).await,
         Err(CoreErr::TargetUnreachable)
     ));
 
     let (right, destination_link) = mem_datagram_pair(1232, 32);
-    let _registered = passive.register_datagram(name, right).unwrap();
+    let _registered = passive.register_datagram(name.as_bytes(), right).unwrap();
     let _datagram_ingress = b.attach_datagram(destination_link).unwrap();
     let datagram = MemDatagramChannel::new(1232);
     let incoming = tokio::spawn(datagram.listen(b"relay").unwrap().serve_datagram(h.clone()));
-    a.register_datagram_channel(TAG, Arc::new(datagram))
+    a.register_datagram_carrier(CARRIER, Arc::new(datagram))
         .unwrap();
     let udp = UdpSocket::bind(local()).await.unwrap();
     let _datagram = b
@@ -426,11 +428,11 @@ async fn passive_relay_uses_only_registered_streams_and_datagram_links() {
         Plane::Datagram,
         "udp",
         b"relay".to_vec(),
-        vec![hop(&h, name.to_vec())],
+        vec![hop(&h, name)],
     );
     let (first, second) = tokio::join!(
-        a.dial_datagram(b.public_key(), "udp", 1232, &[]),
-        a.dial_datagram(b.public_key(), "udp", 1232, &[]),
+        a.dial_datagram(b.public_key(), "udp", 1232),
+        a.dial_datagram(b.public_key(), "udp", 1232),
     );
     let (first, second) = (first.unwrap(), second.unwrap());
     for (circuit, payload) in [
@@ -465,7 +467,7 @@ async fn passive_relay_uses_only_registered_streams_and_datagram_links() {
 #[tokio::test]
 async fn unix_admin_is_0600_and_lives_only_on_the_explicit_socket() {
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-    let (_acl, _routes, _, b) = setup();
+    let (_auth, _routes, _, b) = setup();
     let path = std::env::temp_dir().join(format!("confluence-test-{}-admin", std::process::id()));
     let admin = AdminSocket::bind(&path).unwrap();
     let metadata = std::fs::symlink_metadata(&path).unwrap();
@@ -496,7 +498,7 @@ async fn unix_admin_is_0600_and_lives_only_on_the_explicit_socket() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn udp_ingress_protects_peer_capacity_and_multiplexes_outbound_carrier_links() {
-    let (acl, routes, a, b) = setup();
+    let (auth, routes, a, b) = setup();
     let carrier = UdpCarrier::new(1232).unwrap();
     // Only 1 admitted peer slot and 2 provisional slots: unauthenticated senders must
     // neither occupy the admitted slot nor pin provisional slots, while multiple
@@ -516,7 +518,7 @@ async fn udp_ingress_protects_peer_capacity_and_multiplexes_outbound_carrier_lin
     let mut attacker_sockets = Vec::new();
     for _ in 0..8 {
         let rogue_routes = Arc::new(StaticPathSource::default());
-        let rogue = node(&acl, &rogue_routes);
+        let rogue = node(&auth, &rogue_routes);
         let rogue_carrier = UdpCarrier::new(1232).unwrap();
         let sock = rogue_carrier.connect_from(local(), addr).await.unwrap();
         let plain = confluence_core::crypto::noise_ik::endpoint_plaintext(
@@ -531,7 +533,7 @@ async fn udp_ingress_protects_peer_capacity_and_multiplexes_outbound_carrier_lin
         let mut body = confluence_core::wire::setup::prefix(
             Plane::Datagram,
             1232,
-            None,
+            false,
             confluence_core::wire::setup::SEGMENT_OVERHEAD + plain.len(),
             0,
         )
@@ -562,7 +564,8 @@ async fn udp_ingress_protects_peer_capacity_and_multiplexes_outbound_carrier_lin
 
     // Now legitimate peer A opens 3 concurrent datagram circuits to B using the single
     // admitted peer slot (proving both provisional eviction and UdpCarrier link reuse).
-    a.register_datagram_channel(TAG, Arc::new(carrier)).unwrap();
+    a.register_datagram_carrier(CARRIER, Arc::new(carrier))
+        .unwrap();
     route(
         &routes,
         &b,
@@ -572,9 +575,9 @@ async fn udp_ingress_protects_peer_capacity_and_multiplexes_outbound_carrier_lin
         vec![],
     );
     let (c1, c2, c3) = tokio::join!(
-        a.dial_datagram(b.public_key(), EP, 1232, &[]),
-        a.dial_datagram(b.public_key(), EP, 1232, &[]),
-        a.dial_datagram(b.public_key(), EP, 1232, &[]),
+        a.dial_datagram(b.public_key(), EP, 1232),
+        a.dial_datagram(b.public_key(), EP, 1232),
+        a.dial_datagram(b.public_key(), EP, 1232),
     );
     let (c1, c2, c3) = (c1.unwrap(), c2.unwrap(), c3.unwrap());
     for (circuit, payload) in [

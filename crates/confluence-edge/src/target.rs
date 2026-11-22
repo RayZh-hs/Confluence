@@ -1,65 +1,83 @@
 use confluence_core::{
-    AsyncStream, BoxFut, ChannelCaps, CoreErr, DatagramEndpointHandler, DatagramLink, PacketBuf,
-    PublicKey, STREAM_CHUNK, StreamEndpointHandler,
+    ChannelCaps, CoreErr, DatagramEndpointHandler, DatagramLink, PacketBuf, STREAM_CHUNK,
+    SessionAuth, StreamEndpointHandler,
 };
 use confluence_net::{TcpIo, connect_error};
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    io,
+    net::SocketAddr,
+    sync::Arc,
+    task::{Context, Poll},
+};
 use tokio::net::{TcpStream, UdpSocket};
 
 /// Opens the local TCP service only when the Core calls the confirmed handler.
 pub struct TcpTarget(pub SocketAddr);
+
 impl StreamEndpointHandler for TcpTarget {
-    fn open(&self, _peer: PublicKey) -> BoxFut<'_, Result<Box<dyn AsyncStream>, CoreErr>> {
-        Box::pin(async {
-            let socket = TcpStream::connect(self.0).await.map_err(connect_error)?;
-            Ok(Box::new(TcpIo::new(socket, STREAM_CHUNK as u16)?) as Box<dyn AsyncStream>)
-        })
+    type Stream = TcpIo;
+
+    async fn open(&self, _auth: SessionAuth) -> Result<TcpIo, CoreErr> {
+        let socket = TcpStream::connect(self.0).await.map_err(connect_error)?;
+        TcpIo::new(socket, STREAM_CHUNK as u16)
     }
 }
+
+/// Opens a connected local UDP socket to the target service once confirmed.
 pub struct UdpTarget(pub SocketAddr);
+
 impl DatagramEndpointHandler for UdpTarget {
-    fn open(&self, _peer: PublicKey) -> BoxFut<'_, Result<Arc<dyn DatagramLink>, CoreErr>> {
-        Box::pin(async {
-            let local = if self.0.is_ipv4() {
-                SocketAddr::from(([0; 4], 0))
-            } else {
-                SocketAddr::from(([0; 8], 0))
-            };
-            let socket = UdpSocket::bind(local).await.map_err(connect_error)?;
-            socket.connect(self.0).await.map_err(connect_error)?;
-            Ok(Arc::new(LocalDatagrams(socket)) as Arc<dyn DatagramLink>)
-        })
+    type Link = Arc<LocalDatagrams>;
+
+    async fn open(&self, _auth: SessionAuth) -> Result<Arc<LocalDatagrams>, CoreErr> {
+        let local = if self.0.is_ipv4() {
+            SocketAddr::from(([0; 4], 0))
+        } else {
+            SocketAddr::from(([0; 8], 0))
+        };
+        let socket = UdpSocket::bind(local).await.map_err(connect_error)?;
+        socket.connect(self.0).await.map_err(connect_error)?;
+        Ok(Arc::new(LocalDatagrams(socket)))
     }
 }
-struct LocalDatagrams(UdpSocket);
+
+/// Poll-based [`DatagramLink`] backed by a connected local [`UdpSocket`].
+pub struct LocalDatagrams(UdpSocket);
+
 impl DatagramLink for LocalDatagrams {
     fn caps(&self) -> ChannelCaps {
         ChannelCaps::fixed(u16::MAX, false)
     }
-    fn send(&self, packet: PacketBuf) -> BoxFut<'_, Result<(), CoreErr>> {
-        Box::pin(async move {
-            let sent = self
-                .0
-                .send(packet.as_slice())
-                .await
-                .map_err(connect_error)?;
-            if sent == packet.len() {
-                Ok(())
-            } else {
-                Err(CoreErr::Carrier("short UDP send".into()))
-            }
-        })
+
+    fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), CoreErr>> {
+        self.0.poll_send_ready(cx).map_err(connect_error)
     }
-    fn recv(&self) -> BoxFut<'_, Result<PacketBuf, CoreErr>> {
-        Box::pin(async {
+
+    fn try_send(&self, packet: PacketBuf) -> Result<(), CoreErr> {
+        match self.0.try_send(packet.as_slice()) {
+            Ok(sent) if sent == packet.len() => Ok(()),
+            Ok(_) => Err(CoreErr::Carrier("short local UDP send".into())),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Err(CoreErr::WouldBlock),
+            Err(err) => Err(connect_error(err)),
+        }
+    }
+
+    fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Result<PacketBuf, CoreErr>> {
+        loop {
+            match self.0.poll_recv_ready(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(connect_error(err))),
+                Poll::Ready(Ok(())) => {}
+            }
             let mut packet = PacketBuf::with_payload_cap(u16::MAX as usize);
-            let n = self
-                .0
-                .recv(packet.spare_payload())
-                .await
-                .map_err(connect_error)?;
-            packet.advance_payload(n);
-            Ok(packet)
-        })
+            match self.0.try_recv(packet.spare_payload()) {
+                Ok(n) => {
+                    packet.advance_payload(n);
+                    return Poll::Ready(Ok(packet));
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(err) => return Poll::Ready(Err(connect_error(err))),
+            }
+        }
     }
 }

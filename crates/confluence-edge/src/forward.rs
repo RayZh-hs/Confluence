@@ -1,8 +1,9 @@
 use confluence_core::{CoreErr, PacketBuf, PublicKey, ScopeInstance};
+use parking_lot::Mutex;
 use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
@@ -21,7 +22,6 @@ const IDLE: Duration = Duration::from_secs(90);
 pub struct Destination {
     pub peer: PublicKey,
     pub endpoint: String,
-    pub credential: Vec<u8>,
 }
 
 /// Forwards each locally accepted TCP socket through a separate E2E stream.
@@ -49,9 +49,7 @@ async fn tcp_flow(
     scope: ScopeInstance,
     dst: Arc<Destination>,
 ) -> Result<(), CoreErr> {
-    let tunnel = scope
-        .dial_stream(dst.peer, &dst.endpoint, &dst.credential)
-        .await?;
+    let tunnel = scope.dial_stream(dst.peer, &dst.endpoint).await?;
     let (mut local_read, mut local_write) = stream.into_split();
     let to_remote = async {
         let mut buf = vec![0; tunnel.max_write_size()];
@@ -106,7 +104,7 @@ pub async fn serve_local_udp(
                     && clients.get(&address).is_some_and(|flow| Arc::ptr_eq(flow, &completed)) {
                     clients.remove(&address);
                 }
-                clients.retain(|_, queue| !queue.state.lock().unwrap().closed);
+                clients.retain(|_, queue| !queue.state.lock().closed);
             }
             incoming = socket.recv_from(&mut buf) => {
                 let (length, address) = incoming.map_err(confluence_net::connect_error)?;
@@ -136,9 +134,9 @@ async fn udp_flow(
     queue: &Queue,
 ) -> Result<(), CoreErr> {
     let tunnel = scope
-        .dial_datagram(dst.peer, &dst.endpoint, min_mtu, &dst.credential)
+        .dial_datagram(dst.peer, &dst.endpoint, min_mtu)
         .await?;
-    queue.state.lock().unwrap().active = true;
+    queue.state.lock().active = true;
     loop {
         tokio::select! {
             _ = tokio::time::sleep(IDLE) => return Ok(()),
@@ -175,7 +173,7 @@ struct Staging {
 impl Queue {
     /// True also means a live full queue tail-dropped the incoming datagram.
     fn push(&self, payload: &[u8]) -> bool {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if state.closed {
             return false;
         }
@@ -192,7 +190,7 @@ impl Queue {
         loop {
             let wake = self.available.notified();
             {
-                let mut state = self.state.lock().unwrap();
+                let mut state = self.state.lock();
                 if let Some(packet) = state.packets.pop_front() {
                     state.bytes -= packet.len();
                     return packet;
@@ -205,7 +203,7 @@ impl Queue {
 struct CloseQueue(Arc<Queue>);
 impl Drop for CloseQueue {
     fn drop(&mut self) {
-        self.0.state.lock().unwrap().closed = true;
+        self.0.state.lock().closed = true;
     }
 }
 
@@ -228,8 +226,8 @@ mod tests {
         for value in 0..QUEUE_PACKETS {
             assert_eq!(queue.next().await.as_slice(), &[value as u8]);
         }
-        assert!(queue.state.lock().unwrap().packets.is_empty());
-        queue.state.lock().unwrap().active = true;
+        assert!(queue.state.lock().packets.is_empty());
+        queue.state.lock().active = true;
         queue.push(&vec![4; QUEUE_BYTES + 1]);
         assert_eq!(queue.next().await.len(), QUEUE_BYTES + 1);
     }

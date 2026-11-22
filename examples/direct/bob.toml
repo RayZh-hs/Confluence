@@ -1,0 +1,41 @@
+# Direct Topology — Bob (Destination Node)
+# Exposes local TCP 127.0.0.1:8080 and UDP 127.0.0.1:8081 as endpoint "demo-app" in scope "lab".
+# Demo keys below are for local testing only — generate fresh keys with `confluence keygen`!
+
+[policy]
+default_allow = false
+default_ttl_secs = 300
+
+[[policy.rules]]
+scope = "lab"
+peers = ["7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13"] # Alice
+action = "open_endpoint"
+target = "demo-app"
+required_credential = "shared-lab-token"
+max_bytes_per_sec = 52428800
+max_concurrent_streams = 32
+
+[[scopes]]
+id = "lab"
+secret_key = "2222222222222222222222222222222222222222222222222222222222222222"
+
+[[udp_carriers]]
+id = "udp0"
+bind_addr = "127.0.0.1:14100"
+mtu = 1400
+
+[[tcp_carriers]]
+id = "tcp0"
+listen_addr = "127.0.0.1:14101"
+
+[[publish_endpoints]]
+scope = "lab"
+endpoint = "demo-app"
+plane = "stream"
+local_target = "127.0.0.1:8080"
+
+[[publish_endpoints]]
+scope = "lab"
+endpoint = "demo-app"
+plane = "datagram"
+local_target = "127.0.0.1:8081"

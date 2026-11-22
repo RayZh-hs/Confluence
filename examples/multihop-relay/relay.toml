@@ -1,0 +1,37 @@
+# Multi-Hop + Passive Relay Topology (A -> H1 -> R <- B) — Passive Relay R
+# Even though traffic arrives from H1, R authenticates Alice directly (`channel <-> A`)!
+
+[policy]
+default_allow = false
+default_ttl_secs = 300
+
+[[policy.rules]]
+scope = "relay-domain"
+peers = ["0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20"] # Bob
+action = "channel_custom"
+target = "relay_register"
+
+[[policy.rules]]
+scope = "relay-domain"
+peers = ["7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13"] # Alice
+action = "channel_custom"
+target = "relay_connect"
+required_credential = "relay-access-token"
+
+[[udp_carriers]]
+id = "udp_shared"
+bind_addr = "127.0.0.1:16200"
+
+[[tcp_carriers]]
+id = "tcp_shared"
+listen_addr = "127.0.0.1:16201"
+
+[[relay_channels]]
+plane = "datagram"
+scope = "relay-domain"
+secret_key = "3333333333333333333333333333333333333333333333333333333333333333"
+
+[[relay_channels]]
+plane = "stream"
+scope = "relay-domain"
+secret_key = "4444444444444444444444444444444444444444444444444444444444444444"

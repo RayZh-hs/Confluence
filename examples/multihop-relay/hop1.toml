@@ -1,0 +1,33 @@
+# Multi-Hop + Passive Relay Topology (A -> H1 -> R <- B) — Transit Hop H1
+# Mounts NoiseAclChannel egress wrappers; authenticates Alice directly and sees zero E2E plaintext.
+
+[policy]
+default_allow = false
+default_ttl_secs = 300
+
+[[policy.rules]]
+scope = "transit-edge"
+peers = ["7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13"] # Alice
+action = "channel_forward"
+required_credential = "hop1-transit-token"
+max_bytes_per_sec = 52428800
+
+[[udp_carriers]]
+id = "udp0"
+bind_addr = "127.0.0.1:16100"
+
+[[tcp_carriers]]
+id = "tcp0"
+listen_addr = "127.0.0.1:16101"
+
+[[acl_forward_channels]]
+plane = "datagram"
+carrier_id = "udp0"
+scope = "transit-edge"
+secret_key = "5555555555555555555555555555555555555555555555555555555555555555"
+
+[[acl_forward_channels]]
+plane = "stream"
+carrier_id = "tcp0"
+scope = "transit-edge"
+secret_key = "6666666666666666666666666666666666666666666666666666666666666666"

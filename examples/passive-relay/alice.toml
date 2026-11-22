@@ -1,0 +1,56 @@
+# Passive Relay Topology (A -> R <- B) — Alice (Originator Node)
+# Connects to Bob's passive slot on Relay R with 1-RTT single-pass E2E setup.
+
+[policy]
+default_allow = false
+
+[[scopes]]
+id = "lab"
+secret_key = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[[udp_carriers]]
+id = "udp0"
+bind_addr = "127.0.0.1:0"
+
+[[tcp_carriers]]
+id = "tcp0"
+
+[[routes]]
+scope = "lab"
+target_pubkey = "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20" # Bob
+plane = "stream"
+entry_channel = "tcp0"
+entry_addr = "127.0.0.1:15101"
+target_credential = "bob-e2e-token"
+
+[[routes.hops]]
+channel_pubkey = "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b" # Relay Stream
+next_addr = "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20"     # Bob's PeerId slot
+credential = "relay-access-token"
+
+[[routes]]
+scope = "lab"
+target_pubkey = "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20" # Bob
+plane = "datagram"
+entry_channel = "udp0"
+entry_addr = "127.0.0.1:15100"
+target_credential = "bob-e2e-token"
+
+[[routes.hops]]
+channel_pubkey = "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14" # Relay Datagram
+next_addr = "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20"     # Bob's PeerId slot
+credential = "relay-access-token"
+
+[[bind_endpoints]]
+scope = "lab"
+target_pubkey = "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20"
+endpoint = "demo-app"
+plane = "stream"
+listen_addr = "127.0.0.1:18080"
+
+[[bind_endpoints]]
+scope = "lab"
+target_pubkey = "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20"
+endpoint = "demo-app"
+plane = "datagram"
+listen_addr = "127.0.0.1:18081"

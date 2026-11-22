@@ -1,0 +1,52 @@
+# Passive Relay Topology (A -> R <- B) — Bob (NATed Destination Node)
+# Dials outbound to Relay R to hold passive presence; binds zero public inbound TCP ports!
+
+[policy]
+default_allow = false
+default_ttl_secs = 300
+
+[[policy.rules]]
+scope = "lab"
+peers = ["7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13"] # Alice
+action = "open_endpoint"
+target = "demo-app"
+required_credential = "bob-e2e-token"
+
+[[scopes]]
+id = "lab"
+secret_key = "2222222222222222222222222222222222222222222222222222222222222222"
+
+[[udp_carriers]]
+id = "udp_nat"
+bind_addr = "127.0.0.1:0"
+
+[[tcp_carriers]]
+id = "tcp_nat"
+
+[[relay_registrations]]
+plane = "datagram"
+scope = "lab"
+carrier_id = "udp_nat"
+relay_addr = "127.0.0.1:15100"
+relay_pubkey = "7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b14"
+
+[[relay_registrations]]
+plane = "stream"
+scope = "lab"
+carrier_id = "tcp_nat"
+ingress_id = "relay_stream_in"
+relay_addr = "127.0.0.1:15101"
+relay_pubkey = "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b"
+pool_size = 4
+
+[[publish_endpoints]]
+scope = "lab"
+endpoint = "demo-app"
+plane = "stream"
+local_target = "127.0.0.1:8080"
+
+[[publish_endpoints]]
+scope = "lab"
+endpoint = "demo-app"
+plane = "datagram"
+local_target = "127.0.0.1:8081"

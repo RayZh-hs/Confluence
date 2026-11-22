@@ -1,0 +1,19 @@
+[package]
+name = "confluence-testkit"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+confluence-core.workspace = true
+parking_lot.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "rt", "io-util", "macros"] }
+
+[dev-dependencies]
+confluence-plugins.workspace = true
+confluence-edge.workspace = true
+confluence-relay.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

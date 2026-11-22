@@ -123,11 +123,7 @@ impl MemDatagramHub {
             src: ChannelAddr::new(src).unwrap(),
             dst: ChannelAddr::new(dst).unwrap(),
         };
-        self.wire_tap
-            .lock()
-            .get(&key)
-            .cloned()
-            .unwrap_or_default()
+        self.wire_tap.lock().get(&key).cloned().unwrap_or_default()
     }
 
     /// Returns all wire datagrams transmitted across any link in the hub.

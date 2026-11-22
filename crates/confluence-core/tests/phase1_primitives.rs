@@ -130,8 +130,12 @@ fn tai64n_replay_window_and_sliding_window64() {
     let ts_stale = Tai64nTimestamp::from_parts(base_tai - 120, 0);
 
     // Slight out-of-order (ts_a2 before ts_a1) succeeds for distinct timestamps.
-    window.check_and_record_at(&peer_a, ts_a2, base_tai).unwrap();
-    window.check_and_record_at(&peer_a, ts_a1, base_tai).unwrap();
+    window
+        .check_and_record_at(&peer_a, ts_a2, base_tai)
+        .unwrap();
+    window
+        .check_and_record_at(&peer_a, ts_a1, base_tai)
+        .unwrap();
 
     // Exact replay is rejected.
     assert!(matches!(
@@ -151,7 +155,7 @@ fn tai64n_replay_window_and_sliding_window64() {
     assert!(!rw.accept(0));
     assert!(rw.accept(100));
     assert!(!rw.accept(36)); // 100 - 36 == 64 -> outside 64-bit window
-    assert!(rw.accept(37));  // 100 - 37 == 63 -> inside window
+    assert!(rw.accept(37)); // 100 - 37 == 63 -> inside window
     assert!(!rw.accept(37)); // duplicate rejected
 }
 
@@ -264,7 +268,8 @@ async fn local_policy_veto_intersection_and_fail_closed() {
     let (local_deny, _) = MockPolicy::new(Decision::Deny {
         reason: "blocked by local host owner".into(),
     });
-    let (ext_allow, _) = MockPolicy::new(Decision::Allow(Grant::with_ttl(Duration::from_secs(300))));
+    let (ext_allow, _) =
+        MockPolicy::new(Decision::Allow(Grant::with_ttl(Duration::from_secs(300))));
     let composed_veto =
         IntersectAccessControl::new(local_deny, ext_allow.clone(), Duration::from_millis(200));
     assert!(matches!(
@@ -398,5 +403,8 @@ async fn grant_enforcer_rate_concurrency_renewal_and_idle_stream_revocation() {
         .await
         .expect("idle stream read must wake immediately on revoke");
     assert!(read_res.is_err());
-    assert_eq!(read_res.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        read_res.unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
 }

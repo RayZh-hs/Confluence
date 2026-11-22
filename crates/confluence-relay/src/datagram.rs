@@ -6,9 +6,7 @@ use confluence_core::seams::channel::{
 };
 use confluence_core::security::cookie::{seal_handshake_envelope, CookieProtector, EnvelopeCheck};
 use confluence_core::security::grant::GrantEnforcer;
-use confluence_core::security::noise::{
-    InitiatorHandshake, VerifiedInitiation, DEFAULT_PROLOGUE,
-};
+use confluence_core::security::noise::{InitiatorHandshake, VerifiedInitiation, DEFAULT_PROLOGUE};
 use confluence_core::security::replay::{Tai64nGenerator, Tai64nReplayWindow};
 use confluence_core::wire::{E2eHandshakeResp, HopHandshakeReq};
 use confluence_core::{
@@ -37,8 +35,8 @@ pub struct RelayDatagramChannel {
     keypair: StaticKeypair,
     mtu: usize,
     access: Arc<dyn AccessControl>,
-    cookie_protector: CookieProtector,
-    replay_window: Tai64nReplayWindow,
+    cookie_protector: Arc<CookieProtector>,
+    replay_window: Arc<Tai64nReplayWindow>,
     slots: Arc<DashMap<PeerId, Arc<DatagramSlot>>>,
 }
 
@@ -55,8 +53,8 @@ impl RelayDatagramChannel {
             keypair,
             mtu,
             access,
-            cookie_protector: CookieProtector::new(peer_id, Duration::from_secs(120)),
-            replay_window: Tai64nReplayWindow::default(),
+            cookie_protector: Arc::new(CookieProtector::new(peer_id, Duration::from_secs(120))),
+            replay_window: Arc::new(Tai64nReplayWindow::default()),
             slots: Arc::new(DashMap::new()),
         })
     }
@@ -76,12 +74,30 @@ impl RelayDatagramChannel {
 
 struct RelayDatagramHandle {
     slot: Arc<DatagramSlot>,
+    target_slot_peer: PeerId,
+    originator_peer: PeerId,
+    scope: ScopeId,
+    keypair: StaticKeypair,
+    cookie_protector: Arc<CookieProtector>,
+    replay_window: Arc<Tai64nReplayWindow>,
+    access: Arc<dyn AccessControl>,
     connect_enforcer: Arc<GrantEnforcer>,
     merged_closed_rx: watch::Receiver<bool>,
 }
 
 impl RelayDatagramHandle {
-    fn new(slot: Arc<DatagramSlot>, connect_enforcer: Arc<GrantEnforcer>) -> Arc<Self> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        slot: Arc<DatagramSlot>,
+        target_slot_peer: PeerId,
+        originator_peer: PeerId,
+        scope: ScopeId,
+        keypair: StaticKeypair,
+        cookie_protector: Arc<CookieProtector>,
+        replay_window: Arc<Tai64nReplayWindow>,
+        access: Arc<dyn AccessControl>,
+        connect_enforcer: Arc<GrantEnforcer>,
+    ) -> Arc<Self> {
         let (tx, rx) = watch::channel(false);
         let mut c_rx = connect_enforcer.closed_watch();
         let mut s_rx = slot.enforcer.closed_watch();
@@ -93,6 +109,13 @@ impl RelayDatagramHandle {
         });
         Arc::new(Self {
             slot,
+            target_slot_peer,
+            originator_peer,
+            scope,
+            keypair,
+            cookie_protector,
+            replay_window,
+            access,
             connect_enforcer,
             merged_closed_rx: rx,
         })
@@ -102,7 +125,8 @@ impl RelayDatagramHandle {
 #[async_trait]
 impl DatagramForwardHandle for RelayDatagramHandle {
     async fn send(&self, packet: &[u8]) -> Result<()> {
-        self.connect_enforcer.check_and_record_datagram(packet.len())?;
+        self.connect_enforcer
+            .check_and_record_datagram(packet.len())?;
         self.slot.enforcer.check_and_record_datagram(packet.len())?;
         let dst = self.slot.peer_addr.read().clone();
         self.slot.ingress.send_to(&dst, packet).await
@@ -111,6 +135,50 @@ impl DatagramForwardHandle for RelayDatagramHandle {
     fn check_and_record_reverse(&self, byte_len: usize) -> Result<()> {
         self.connect_enforcer.check_and_record_datagram(byte_len)?;
         self.slot.enforcer.check_and_record_datagram(byte_len)
+    }
+
+    async fn renew(&self, renew_payload: &[u8]) -> Result<Vec<u8>> {
+        let inner_msg1 = self
+            .cookie_protector
+            .verify_mac1_only(renew_payload)
+            .ok_or(CoreError::AuthFailed)?;
+        let verified = VerifiedInitiation::read_msg1(&self.keypair, DEFAULT_PROLOGUE, inner_msg1)?;
+        if verified.initiator_peer() != self.originator_peer {
+            return Err(CoreError::AuthFailed);
+        }
+        let req = HopHandshakeReq::decode(verified.payload())?;
+        self.replay_window
+            .check_and_record(&self.originator_peer, req.timestamp)?;
+
+        let ac_req = AccessRequest {
+            scope: self.scope.clone(),
+            peer: self.originator_peer,
+            credential: req.credential,
+            action: Action::RenewGrant {
+                target_action: Box::new(Action::ChannelCustom {
+                    kind: "relay_connect".into(),
+                    target: self.target_slot_peer.to_string(),
+                    plane: Plane::Datagram,
+                }),
+            },
+        };
+        match self.access.evaluate(ac_req).await? {
+            Decision::Allow(new_grant) => {
+                let ttl_millis = new_grant
+                    .expires_at
+                    .saturating_duration_since(Instant::now())
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64;
+                self.connect_enforcer.update_grant(new_grant);
+                let resp = E2eHandshakeResp {
+                    granted_ttl_millis: ttl_millis,
+                }
+                .encode();
+                let (_keys, msg2) = verified.respond(&resp)?;
+                Ok(msg2)
+            }
+            Decision::Deny { reason } => Err(CoreError::AccessDenied(reason)),
+        }
     }
 
     fn closed(&self) -> watch::Receiver<bool> {
@@ -233,10 +301,11 @@ impl DatagramForwardChannel for RelayDatagramChannel {
             EnvelopeCheck::Drop => return Ok(SetupOutcome::Reject("invalid envelope".into())),
         };
 
-        let verified = match VerifiedInitiation::read_msg1(&self.keypair, DEFAULT_PROLOGUE, inner_msg1) {
-            Ok(v) => v,
-            Err(_) => return Ok(SetupOutcome::Reject("relay authentication failed".into())),
-        };
+        let verified =
+            match VerifiedInitiation::read_msg1(&self.keypair, DEFAULT_PROLOGUE, inner_msg1) {
+                Ok(v) => v,
+                Err(_) => return Ok(SetupOutcome::Reject("relay authentication failed".into())),
+            };
         let originator_peer = verified.initiator_peer();
 
         let req = match HopHandshakeReq::decode(verified.payload()) {
@@ -286,7 +355,9 @@ impl DatagramForwardChannel for RelayDatagramChannel {
         };
         if slot.enforcer.check_liveness(Instant::now()).is_err() {
             self.slots.remove(&target_slot_peer);
-            return Ok(SetupOutcome::Reject("target peer relay slot expired".into()));
+            return Ok(SetupOutcome::Reject(
+                "target peer relay slot expired".into(),
+            ));
         }
 
         let connect_enforcer = GrantEnforcer::new(connect_grant);
@@ -297,7 +368,17 @@ impl DatagramForwardChannel for RelayDatagramChannel {
             None,
         );
 
-        let handle: BoxedDatagramForwardHandle = RelayDatagramHandle::new(slot, connect_enforcer);
+        let handle: BoxedDatagramForwardHandle = RelayDatagramHandle::new(
+            slot,
+            target_slot_peer,
+            originator_peer,
+            self.scope.clone(),
+            self.keypair.clone(),
+            Arc::clone(&self.cookie_protector),
+            Arc::clone(&self.replay_window),
+            Arc::clone(&self.access),
+            connect_enforcer,
+        );
         Ok(SetupOutcome::Accept {
             handle,
             reply_hint: None,

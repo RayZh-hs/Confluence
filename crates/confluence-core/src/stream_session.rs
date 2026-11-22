@@ -90,21 +90,27 @@ impl ConfluenceStream {
             let mut closed_watch = enf_task.closed_watch();
             let mut app_eof_sent = false;
 
-            let fail_with = |kind: io::ErrorKind,
-                             slot: &Mutex<Option<io::ErrorKind>>,
-                             tx: &watch::Sender<bool>,
-                             renews: &DashMap<u64, oneshot::Sender<Result<Duration>>>| {
-                let mut g = slot.lock();
-                if g.is_none() {
-                    *g = Some(kind);
-                }
-                let _ = tx.send(true);
-                renews.clear();
-            };
+            let fail_with =
+                |kind: io::ErrorKind,
+                 slot: &Mutex<Option<io::ErrorKind>>,
+                 tx: &watch::Sender<bool>,
+                 renews: &DashMap<u64, oneshot::Sender<Result<Duration>>>| {
+                    let mut g = slot.lock();
+                    if g.is_none() {
+                        *g = Some(kind);
+                    }
+                    let _ = tx.send(true);
+                    renews.clear();
+                };
 
             loop {
                 if *closed_watch.borrow() {
-                    fail_with(io::ErrorKind::PermissionDenied, &err_slot_task, &err_tx, &renews_task);
+                    fail_with(
+                        io::ErrorKind::PermissionDenied,
+                        &err_slot_task,
+                        &err_tx,
+                        &renews_task,
+                    );
                     break;
                 }
                 tokio::select! {

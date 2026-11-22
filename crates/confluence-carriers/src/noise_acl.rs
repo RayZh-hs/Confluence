@@ -81,13 +81,10 @@ impl<D: DatagramChannel> DatagramForwardHandle for NoiseAclDatagramHandle<D> {
     }
 
     async fn renew(&self, renew_payload: &[u8]) -> Result<Vec<u8>> {
-        let inner_msg1 = match self
+        let inner_msg1 = self
             .cookie_protector
-            .verify_envelope(self.target_addr.as_bytes(), renew_payload)
-        {
-            EnvelopeCheck::Verified(b) => b,
-            _ => return Err(CoreError::AuthFailed),
-        };
+            .verify_mac1_only(renew_payload)
+            .ok_or(CoreError::AuthFailed)?;
         let verified = VerifiedInitiation::read_msg1(&self.keypair, DEFAULT_PROLOGUE, inner_msg1)?;
         if verified.initiator_peer() != self.originator_peer {
             return Err(CoreError::AuthFailed);
@@ -165,10 +162,11 @@ impl<D: DatagramChannel> DatagramForwardChannel for NoiseAclDatagramChannel<D> {
             EnvelopeCheck::Drop => return Ok(SetupOutcome::Reject("invalid envelope".into())),
         };
 
-        let verified = match VerifiedInitiation::read_msg1(&self.keypair, DEFAULT_PROLOGUE, inner_msg1) {
-            Ok(v) => v,
-            Err(_) => return Ok(SetupOutcome::Reject("hop authentication failed".into())),
-        };
+        let verified =
+            match VerifiedInitiation::read_msg1(&self.keypair, DEFAULT_PROLOGUE, inner_msg1) {
+                Ok(v) => v,
+                Err(_) => return Ok(SetupOutcome::Reject("hop authentication failed".into())),
+            };
         let originator_peer = verified.initiator_peer();
 
         let req = match HopHandshakeReq::decode(verified.payload()) {
@@ -296,10 +294,11 @@ impl<S: StreamChannel> StreamForwardChannel for NoiseAclStreamChannel<S> {
             EnvelopeCheck::Drop => return Ok(SetupOutcome::Reject("invalid envelope".into())),
         };
 
-        let verified = match VerifiedInitiation::read_msg1(&self.keypair, DEFAULT_PROLOGUE, inner_msg1) {
-            Ok(v) => v,
-            Err(_) => return Ok(SetupOutcome::Reject("hop authentication failed".into())),
-        };
+        let verified =
+            match VerifiedInitiation::read_msg1(&self.keypair, DEFAULT_PROLOGUE, inner_msg1) {
+                Ok(v) => v,
+                Err(_) => return Ok(SetupOutcome::Reject("hop authentication failed".into())),
+            };
         let originator_peer = verified.initiator_peer();
 
         let req = match HopHandshakeReq::decode(verified.payload()) {

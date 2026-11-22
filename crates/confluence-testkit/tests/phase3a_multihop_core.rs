@@ -6,7 +6,7 @@ use confluence_core::seams::channel::{
 };
 use confluence_core::seams::edge::DatagramSession;
 use confluence_core::seams::routing::{ExplicitPath, PathHop};
-use confluence_core::security::cookie::{seal_handshake_envelope, EnvelopeCheck, CookieProtector};
+use confluence_core::security::cookie::{seal_handshake_envelope, CookieProtector, EnvelopeCheck};
 use confluence_core::security::noise::{
     VerifiedInitiation, DATAGRAM_WIRE_OVERHEAD_BYTES, DEFAULT_PROLOGUE,
 };
@@ -157,7 +157,9 @@ async fn blind_single_pass_two_hop_label_switching_and_stream_splicing() {
     });
     // Also exercise mid-chain MAC2 flood challenge at Hop 1!
     h1_dgram_fwd.protector.set_under_load(true);
-    h1_node.mount_datagram_forward_channel(h1_dgram_fwd).unwrap();
+    h1_node
+        .mount_datagram_forward_channel(h1_dgram_fwd)
+        .unwrap();
 
     let h1_stream_fwd = Arc::new(DummyStreamFwd {
         protector: CookieProtector::new(h1_stream_kp.peer_id(), Duration::from_secs(60)),
@@ -165,9 +167,7 @@ async fn blind_single_pass_two_hop_label_switching_and_stream_splicing() {
         carrier: h1_tcp,
     });
     h1_stream_fwd.protector.set_under_load(true);
-    h1_node
-        .mount_stream_forward_channel(h1_stream_fwd)
-        .unwrap();
+    h1_node.mount_stream_forward_channel(h1_stream_fwd).unwrap();
 
     // Endpoint B
     let bob_node = Node::new(StaticMapPathSource::new());

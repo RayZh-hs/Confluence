@@ -52,9 +52,9 @@ async fn multihop_three_link_blind_intermediaries_and_no_transitive_trust() {
             && req.credential.as_ref().map(|c| c.as_bytes()) == Some(cred_h1.as_slice())
             && matches!(req.action, Action::ChannelForward { .. })
         {
-            Some(Decision::Allow(confluence_core::seams::access::Grant::with_ttl(
-                Duration::from_secs(60),
-            )))
+            Some(Decision::Allow(
+                confluence_core::seams::access::Grant::with_ttl(Duration::from_secs(60)),
+            ))
         } else {
             None
         }
@@ -63,13 +63,20 @@ async fn multihop_three_link_blind_intermediaries_and_no_transitive_trust() {
     // Hop 2 policy: MUST verify Alice's PeerId directly (NOT H1!) + H2's credential!
     let h2_policy = AuditAccessControl::deny_by_default(Duration::from_secs(60));
     h2_policy.add_rule(move |req| {
+        let is_fwd = match &req.action {
+            Action::ChannelForward { .. } => true,
+            Action::RenewGrant { target_action } => {
+                matches!(target_action.as_ref(), Action::ChannelForward { .. })
+            }
+            _ => false,
+        };
         if req.peer == expected_alice
             && req.credential.as_ref().map(|c| c.as_bytes()) == Some(cred_h2.as_slice())
-            && matches!(req.action, Action::ChannelForward { .. })
+            && is_fwd
         {
-            Some(Decision::Allow(confluence_core::seams::access::Grant::with_ttl(
-                Duration::from_secs(60),
-            )))
+            Some(Decision::Allow(
+                confluence_core::seams::access::Grant::with_ttl(Duration::from_secs(60)),
+            ))
         } else {
             None
         }
@@ -82,9 +89,9 @@ async fn multihop_three_link_blind_intermediaries_and_no_transitive_trust() {
             && req.credential.as_ref().map(|c| c.as_bytes()) == Some(cred_bob.as_slice())
             && matches!(req.action, Action::OpenEndpoint { .. })
         {
-            Some(Decision::Allow(confluence_core::seams::access::Grant::with_ttl(
-                Duration::from_secs(60),
-            )))
+            Some(Decision::Allow(
+                confluence_core::seams::access::Grant::with_ttl(Duration::from_secs(60)),
+            ))
         } else {
             None
         }
@@ -255,6 +262,25 @@ async fn multihop_three_link_blind_intermediaries_and_no_transitive_trust() {
     assert_eq!(&p1[4..], &p2[4..]);
     assert_eq!(&p2[4..], &p3[4..]);
 
+    // Verify live hop CircuitRenew to downstream Hop 2 (passing transparently through Hop 1!)
+    // without disturbing flat data forwarding!
+    let renewed_ttl = alice_node
+        .renew_datagram_hop(
+            &scope_e2e,
+            &a_dgram,
+            &PathHop {
+                target_tag: h2_dgram_kp.target_tag(),
+                channel_pubkey: h2_dgram_kp.peer_id(),
+                next_addr: ChannelAddr::new("bob:1000").unwrap(),
+                credential: Some(OpaqueCredential::new(cred_h2.to_vec()).unwrap()),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(renewed_ttl >= Duration::from_secs(50));
+    a_dgram.send(secret_dgram_msg).await.unwrap();
+    assert_eq!(&b_dgram.recv().await.unwrap()[..], secret_dgram_msg);
+
     // 2. Execute Stream `A -> H1 -> H2 -> B`
     let mut a_stream = alice_node
         .open_stream(&scope_e2e, bob_kp.peer_id(), ep)
@@ -347,8 +373,11 @@ async fn passive_relay_direct_and_composed_multihop_zero_dial_and_revocation() {
         1400,
         relay_policy.clone(),
     );
-    let relay_stream_plugin =
-        RelayStreamChannel::new(scope_relay.clone(), relay_stream_kp.clone(), relay_policy.clone());
+    let relay_stream_plugin = RelayStreamChannel::new(
+        scope_relay.clone(),
+        relay_stream_kp.clone(),
+        relay_policy.clone(),
+    );
     relay_node
         .mount_datagram_forward_channel(relay_dgram_plugin.clone())
         .unwrap();
@@ -422,7 +451,10 @@ async fn passive_relay_direct_and_composed_multihop_zero_dial_and_revocation() {
     .await
     .unwrap();
     bob_node.attach_stream_channel(b_relay_ingress).unwrap();
-    assert_eq!(relay_stream_plugin.parked_stream_count(&bob_kp.peer_id()), 4);
+    assert_eq!(
+        relay_stream_plugin.parked_stream_count(&bob_kp.peer_id()),
+        4
+    );
 
     let ep = EndpointName::new("terraria").unwrap();
     let mut b_dgram_ep = bob_node
@@ -598,7 +630,10 @@ async fn passive_relay_direct_and_composed_multihop_zero_dial_and_revocation() {
         .unwrap();
     let mut b_stream_2 = b_stream_ep.accept().await.unwrap();
     assert_eq!(b_stream_2.remote_peer, alice_2hop_kp.peer_id());
-    a2_stream.write_all(b"composed-h1-relay-stream").await.unwrap();
+    a2_stream
+        .write_all(b"composed-h1-relay-stream")
+        .await
+        .unwrap();
     let n2 = b_stream_2.stream.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n2], b"composed-h1-relay-stream");
 
@@ -619,10 +654,11 @@ async fn passive_relay_direct_and_composed_multihop_zero_dial_and_revocation() {
     });
 
     // Active stream across A2 -> H1 -> R <- B severs immediately (honest ConnectionReset at B!)
-    let stream_dead = tokio::time::timeout(Duration::from_secs(1), b_stream_2.stream.read(&mut buf))
-        .await
-        .expect("mid-chain hop revocation must sever stream immediately")
-        .unwrap_err();
+    let stream_dead =
+        tokio::time::timeout(Duration::from_secs(1), b_stream_2.stream.read(&mut buf))
+            .await
+            .expect("mid-chain hop revocation must sever stream immediately")
+            .unwrap_err();
     assert_eq!(stream_dead.kind(), std::io::ErrorKind::ConnectionReset);
 
     // Active datagram label switches on H1 are purged immediately!
@@ -631,10 +667,11 @@ async fn passive_relay_direct_and_composed_multihop_zero_dial_and_revocation() {
 
     // --- Mid-Session Link Cut on `a1 <-> relay` severs A1's active stream honestly! ---
     stream_hub.set_symmetric_link_down("a1:2000", "relay:6000", true);
-    let link_cut_err = tokio::time::timeout(Duration::from_secs(1), b_stream_1.stream.read(&mut buf))
-        .await
-        .expect("link cut on relay leg must propagate to B")
-        .unwrap_err();
+    let link_cut_err =
+        tokio::time::timeout(Duration::from_secs(1), b_stream_1.stream.read(&mut buf))
+            .await
+            .expect("link cut on relay leg must propagate to B")
+            .unwrap_err();
     assert_eq!(link_cut_err.kind(), std::io::ErrorKind::ConnectionReset);
     let _ = CoreError::AuthFailed;
 }

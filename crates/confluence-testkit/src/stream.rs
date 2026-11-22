@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use confluence_core::seams::channel::{BoxedAsyncStream, ChannelCaps, ChannelHealth, StreamChannel};
+use confluence_core::seams::channel::{
+    BoxedAsyncStream, ChannelCaps, ChannelHealth, StreamChannel,
+};
 use confluence_core::{ChannelAddr, ChannelId, CoreError, Plane, Result};
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -107,11 +109,7 @@ impl MemStreamHub {
             src: ChannelAddr::new(src).unwrap(),
             dst: ChannelAddr::new(dst).unwrap(),
         };
-        self.wire_tap
-            .lock()
-            .get(&key)
-            .cloned()
-            .unwrap_or_default()
+        self.wire_tap.lock().get(&key).cloned().unwrap_or_default()
     }
 
     fn connect(&self, src: &ChannelAddr, dst: &ChannelAddr) -> Result<BoxedAsyncStream> {
@@ -149,9 +147,7 @@ impl MemStreamHub {
             .listeners
             .get(dst)
             .map(|r| r.value().clone())
-            .ok_or_else(|| {
-                CoreError::ChannelUnhealthy(format!("no listener bound at {}", dst))
-            })?;
+            .ok_or_else(|| CoreError::ChannelUnhealthy(format!("no listener bound at {}", dst)))?;
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let client_wrapped: BoxedAsyncStream = Box::pin(TappedDuplexStream::new(
@@ -171,7 +167,9 @@ impl MemStreamHub {
 
         accept_tx
             .try_send((server_wrapped, src.clone()))
-            .map_err(|_| CoreError::ChannelUnhealthy("listener accept backlog full or closed".into()))?;
+            .map_err(|_| {
+                CoreError::ChannelUnhealthy("listener accept backlog full or closed".into())
+            })?;
 
         Ok(client_wrapped)
     }

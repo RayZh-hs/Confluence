@@ -117,7 +117,13 @@ impl SymmetricState {
         let nonce = noise_nonce(self.n);
         self.n = self.n.checked_add(1).ok_or(CoreError::AuthFailed)?;
         let ciphertext = cipher
-            .encrypt(&nonce, Payload { msg: plaintext, aad: &self.h })
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext,
+                    aad: &self.h,
+                },
+            )
             .map_err(|_| CoreError::AuthFailed)?;
         self.mix_hash(&ciphertext);
         Ok(ciphertext)
@@ -132,7 +138,13 @@ impl SymmetricState {
         let nonce = noise_nonce(self.n);
         self.n = self.n.checked_add(1).ok_or(CoreError::AuthFailed)?;
         let plaintext = cipher
-            .decrypt(&nonce, Payload { msg: ciphertext, aad: &self.h })
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad: &self.h,
+                },
+            )
             .map_err(|_| CoreError::AuthFailed)?;
         self.mix_hash(ciphertext);
         Ok(plaintext)

@@ -126,11 +126,7 @@ impl Default for Tai64nReplayWindow {
 }
 
 impl Tai64nReplayWindow {
-    pub fn new(
-        max_clock_skew: Duration,
-        max_peers: usize,
-        max_per_peer_window: usize,
-    ) -> Self {
+    pub fn new(max_clock_skew: Duration, max_peers: usize, max_per_peer_window: usize) -> Self {
         Self {
             max_clock_skew_secs: max_clock_skew.as_secs().max(1),
             max_peers: max_peers.max(1),

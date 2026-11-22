@@ -37,9 +37,18 @@ use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 pub const MIN_DATAGRAM_MTU: usize = 512;
 
 enum PendingDgramOutcome {
-    Accept { responder_label: u32, msg2: Vec<u8> },
-    Challenge { target_tag: TargetTag, challenge: Vec<u8> },
-    Reject { target_tag: TargetTag, reason: String },
+    Accept {
+        responder_label: u32,
+        msg2: Vec<u8>,
+    },
+    Challenge {
+        target_tag: TargetTag,
+        challenge: Vec<u8>,
+    },
+    Reject {
+        target_tag: TargetTag,
+        reason: String,
+    },
 }
 
 #[derive(Clone)]
@@ -356,6 +365,43 @@ impl Node {
             .map_err(|_| CoreError::Closed("control request cancelled".into()))
     }
 
+    /// Renews a hop channel's `DatagramForwardHandle` along an active datagram circuit
+    /// using direct `channel <-> originator` authentication without disturbing flat data forwarding.
+    pub async fn renew_datagram_hop(
+        &self,
+        scope_id: &ScopeId,
+        session: &ConfluenceDatagramSession,
+        hop: &crate::seams::routing::PathHop,
+    ) -> Result<Duration> {
+        let scope = self.scope(scope_id)?;
+        let req = crate::wire::HopHandshakeReq {
+            timestamp: scope.next_timestamp(),
+            plane: Plane::Datagram,
+            next_addr: hop.next_addr.clone(),
+            credential: hop.credential.clone(),
+        }
+        .encode();
+        let (init, msg1) = InitiatorHandshake::initiate(
+            scope.keypair(),
+            hop.channel_pubkey,
+            DEFAULT_PROLOGUE,
+            &req,
+        )?;
+        let (env, _) = seal_handshake_envelope(&hop.channel_pubkey, &msg1, None)?;
+        let resp_msg2 = self
+            .send_circuit_renew(
+                session.carrier_id(),
+                session.next_hop_addr(),
+                session.circuit_id(),
+                hop.target_tag,
+                env,
+            )
+            .await?;
+        let (_keys, resp_pt) = init.finalize(&resp_msg2)?;
+        let resp = E2eHandshakeResp::decode(&resp_pt)?;
+        Ok(Duration::from_millis(resp.granted_ttl_millis))
+    }
+
     /// Renews a hop channel's `DatagramForwardHandle` along an active datagram circuit.
     pub async fn send_circuit_renew(
         &self,
@@ -475,9 +521,10 @@ impl Node {
             raw_stream.write_all(&burst).await?;
             raw_stream.flush().await?;
 
-            let reply = tokio::time::timeout(self.setup_timeout, read_stream_reply(&mut raw_stream))
-                .await
-                .map_err(|_| CoreError::Timeout)??;
+            let reply =
+                tokio::time::timeout(self.setup_timeout, read_stream_reply(&mut raw_stream))
+                    .await
+                    .map_err(|_| CoreError::Timeout)??;
 
             match reply {
                 StreamSetupReply::Accept { target_tag, msg2 } => {
@@ -510,9 +557,8 @@ impl Node {
                     target_tag,
                     challenge,
                 } if attempt <= path.hops.len() && !cookies.contains_key(&target_tag) => {
-                    let (sent_mac1, responder_pk) = sent_mac1s
-                        .get(&target_tag)
-                        .ok_or(CoreError::AuthFailed)?;
+                    let (sent_mac1, responder_pk) =
+                        sent_mac1s.get(&target_tag).ok_or(CoreError::AuthFailed)?;
                     let cookie = unseal_cookie_challenge(responder_pk, sent_mac1, &challenge)?;
                     cookies.insert(target_tag, cookie);
                     continue;
@@ -656,6 +702,7 @@ impl Node {
                         Some(endpoint.clone()),
                     );
                     let session = ConfluenceDatagramSession::new(
+                        circuit_id,
                         in_label,
                         responder_label,
                         keys,
@@ -676,9 +723,8 @@ impl Node {
                     target_tag,
                     challenge,
                 } if attempt <= path.hops.len() && !cookies.contains_key(&target_tag) => {
-                    let (sent_mac1, responder_pk) = sent_mac1s
-                        .get(&target_tag)
-                        .ok_or(CoreError::AuthFailed)?;
+                    let (sent_mac1, responder_pk) =
+                        sent_mac1s.get(&target_tag).ok_or(CoreError::AuthFailed)?;
                     let cookie = unseal_cookie_challenge(responder_pk, sent_mac1, &challenge)?;
                     cookies.insert(target_tag, cookie);
                     continue;
@@ -696,7 +742,9 @@ impl Node {
             }
         }
 
-        Err(CoreError::PathSetupFailed("datagram setup exhausted".into()))
+        Err(CoreError::PathSetupFailed(
+            "datagram setup exhausted".into(),
+        ))
     }
 
     fn alloc_label(&self) -> u32 {
@@ -788,7 +836,11 @@ impl Node {
         let label = HopLabel::from_be_bytes([pkt[0], pkt[1], pkt[2], pkt[3]]);
         if !label.is_control() {
             // 1. Check local E2E datagram sessions.
-            if let Some(sess) = self.dgram_sessions.get(&label.0).map(|r| Arc::clone(r.value())) {
+            if let Some(sess) = self
+                .dgram_sessions
+                .get(&label.0)
+                .map(|r| Arc::clone(r.value()))
+            {
                 sess.handle_inbound_packet(&pkt[4..]).await;
                 return;
             }
@@ -821,28 +873,23 @@ impl Node {
                     carrier: ret_carrier,
                     addr: ret_addr,
                     handle,
-                } => {
-                    match handle.check_and_record_reverse(pkt.len()) {
-                        Ok(()) => {
-                            if let Err(e) = ret_carrier.send_to(&ret_addr, &pkt).await {
-                                if matches!(e, CoreError::Closed(_) | CoreError::ChannelUnhealthy(_))
-                                {
-                                    self.dgram_label_switches.remove(&label.0);
-                                    self.dgram_label_switches.remove(&entry.pair_label);
-                                }
+                } => match handle.check_and_record_reverse(pkt.len()) {
+                    Ok(()) => {
+                        if let Err(e) = ret_carrier.send_to(&ret_addr, &pkt).await {
+                            if matches!(e, CoreError::Closed(_) | CoreError::ChannelUnhealthy(_)) {
+                                self.dgram_label_switches.remove(&label.0);
+                                self.dgram_label_switches.remove(&entry.pair_label);
                             }
                         }
-                        Err(
-                            CoreError::GrantRevoked
-                            | CoreError::GrantExpired
-                            | CoreError::Closed(_),
-                        ) => {
-                            self.dgram_label_switches.remove(&label.0);
-                            self.dgram_label_switches.remove(&entry.pair_label);
-                        }
-                        Err(_) => {}
                     }
-                }
+                    Err(
+                        CoreError::GrantRevoked | CoreError::GrantExpired | CoreError::Closed(_),
+                    ) => {
+                        self.dgram_label_switches.remove(&label.0);
+                        self.dgram_label_switches.remove(&entry.pair_label);
+                    }
+                    Err(_) => {}
+                },
             }
             return;
         }
@@ -949,9 +996,9 @@ impl Node {
                     .get(&target_tag)
                     .map(|r| Arc::clone(r.value()))
                 {
-                    if let Ok(Some(resp_payload)) =
-                        fwd.handle_control(Arc::clone(carrier), &src_addr, &payload)
-                            .await
+                    if let Ok(Some(resp_payload)) = fwd
+                        .handle_control(Arc::clone(carrier), &src_addr, &payload)
+                        .await
                     {
                         if let Ok(raw) = (DgramCtrlPacket::ChannelControlResp {
                             req_id,
@@ -977,12 +1024,10 @@ impl Node {
                 target_tag,
                 payload,
             } => {
-                let hop_entry = self.installed_hop_circuits.get(&circuit_id).map(|e| {
-                    (
-                        e.target_tag,
-                        Arc::clone(&e.handle),
-                    )
-                });
+                let hop_entry = self
+                    .installed_hop_circuits
+                    .get(&circuit_id)
+                    .map(|e| (e.target_tag, Arc::clone(&e.handle)));
                 if let Some((local_tag, handle)) = hop_entry {
                     if local_tag == target_tag {
                         if let Ok(resp_payload) = handle.renew(&payload).await {
@@ -1013,8 +1058,9 @@ impl Node {
                 target_tag,
                 payload,
             } => {
-                if let Some((_, waiter)) =
-                    self.pending_circuit_renews.remove(&(circuit_id, target_tag))
+                if let Some((_, waiter)) = self
+                    .pending_circuit_renews
+                    .remove(&(circuit_id, target_tag))
                 {
                     let _ = waiter.send(payload);
                 } else if let Some(hop) = self.installed_hop_circuits.get(&circuit_id) {
@@ -1349,6 +1395,7 @@ impl Node {
         );
 
         let session = ConfluenceDatagramSession::new(
+            circuit_id,
             in_label,
             sender_return_label,
             keys,
@@ -1386,12 +1433,10 @@ impl Node {
         src_addr: ChannelAddr,
         preauth_permit: OwnedSemaphorePermit,
     ) -> Result<()> {
-        let (mode, target_tag, envelope) = tokio::time::timeout(
-            self.setup_timeout,
-            read_stream_segment(&mut stream),
-        )
-        .await
-        .map_err(|_| CoreError::Timeout)??;
+        let (mode, target_tag, envelope) =
+            tokio::time::timeout(self.setup_timeout, read_stream_segment(&mut stream))
+                .await
+                .map_err(|_| CoreError::Timeout)??;
 
         match mode {
             StreamSegmentMode::FinalE2e => {
@@ -1615,11 +1660,7 @@ impl Node {
         .encode();
         let (keys, msg2) = verified.respond(&resp_bytes)?;
 
-        write_stream_reply(
-            &mut stream,
-            &StreamSetupReply::Accept { target_tag, msg2 },
-        )
-        .await?;
+        write_stream_reply(&mut stream, &StreamSetupReply::Accept { target_tag, msg2 }).await?;
 
         let conf_stream = ConfluenceStream::spawn_new(
             stream,

@@ -1,14 +1,11 @@
 use async_trait::async_trait;
 use confluence_core::seams::access::{AccessControl, AccessRequest, Action, Decision};
 use confluence_core::seams::channel::{
-    BoxedAsyncStream, ChannelCaps, ChannelHealth, SetupOutcome, StreamChannel,
-    StreamForwardChannel,
+    BoxedAsyncStream, ChannelCaps, ChannelHealth, SetupOutcome, StreamChannel, StreamForwardChannel,
 };
 use confluence_core::security::cookie::{seal_handshake_envelope, CookieProtector, EnvelopeCheck};
 use confluence_core::security::grant::{GrantEnforcedStream, GrantEnforcer};
-use confluence_core::security::noise::{
-    InitiatorHandshake, VerifiedInitiation, DEFAULT_PROLOGUE,
-};
+use confluence_core::security::noise::{InitiatorHandshake, VerifiedInitiation, DEFAULT_PROLOGUE};
 use confluence_core::security::replay::{Tai64nGenerator, Tai64nReplayWindow};
 use confluence_core::wire::{
     append_stream_segment, read_stream_reply, write_stream_reply, E2eHandshakeResp,
@@ -185,11 +182,7 @@ impl StreamForwardChannel for RelayStreamChannel {
         .encode();
         let (_keys, msg2) = verified.respond(&resp)?;
 
-        write_stream_reply(
-            &mut stream,
-            &StreamSetupReply::Accept { target_tag, msg2 },
-        )
-        .await?;
+        write_stream_reply(&mut stream, &StreamSetupReply::Accept { target_tag, msg2 }).await?;
 
         let slot = if let Some(existing) = self.slots.get(&registrant) {
             existing.enforcer.update_grant(grant);
@@ -239,10 +232,11 @@ impl StreamForwardChannel for RelayStreamChannel {
             EnvelopeCheck::Drop => return Ok(SetupOutcome::Reject("invalid envelope".into())),
         };
 
-        let verified = match VerifiedInitiation::read_msg1(&self.keypair, DEFAULT_PROLOGUE, inner_msg1) {
-            Ok(v) => v,
-            Err(_) => return Ok(SetupOutcome::Reject("relay authentication failed".into())),
-        };
+        let verified =
+            match VerifiedInitiation::read_msg1(&self.keypair, DEFAULT_PROLOGUE, inner_msg1) {
+                Ok(v) => v,
+                Err(_) => return Ok(SetupOutcome::Reject("relay authentication failed".into())),
+            };
         let originator_peer = verified.initiator_peer();
 
         let req = match HopHandshakeReq::decode(verified.payload()) {
@@ -291,7 +285,9 @@ impl StreamForwardChannel for RelayStreamChannel {
         };
         if slot.enforcer.check_liveness(Instant::now()).is_err() {
             self.slots.remove(&target_slot_peer);
-            return Ok(SetupOutcome::Reject("target peer relay slot expired".into()));
+            return Ok(SetupOutcome::Reject(
+                "target peer relay slot expired".into(),
+            ));
         }
 
         let connect_enforcer = GrantEnforcer::new(connect_grant);
@@ -442,9 +438,9 @@ async fn park_one_stream<S: StreamChannel>(
             Ok(stream)
         }
         StreamSetupReply::Reject { reason, .. } => Err(CoreError::AccessDenied(reason)),
-        StreamSetupReply::Challenge { .. } => {
-            Err(CoreError::PathSetupFailed("relay stream park challenged".into()))
-        }
+        StreamSetupReply::Challenge { .. } => Err(CoreError::PathSetupFailed(
+            "relay stream park challenged".into(),
+        )),
     }
 }
 

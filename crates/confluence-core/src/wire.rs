@@ -46,7 +46,9 @@ fn plane_from_u8(v: u8) -> Result<Plane> {
     match v {
         0x01 => Ok(Plane::Datagram),
         0x02 => Ok(Plane::Stream),
-        other => Err(CoreError::Framing(format!("invalid wire plane 0x{other:02x}"))),
+        other => Err(CoreError::Framing(format!(
+            "invalid wire plane 0x{other:02x}"
+        ))),
     }
 }
 
@@ -62,7 +64,11 @@ pub struct E2eHandshakeReq {
 impl E2eHandshakeReq {
     pub fn encode(&self) -> Vec<u8> {
         let ep_bytes = self.endpoint.as_str().as_bytes();
-        let cred_len = self.credential.as_ref().map(|c| 2 + c.as_bytes().len()).unwrap_or(0);
+        let cred_len = self
+            .credential
+            .as_ref()
+            .map(|c| 2 + c.as_bytes().len())
+            .unwrap_or(0);
         let mut out = Vec::with_capacity(12 + 1 + 1 + ep_bytes.len() + 1 + cred_len);
         out.extend_from_slice(self.timestamp.as_bytes());
         out.push(plane_to_u8(self.plane));
@@ -88,7 +94,9 @@ impl E2eHandshakeReq {
         let plane = plane_from_u8(buf[12])?;
         let ep_len = buf[13] as usize;
         if ep_len == 0 || ep_len > MAX_ENDPOINT_NAME_BYTES || buf.len() < 14 + ep_len + 1 {
-            return Err(CoreError::Framing("invalid E2eHandshakeReq endpoint len".into()));
+            return Err(CoreError::Framing(
+                "invalid E2eHandshakeReq endpoint len".into(),
+            ));
         }
         let ep_str = std::str::from_utf8(&buf[14..14 + ep_len])
             .map_err(|_| CoreError::Framing("non-utf8 endpoint name".into()))?;
@@ -99,7 +107,9 @@ impl E2eHandshakeReq {
         let credential = match has_cred {
             0 => {
                 if pos != buf.len() {
-                    return Err(CoreError::Framing("trailing bytes in E2eHandshakeReq".into()));
+                    return Err(CoreError::Framing(
+                        "trailing bytes in E2eHandshakeReq".into(),
+                    ));
                 }
                 None
             }
@@ -158,7 +168,11 @@ pub struct HopHandshakeReq {
 impl HopHandshakeReq {
     pub fn encode(&self) -> Vec<u8> {
         let addr_bytes = self.next_addr.as_bytes();
-        let cred_len = self.credential.as_ref().map(|c| 2 + c.as_bytes().len()).unwrap_or(0);
+        let cred_len = self
+            .credential
+            .as_ref()
+            .map(|c| 2 + c.as_bytes().len())
+            .unwrap_or(0);
         let mut out = Vec::with_capacity(12 + 1 + 2 + addr_bytes.len() + 1 + cred_len);
         out.extend_from_slice(self.timestamp.as_bytes());
         out.push(plane_to_u8(self.plane));
@@ -184,7 +198,9 @@ impl HopHandshakeReq {
         let plane = plane_from_u8(buf[12])?;
         let addr_len = u16::from_be_bytes([buf[13], buf[14]]) as usize;
         if addr_len == 0 || addr_len > MAX_CHANNEL_ADDR_BYTES || buf.len() < 15 + addr_len + 1 {
-            return Err(CoreError::Framing("invalid HopHandshakeReq addr len".into()));
+            return Err(CoreError::Framing(
+                "invalid HopHandshakeReq addr len".into(),
+            ));
         }
         let addr_str = std::str::from_utf8(&buf[15..15 + addr_len])
             .map_err(|_| CoreError::Framing("non-utf8 HopHandshakeReq addr".into()))?;
@@ -195,7 +211,9 @@ impl HopHandshakeReq {
         let credential = match has_cred {
             0 => {
                 if pos != buf.len() {
-                    return Err(CoreError::Framing("trailing bytes in HopHandshakeReq".into()));
+                    return Err(CoreError::Framing(
+                        "trailing bytes in HopHandshakeReq".into(),
+                    ));
                 }
                 None
             }
@@ -251,7 +269,9 @@ impl InBandRenewReqPayload {
         let credential = match buf[8] {
             0 => {
                 if buf.len() != 9 {
-                    return Err(CoreError::Framing("trailing bytes in InBandRenewReq".into()));
+                    return Err(CoreError::Framing(
+                        "trailing bytes in InBandRenewReq".into(),
+                    ));
                 }
                 None
             }
@@ -307,18 +327,24 @@ impl InBandRenewRespPayload {
         match buf[8] {
             1 => {
                 if buf.len() != 17 {
-                    return Err(CoreError::Framing("invalid Accepted InBandRenewResp len".into()));
+                    return Err(CoreError::Framing(
+                        "invalid Accepted InBandRenewResp len".into(),
+                    ));
                 }
                 let ttl_millis = u64::from_be_bytes(buf[9..17].try_into().unwrap());
                 Ok(Self::Accepted { req_id, ttl_millis })
             }
             0 => {
                 if buf.len() < 11 {
-                    return Err(CoreError::Framing("truncated Denied InBandRenewResp".into()));
+                    return Err(CoreError::Framing(
+                        "truncated Denied InBandRenewResp".into(),
+                    ));
                 }
                 let rlen = u16::from_be_bytes([buf[9], buf[10]]) as usize;
                 if buf.len() != 11 + rlen {
-                    return Err(CoreError::Framing("invalid Denied InBandRenewResp len".into()));
+                    return Err(CoreError::Framing(
+                        "invalid Denied InBandRenewResp len".into(),
+                    ));
                 }
                 let reason = String::from_utf8_lossy(&buf[11..]).into_owned();
                 Ok(Self::Denied { req_id, reason })
@@ -333,7 +359,9 @@ pub fn pack_chain_segments(segments: &[(TargetTag, Vec<u8>)]) -> Result<Vec<u8>>
     let mut out = Vec::new();
     for (tag, payload) in segments {
         if payload.len() > MAX_WIRE_SEGMENT_BYTES {
-            return Err(CoreError::Framing("setup segment exceeds max wire size".into()));
+            return Err(CoreError::Framing(
+                "setup segment exceeds max wire size".into(),
+            ));
         }
         out.extend_from_slice(tag.as_bytes());
         out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
@@ -566,7 +594,9 @@ impl DgramCtrlPacket {
                 tag.copy_from_slice(&body[16..24]);
                 let clen = u16::from_be_bytes([body[24], body[25]]) as usize;
                 if body.len() != 26 + clen {
-                    return Err(CoreError::Framing("ChainSetupChallenge length mismatch".into()));
+                    return Err(CoreError::Framing(
+                        "ChainSetupChallenge length mismatch".into(),
+                    ));
                 }
                 Ok(Self::ChainSetupChallenge {
                     circuit_id: CircuitId(cid),
@@ -584,7 +614,9 @@ impl DgramCtrlPacket {
                 tag.copy_from_slice(&body[16..24]);
                 let rlen = u16::from_be_bytes([body[24], body[25]]) as usize;
                 if body.len() != 26 + rlen {
-                    return Err(CoreError::Framing("ChainSetupReject length mismatch".into()));
+                    return Err(CoreError::Framing(
+                        "ChainSetupReject length mismatch".into(),
+                    ));
                 }
                 Ok(Self::ChainSetupReject {
                     circuit_id: CircuitId(cid),
@@ -701,7 +733,9 @@ pub async fn read_stream_segment<R: AsyncRead + Unpin>(
     tag.copy_from_slice(&hdr[1..9]);
     let len = u16::from_be_bytes([hdr[9], hdr[10]]) as usize;
     if len > MAX_WIRE_SEGMENT_BYTES {
-        return Err(CoreError::Framing("stream setup segment exceeds limit".into()));
+        return Err(CoreError::Framing(
+            "stream setup segment exceeds limit".into(),
+        ));
     }
     let mut payload = vec![0u8; len];
     stream.read_exact(&mut payload).await?;
@@ -767,7 +801,9 @@ pub async fn read_stream_reply<R: AsyncRead + Unpin>(stream: &mut R) -> Result<S
     tag.copy_from_slice(&hdr[1..9]);
     let len = u16::from_be_bytes([hdr[9], hdr[10]]) as usize;
     if len > MAX_WIRE_SEGMENT_BYTES {
-        return Err(CoreError::Framing("stream setup reply exceeds limit".into()));
+        return Err(CoreError::Framing(
+            "stream setup reply exceeds limit".into(),
+        ));
     }
     let mut body = vec![0u8; len];
     stream.read_exact(&mut body).await?;

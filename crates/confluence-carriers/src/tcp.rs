@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use confluence_core::seams::channel::{BoxedAsyncStream, ChannelCaps, ChannelHealth, StreamChannel};
+use confluence_core::seams::channel::{
+    BoxedAsyncStream, ChannelCaps, ChannelHealth, StreamChannel,
+};
 use confluence_core::{ChannelAddr, ChannelId, CoreError, Plane, Result};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};

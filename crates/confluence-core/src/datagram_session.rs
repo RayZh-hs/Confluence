@@ -3,10 +3,10 @@ use crate::seams::access::{AccessControl, AccessRequest, Action, Decision, Grant
 use crate::seams::channel::DatagramChannel;
 use crate::seams::edge::DatagramSession;
 use crate::security::grant::GrantEnforcer;
-use crate::security::noise::{
-    DatagramSessionCipher, TransportKeys, DATAGRAM_WIRE_OVERHEAD_BYTES,
+use crate::security::noise::{DatagramSessionCipher, TransportKeys, DATAGRAM_WIRE_OVERHEAD_BYTES};
+use crate::types::{
+    ChannelAddr, ChannelId, CircuitId, EndpointName, OpaqueCredential, PeerId, Plane, ScopeId,
 };
-use crate::types::{ChannelAddr, EndpointName, OpaqueCredential, PeerId, Plane, ScopeId};
 use crate::wire::{DataMsgType, InBandRenewReqPayload, InBandRenewRespPayload};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 /// Steady-state packets carry a flat 4-byte `HopLabel` + 8-byte nonce + AEAD(1B type || payload) + 16B tag
 /// (**29 bytes** constant overhead regardless of hop count, zero extra endpoint header bytes).
 pub struct ConfluenceDatagramSession {
+    circuit_id: CircuitId,
     in_label: u32,
     out_label: u32,
     remote_peer: PeerId,
@@ -45,6 +46,7 @@ pub struct ConfluenceDatagramSession {
 impl ConfluenceDatagramSession {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        circuit_id: CircuitId,
         in_label: u32,
         out_label: u32,
         keys: TransportKeys,
@@ -64,6 +66,7 @@ impl ConfluenceDatagramSession {
         let (closed_tx, closed_rx) = watch::channel(None);
 
         let session = Arc::new(Self {
+            circuit_id,
             in_label,
             out_label,
             remote_peer,
@@ -111,6 +114,10 @@ impl ConfluenceDatagramSession {
         session
     }
 
+    pub fn circuit_id(&self) -> CircuitId {
+        self.circuit_id
+    }
+
     pub fn in_label(&self) -> u32 {
         self.in_label
     }
@@ -119,8 +126,12 @@ impl ConfluenceDatagramSession {
         self.max_app_payload
     }
 
-    pub(crate) fn carrier_id(&self) -> &crate::types::ChannelId {
+    pub(crate) fn carrier_id(&self) -> &ChannelId {
         self.carrier.id()
+    }
+
+    pub(crate) fn next_hop_addr(&self) -> &ChannelAddr {
+        &self.next_hop_addr
     }
 
     pub(crate) fn terminate_locally(&self, reason: String) {
@@ -180,7 +191,8 @@ impl ConfluenceDatagramSession {
                                 .expires_at
                                 .saturating_duration_since(Instant::now())
                                 .as_millis()
-                                .min(u64::MAX as u128) as u64;
+                                .min(u64::MAX as u128)
+                                as u64;
                             self.enforcer.update_grant(new_grant);
                             InBandRenewRespPayload::Accepted {
                                 req_id: req.req_id,
@@ -202,10 +214,11 @@ impl ConfluenceDatagramSession {
                         reason: "renewal not supported on initiator".into(),
                     }
                 };
-                if let Ok(pkt) = self
-                    .cipher
-                    .seal_packet(self.out_label, DataMsgType::InBandRenewResp as u8, &resp.encode())
-                {
+                if let Ok(pkt) = self.cipher.seal_packet(
+                    self.out_label,
+                    DataMsgType::InBandRenewResp as u8,
+                    &resp.encode(),
+                ) {
                     let _ = self.carrier.send_to(&self.next_hop_addr, &pkt).await;
                 }
             }
@@ -323,9 +336,9 @@ impl DatagramSession for ConfluenceDatagramSession {
         self.pending_renews.insert(req_id, tx);
 
         let payload = InBandRenewReqPayload { req_id, credential }.encode();
-        let pkt = self
-            .cipher
-            .seal_packet(self.out_label, DataMsgType::InBandRenewReq as u8, &payload)?;
+        let pkt =
+            self.cipher
+                .seal_packet(self.out_label, DataMsgType::InBandRenewReq as u8, &payload)?;
         if let Err(e) = self.carrier.send_to(&self.next_hop_addr, &pkt).await {
             self.pending_renews.remove(&req_id);
             return Err(e);

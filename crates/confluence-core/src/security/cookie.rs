@@ -31,7 +31,8 @@ fn derive_label_key(label: &[u8], responder_pubkey: &PeerId) -> [u8; 32] {
 }
 
 fn compute_mac16(key: &[u8], data: &[u8]) -> [u8; 16] {
-    let mut mac = <HmacBlake2s as Mac>::new_from_slice(key).expect("HMAC accepts arbitrary key len");
+    let mut mac =
+        <HmacBlake2s as Mac>::new_from_slice(key).expect("HMAC accepts arbitrary key len");
     mac.update(data);
     let digest = mac.finalize().into_bytes();
     let mut out = [0u8; 16];
@@ -149,6 +150,25 @@ impl CookieProtector {
 
     pub fn is_under_load(&self) -> bool {
         self.under_load.load(Ordering::Relaxed)
+    }
+
+    /// Verifies `MAC1` framing and integrity in constant time (for already-established circuit renewals).
+    pub fn verify_mac1_only<'a>(&self, envelope: &'a [u8]) -> Option<&'a [u8]> {
+        if envelope.len() < 2 + 2 * HANDSHAKE_MAC_BYTES {
+            return None;
+        }
+        let inner_len = u16::from_be_bytes([envelope[0], envelope[1]]) as usize;
+        if envelope.len() != 2 + inner_len + 2 * HANDSHAKE_MAC_BYTES {
+            return None;
+        }
+        let msg_through_inner = &envelope[..2 + inner_len];
+        let mac1_slice = &envelope[2 + inner_len..2 + inner_len + HANDSHAKE_MAC_BYTES];
+        let expected_mac1 = compute_mac16(&self.mac1_key, msg_through_inner);
+        if bool::from(mac1_slice.ct_eq(&expected_mac1)) {
+            Some(&envelope[2..2 + inner_len])
+        } else {
+            None
+        }
     }
 
     /// Verifies `MAC1` (always) and `MAC2` (when `under_load`) in constant time before any X25519 DH.

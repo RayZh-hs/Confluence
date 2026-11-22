@@ -75,10 +75,7 @@ impl Grant {
         Self {
             expires_at: self.expires_at.min(other.expires_at),
             max_bytes_per_sec: min_opt(self.max_bytes_per_sec, other.max_bytes_per_sec),
-            max_datagrams_per_sec: min_opt(
-                self.max_datagrams_per_sec,
-                other.max_datagrams_per_sec,
-            ),
+            max_datagrams_per_sec: min_opt(self.max_datagrams_per_sec, other.max_datagrams_per_sec),
             max_concurrent_streams: min_opt(
                 self.max_concurrent_streams,
                 other.max_concurrent_streams,
@@ -116,12 +113,7 @@ pub struct RevocationEvent {
 
 impl RevocationEvent {
     /// Checks whether this revocation event applies to `(scope, peer, endpoint)`.
-    pub fn matches(
-        &self,
-        scope: &ScopeId,
-        peer: &PeerId,
-        endpoint: Option<&EndpointName>,
-    ) -> bool {
+    pub fn matches(&self, scope: &ScopeId, peer: &PeerId, endpoint: Option<&EndpointName>) -> bool {
         if let Some(ref s) = self.scope {
             if s != scope {
                 return false;
@@ -211,9 +203,12 @@ where
 {
     async fn evaluate(&self, req: AccessRequest) -> Result<Decision> {
         // 1. Local policy evaluates first (hard local veto; never overridden by external policy).
-        let local_decision = tokio::time::timeout(self.eval_timeout, self.local.evaluate(req.clone()))
-            .await
-            .map_err(|_| CoreError::PolicyError("local policy evaluation timed out".into()))??;
+        let local_decision =
+            tokio::time::timeout(self.eval_timeout, self.local.evaluate(req.clone()))
+                .await
+                .map_err(|_| {
+                    CoreError::PolicyError("local policy evaluation timed out".into())
+                })??;
 
         let local_grant = match local_decision {
             Decision::Allow(g) => g,

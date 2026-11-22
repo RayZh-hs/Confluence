@@ -131,7 +131,11 @@ fn rule_matches(rule: &PolicyRuleConfig, req: &AccessRequest) -> bool {
     }
 
     let peer_hex = req.peer.to_string();
-    if !rule.peers.iter().any(|p| p == "*" || p.eq_ignore_ascii_case(&peer_hex)) {
+    if !rule
+        .peers
+        .iter()
+        .any(|p| p == "*" || p.eq_ignore_ascii_case(&peer_hex))
+    {
         return false;
     }
 

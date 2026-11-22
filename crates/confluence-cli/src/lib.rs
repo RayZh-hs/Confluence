@@ -314,9 +314,9 @@ impl RunningNode {
             let scope = ScopeId::new(&fwd.scope)?;
             match fwd.plane {
                 Plane::Datagram => {
-                    let carrier = udp_map.get(&fwd.carrier_id).ok_or_else(|| {
-                        CoreError::ChannelNotFound(fwd.carrier_id.clone())
-                    })?;
+                    let carrier = udp_map
+                        .get(&fwd.carrier_id)
+                        .ok_or_else(|| CoreError::ChannelNotFound(fwd.carrier_id.clone()))?;
                     let wrapped = NoiseAclDatagramChannel::new(
                         Arc::clone(carrier),
                         scope,
@@ -327,9 +327,9 @@ impl RunningNode {
                     node.mount_datagram_forward_channel(wrapped)?;
                 }
                 Plane::Stream => {
-                    let carrier = tcp_map.get(&fwd.carrier_id).ok_or_else(|| {
-                        CoreError::ChannelNotFound(fwd.carrier_id.clone())
-                    })?;
+                    let carrier = tcp_map
+                        .get(&fwd.carrier_id)
+                        .ok_or_else(|| CoreError::ChannelNotFound(fwd.carrier_id.clone()))?;
                     let wrapped = NoiseAclStreamChannel::new(
                         Arc::clone(carrier),
                         scope,
@@ -402,9 +402,9 @@ impl RunningNode {
                     bg_tasks.push(handle);
                 }
                 Plane::Stream => {
-                    let underlay = tcp_map.get(&reg.carrier_id).ok_or_else(|| {
-                        CoreError::ChannelNotFound(reg.carrier_id.clone())
-                    })?;
+                    let underlay = tcp_map
+                        .get(&reg.carrier_id)
+                        .ok_or_else(|| CoreError::ChannelNotFound(reg.carrier_id.clone()))?;
                     let ingress_id = ChannelId::new(
                         reg.ingress_id
                             .clone()

@@ -53,7 +53,11 @@ async fn direct_two_plane_roundtrip_cookie_flood_and_control_only_acl() {
 
     let alice_node = Node::new(alice_routes);
     alice_node
-        .add_scope(TrustScope::new(scope_id.clone(), alice_kp.clone(), alice_policy))
+        .add_scope(TrustScope::new(
+            scope_id.clone(),
+            alice_kp.clone(),
+            alice_policy,
+        ))
         .unwrap();
     let a_udp = dgram_hub.bind("udp0", "alice:1000");
     let a_tcp = stream_hub.bind("tcp0", "alice:2000");
@@ -72,7 +76,10 @@ async fn direct_two_plane_roundtrip_cookie_flood_and_control_only_acl() {
 
     // 1. Pre-auth resilience: inject garbage UDP packets to Bob -> silently dropped, 0 ACL calls!
     a_udp
-        .send_to(&ChannelAddr::new("bob:1000").unwrap(), &[0, 0, 0, 0, 0x10, 1, 2, 3])
+        .send_to(
+            &ChannelAddr::new("bob:1000").unwrap(),
+            &[0, 0, 0, 0, 0x10, 1, 2, 3],
+        )
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -92,7 +99,11 @@ async fn direct_two_plane_roundtrip_cookie_flood_and_control_only_acl() {
         let mut inbound = stream_ep.accept().await.unwrap();
         let mut payload = vec![0u8; 64 * 1024];
         inbound.stream.read_exact(&mut payload).await.unwrap();
-        inbound.stream.write_all(b"stream-ack-from-bob").await.unwrap();
+        inbound
+            .stream
+            .write_all(b"stream-ack-from-bob")
+            .await
+            .unwrap();
         inbound.stream.close().await.unwrap();
         (inbound.remote_peer, payload)
     });
@@ -147,7 +158,10 @@ async fn direct_two_plane_roundtrip_cookie_flood_and_control_only_acl() {
     // Verify exact 29-byte wire overhead on data datagrams and zero plaintext on wire!
     let all_pkts = dgram_hub.captured_packets("alice:1000", "bob:1000");
     let data_pkt = &all_pkts[pkts_before_data];
-    assert_eq!(data_pkt.len(), DATAGRAM_WIRE_OVERHEAD_BYTES + b"pkt-one".len());
+    assert_eq!(
+        data_pkt.len(),
+        DATAGRAM_WIRE_OVERHEAD_BYTES + b"pkt-one".len()
+    );
     assert!(!data_pkt.windows(7).any(|w| w == b"pkt-one"));
 
     // Only 2 total AccessControl evaluations (1 for stream open, 1 for datagram open)!
@@ -258,7 +272,10 @@ async fn in_band_renewal_and_immediate_teardown_on_revocation_unpublish_and_link
 
     let bob_policy = AuditAccessControl::allow_all(Duration::from_millis(150));
     bob_policy.add_rule(|req| {
-        if matches!(req.action, confluence_core::seams::access::Action::RenewGrant { .. }) {
+        if matches!(
+            req.action,
+            confluence_core::seams::access::Action::RenewGrant { .. }
+        ) {
             Some(Decision::Allow(Grant::with_ttl(Duration::from_secs(10))))
         } else {
             None

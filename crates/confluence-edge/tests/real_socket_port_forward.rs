@@ -255,15 +255,10 @@ async fn real_loopback_tcp_and_udp_port_forward_across_multihop_passive_relay() 
     )
     .await
     .unwrap();
-    let a_udp_bind = UdpOutboundForwarder::bind(
-        loopback,
-        a_node,
-        scope_e2e,
-        bob_kp.peer_id(),
-        ep_name,
-    )
-    .await
-    .unwrap();
+    let a_udp_bind =
+        UdpOutboundForwarder::bind(loopback, a_node, scope_e2e, bob_kp.peer_id(), ep_name)
+            .await
+            .unwrap();
 
     // 6. Connect an ordinary local TCP application client to Alice's local TCP port!
     let mut app_tcp = TcpStream::connect(a_tcp_bind.local_addr()).await.unwrap();

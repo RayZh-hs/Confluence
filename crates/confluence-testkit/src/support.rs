@@ -108,9 +108,7 @@ impl StaticMapPathSource {
     }
 
     pub fn insert(&self, scope: ScopeId, target: PeerId, path: ExplicitPath) {
-        self.routes
-            .lock()
-            .insert((scope, target, path.plane), path);
+        self.routes.lock().insert((scope, target, path.plane), path);
     }
 }
 

@@ -1,39 +1,42 @@
 # Confluence
 
-Confluence securely connects named endpoints over explicit, pluggable paths. A dial establishes one bidirectional byte stream or datagram flow. Intermediate hops forward end-to-end ciphertext, and the destination opens its local service after authenticating the originator’s confirmation.
+Confluence securely connects explicitly published named **Endpoints** over explicit, pluggable paths and named **Transits**. A dial establishes one bidirectional byte stream or datagram flow. Intermediate hops forward end-to-end ciphertext under route-integrity-bound 1-RTT single-pass setup, and the destination opens its local service only after authenticating the originator's 1.0 RTT confirmation.
 
-The [design](DESIGN.md) describes the architecture. The [protocol and implementation plan](SPEC%26IMPL.md) specifies the wire format and milestones.
+* [Core Design](DESIGN.md) — architectural boundaries, symmetric auth model, and the 10 Core invariants
+* [Architecture](docs/architecture.md) · [Wire Protocol](docs/wire-protocol.md) · [API Reference](docs/api.md) · [CLI User Guide](docs/user-guide.md)
 
 ## Rust workspace
 
 | Crate | Responsibility |
 | --- | --- |
-| [confluence-core](crates/confluence-core) | Scope identities, authenticated setup, explicit paths, grants, and the two independent data planes |
-| [confluence-plugins](crates/confluence-plugins) | Static routes and ACLs, the transit authorization wrapper, and in-memory channels |
-| [confluence-net](crates/confluence-net) | TCP and Linux DF UDP carriers on explicitly bound sockets |
-| [confluence-edge](crates/confluence-edge) | TCP and UDP port forwarding, target handlers, and local Unix administration |
-| [confluence-relay](crates/confluence-relay) | Passive selection of pre-established stream and datagram presence links |
+| [confluence-core](crates/confluence-core) | `#![forbid(unsafe_code)]`, zero-OS-I/O engine: `ScopeInstance`, multi-scope `Node`, route-integrity 1-RTT setup over named Endpoints & Transits, rotating `MAC2` flood cookies, per-link generational CIDs, symmetric `CredentialProvider` ↔ `Authorizer` + `IntersectAuthorizer`, revocable `Lease` (`TrafficGate`, `SessionGuard`, live `AuthExtensions` / `SessionAuth`), and the two independent data planes |
+| [confluence-plugins](crates/confluence-plugins) | Out-of-core QoS primitives (`QosLimits`, `RateBucket`, `RateGate`, `ConcurrencyLimiter`, `QosAuthorizer`), `StaticAuthorizer`, TOML `StaticPolicy`, `StaticCredentials`, `StaticPathSource`, in-memory channels, and `TokioSpawner` |
+| [confluence-net](crates/confluence-net) | Pure native TCP (`TcpCarrier`, `TcpListenerSource`) and Linux `DF=1` UDP (`UdpCarrier`, `UdpIngress` + `serve_custom`) carriers supporting both `ScopeInstance` and multi-scope `Node` |
+| [confluence-relay](crates/confluence-relay) | Out-of-core zero-dialing `PassiveRelay` and single-port transport-muxed `RelayService` / `RelayMux` + NAT-side `RelayClientDatagramLink` & `PassiveStreamPool` |
+| [confluence-edge](crates/confluence-edge) | TCP/UDP port forwarding, `E2eStreamIo` (`tokio::io::AsyncRead + AsyncWrite`), target handlers, and owner-only `0600` Unix administration |
+| [confluence-testkit](crates/confluence-testkit) | Deterministic fault-injection hubs (`MemDatagramHub`, `MemStreamHub`), wire-tap capture, outbound-dial auditing, `AuditAuthorizer`, and enterprise RBAC end-to-end tests |
+| [confluence-cli](crates/confluence-cli) | `confluence` CLI (`keygen`, `check`, `run`) for declarative TOML topologies (see [examples/](examples)) |
+| [confluence-ext](crates/confluence-ext) | Out-of-core plugin evaluation suite: Group capability tokens, link-encrypted TCP/UDP, muxed passive TCP relay, Blind Rendezvous UDP P2P + NAT traversal, Striped-TCP & Stream-over-Datagram adapters, and virtual L3 mesh |
 
 ```sh
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo bench -p confluence-core --bench grant_contention
+cargo bench -p confluence-core --bench lease_contention
+```
+
+## Quick start (CLI)
+
+```sh
+cargo run -p confluence-cli -- keygen
+cargo run -p confluence-cli -- check examples/multihop-relay/alice.toml
+cargo run -p confluence-cli -- run examples/direct/bob.toml
 ```
 
 ## Embedding an instance
 
-1. Create a `ScopeInstance` with its own `ScopeKeypair`, an `AccessControl` implementation, a `PathSource`, and a task spawner. The included plugins provide `StaticAcl`, `StaticPathSource`, and `TokioSpawner`.
-2. Register the local first-hop carrier on the originator. At each intermediate scope, register its private carrier stack under the channel tag in the path. Use `AuthAclWrapper` to add transit admission to a native or passive carrier.
-3. Bind and serve ingress on the scopes that should receive traffic. Publish the destination by name and retain the returned `PublishGuard` for as long as it should stay reachable.
-4. Dial using `dial_stream` or `dial_datagram`, or bind a local socket and give it to an edge forwarder.
+1. Build one or more `ScopeInstance`s via `ScopeInstance::builder(identity, tasks)` attaching your `Authorizer` (or `IntersectAuthorizer` for host sovereignty), `PathSource` (pure routing), and `CredentialProvider` (token acquisition & live in-band refresh). Optionally mount multiple scopes on a single `Node` to share one TCP/UDP listener.
+2. Register local first-hop outbound carriers (`register_stream_carrier` / `register_datagram_carrier`). At intermediate hops, publish explicit named transits (`publish_stream_route` / `publish_datagram_route`, or prefix handlers such as `RelayService` via `publish_stream_transit_prefix`) — Core handles `Noise_IK`, `MAC2` cookies, replay protection, and `AuthGate` automatically.
+3. Publish endpoints via `publish_stream` / `publish_datagram` directly (QoS is enforced fail-closed via `Lease` `TrafficGate` / `SessionGuard` attached by your `Authorizer`). Handlers receive a live `SessionAuth` whose `context::<MyClaims>()` reflects in-band renewals automatically, enabling fine-grained application RBAC with zero double-authentication.
+4. Serve ingress via `serve_tcp` / `serve_tcp_node`, `UdpIngress::serve` / `serve_node` (or `RelayMux::serve_tcp_node` / `serve_udp_node` for single-port passive relays), and dial cleanly with `dial_stream(peer, endpoint)` or `dial_datagram(peer, endpoint, min_mtu)` (or attach `serve_local_tcp` / `serve_local_udp` / `E2eStreamIo`).
 
-The [integration tests](crates/confluence-edge/tests/native.rs) show this wiring with native sockets, a three-hop path, and passive presence. For a passive stream relay, supply one already-connected stream per circuit. A registered datagram presence link can serve concurrent circuits.
-
-The optional `AdminSocket::bind` creates an owner-only `0600` Unix socket at the supplied path. Send one newline-terminated command per connection. Commands include `publish-stream NAME ADDR`, `publish-datagram NAME MIN_MTU ADDR`, `unpublish NAME`, `revoke-peer HEX_PUBLIC_KEY`, and `list`. Replies begin with `OK` or `ERR`.
-
-## Protocol decisions
-
-- The receiver checks the scope identifier, MAC, and recently authenticated ephemerals before X25519. It checks clock skew after decrypting the timestamp in the documented v1 envelope.
-- The hop and destination handshakes use Noise IK token order with a Confluence-specific BLAKE3 transcript and key schedule. The first end-to-end frame sent by the originator is an empty DATA confirmation.
-- `SETUP_OK` carries the destination’s grant. The originator sends an initial in-band renewal to learn each intermediate hop’s lease. Forward hop controls count down to their target. Reverse controls carry the sender’s distance and count up.
-- Datagram slot identifiers are retired on a link before their 8-bit generation would repeat. This prevents delayed packets from aliasing a reused label. Rate fields represent bytes per second.
+The optional `AdminSocket::bind` creates an owner-only `0600` Unix socket accepting one newline-terminated command per connection (`publish-stream`, `publish-datagram`, `unpublish`, `revoke-peer`, `list`).

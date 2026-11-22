@@ -6,7 +6,10 @@ publish.workspace = true
 
 [dependencies]
 confluence-core.workspace = true
-tokio = { workspace = true, features = ["sync", "macros"] }
+confluence-net.workspace = true
+blake3.workspace = true
+parking_lot.workspace = true
+tokio = { workspace = true, features = ["sync", "macros", "time", "rt", "net"] }
 
 [lints]
 workspace = true

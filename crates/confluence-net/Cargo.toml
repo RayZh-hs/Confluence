@@ -6,6 +6,8 @@ publish.workspace = true
 
 [dependencies]
 confluence-core.workspace = true
+blake3.workspace = true
+parking_lot.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "sync", "io-util", "time", "macros"] }
 socket2.workspace = true
 libc.workspace = true

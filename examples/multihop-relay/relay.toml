@@ -1,0 +1,36 @@
+# Multi-Hop + Passive Relay Topology (A -> H1 -> R <- B) — Passive Relay R
+# Even though traffic arrives from H1, R authenticates Alice directly on named transit "relay/bob-presence".
+
+[policy]
+default_allow = false
+default_ttl_secs = 300
+
+[[policy.rules]]
+scope = "default"
+peers = ["7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13"] # Alice
+action = "transit"
+target = "relay/bob-presence"
+required_credential = "relay-access-token"
+
+[[scopes]]
+name = "default"
+secret_key = "3333333333333333333333333333333333333333333333333333333333333333"
+
+[[udp_listeners]]
+bind_addr = "127.0.0.1:16200"
+mtu = 1400
+
+[[tcp_listeners]]
+listen_addr = "127.0.0.1:16201"
+
+[[relay_transits]]
+scope = "default"
+prefix = "relay/"
+stream_mtu = 16384
+datagram_mtu = 1400
+
+[[relay_transits.registration_rules]]
+peers = ["0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20"] # Bob
+presence = "bob-presence"
+required_credential = "relay-reg-token"
+ttl_secs = 300

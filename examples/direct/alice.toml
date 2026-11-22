@@ -1,0 +1,60 @@
+# Direct Topology (A -> B) — Alice (Originator)
+#
+# Run Bob first, then run Alice:
+#   cargo run -p confluence-cli -- run examples/direct/bob.toml
+#   cargo run -p confluence-cli -- run examples/direct/alice.toml
+
+[[scopes]]
+name = "default"
+secret_key = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[[credentials]]
+scope = "default"
+verifier = "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20" # Bob
+action = "endpoint"
+credential = "bob-e2e-token"
+
+[[outbound_carriers]]
+scope = "default"
+name = "tcp"
+plane = "stream"
+
+[[outbound_carriers]]
+scope = "default"
+name = "udp"
+plane = "datagram"
+mtu = 1400
+
+[[routes]]
+id = 1
+scope = "default"
+target_pubkey = "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20" # Bob
+endpoint = "demo-tcp"
+plane = "stream"
+first_channel = "tcp"
+first_locator = "127.0.0.1:14101"
+
+[[routes]]
+id = 2
+scope = "default"
+target_pubkey = "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20" # Bob
+endpoint = "demo-udp"
+plane = "datagram"
+first_channel = "udp"
+first_locator = "127.0.0.1:14100"
+min_mtu = 1232
+
+[[bind_endpoints]]
+scope = "default"
+target_pubkey = "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20"
+endpoint = "demo-tcp"
+plane = "stream"
+listen_addr = "127.0.0.1:18080"
+
+[[bind_endpoints]]
+scope = "default"
+target_pubkey = "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20"
+endpoint = "demo-udp"
+plane = "datagram"
+listen_addr = "127.0.0.1:18081"
+min_mtu = 1232

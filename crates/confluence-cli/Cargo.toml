@@ -1,0 +1,25 @@
+[package]
+name = "confluence-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "confluence"
+path = "src/main.rs"
+
+[dependencies]
+confluence-core = { workspace = true, features = ["serde"] }
+confluence-plugins.workspace = true
+confluence-net.workspace = true
+confluence-edge.workspace = true
+confluence-relay.workspace = true
+clap.workspace = true
+serde.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync", "time", "macros", "signal", "io-util"] }
+
+[lints]
+workspace = true

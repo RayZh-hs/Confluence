@@ -829,3 +829,291 @@ async fn e2e_stream_io_adapter_and_testkit_fault_injection() {
     t1.abort();
     t2.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mounted_scopes_share_an_outbound_datagram_link_after_adoption() {
+    let routes = Arc::new(StaticPathSource::default());
+    let auth = AuditAuthorizer::allow_all(Duration::from_secs(30));
+    let first = make_scope(auth.clone(), routes.clone());
+    let second = make_scope(auth.clone(), routes.clone());
+    let remote = make_scope(auth, routes.clone());
+    let node = Node::new(Arc::new(TokioSpawner));
+
+    let hub = MemDatagramHub::new(1500);
+    let local_carrier = hub.bind(b"local");
+    let remote_carrier = hub.bind(b"remote");
+    first
+        .register_datagram_carrier(CARRIER, local_carrier.clone())
+        .unwrap();
+    second
+        .register_datagram_carrier(CARRIER, local_carrier)
+        .unwrap();
+    let _publication = remote
+        .publish_datagram("echo", DATAGRAM_MTU, Arc::new(EchoDatagram))
+        .unwrap();
+    routes.set(
+        remote.public_key(),
+        "echo",
+        Plane::Datagram,
+        ExplicitPath {
+            id: 1,
+            first_channel: CARRIER.into(),
+            first_locator: b"remote".to_vec(),
+            min_mtu: DATAGRAM_MTU,
+            hops: Vec::new(),
+        },
+    );
+    let remote_scope = remote.clone();
+    let _server =
+        tokio::spawn(async move { remote_scope.serve_datagram_listener(&*remote_carrier).await });
+
+    let first_flow = first
+        .dial_datagram(remote.public_key(), "echo", DATAGRAM_MTU)
+        .await
+        .unwrap();
+    node.add_scope(first.clone()).unwrap();
+    node.add_scope(second.clone()).unwrap();
+    let second_flow = second
+        .dial_datagram(remote.public_key(), "echo", DATAGRAM_MTU)
+        .await
+        .unwrap();
+    for (flow, bytes) in [
+        (&first_flow, b"first".as_slice()),
+        (&second_flow, b"second".as_slice()),
+    ] {
+        flow.send(PacketBuf::from_slice(bytes)).unwrap();
+        assert_eq!(
+            timeout(WAIT, flow.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            bytes
+        );
+    }
+}
+
+#[tokio::test]
+async fn mounted_scope_attachment_only_accepts_its_scope() {
+    let routes = Arc::new(StaticPathSource::default());
+    let auth = AuditAuthorizer::allow_all(Duration::from_secs(30));
+    let origin = make_scope(auth.clone(), routes.clone());
+    let allowed = make_scope(auth.clone(), routes.clone());
+    let sibling = make_scope(auth, routes.clone());
+    let node = Node::new(Arc::new(TokioSpawner));
+    node.add_scope(allowed.clone()).unwrap();
+    node.add_scope(sibling.clone()).unwrap();
+
+    let hub = MemDatagramHub::new(1500);
+    let origin_carrier = hub.bind(b"origin");
+    let destination_carrier = hub.bind(b"destination");
+    let _link = origin_carrier.open_link(b"destination").await.unwrap();
+    let inbound = confluence_core::DatagramListener::accept_link(&*destination_carrier)
+        .await
+        .unwrap();
+    let _ingress = allowed.attach_datagram(inbound.clone()).unwrap();
+    origin
+        .register_datagram_carrier(CARRIER, origin_carrier)
+        .unwrap();
+
+    let mut publications = Vec::new();
+    for (id, scope) in [(1, &allowed), (2, &sibling)] {
+        publications.push(
+            scope
+                .publish_datagram("echo", DATAGRAM_MTU, Arc::new(EchoDatagram))
+                .unwrap(),
+        );
+        routes.set(
+            scope.public_key(),
+            "echo",
+            Plane::Datagram,
+            ExplicitPath {
+                id,
+                first_channel: CARRIER.into(),
+                first_locator: b"destination".to_vec(),
+                min_mtu: DATAGRAM_MTU,
+                hops: Vec::new(),
+            },
+        );
+    }
+
+    let allowed_flow = origin
+        .dial_datagram(allowed.public_key(), "echo", DATAGRAM_MTU)
+        .await
+        .unwrap();
+    assert!(
+        timeout(
+            Duration::from_millis(150),
+            origin.dial_datagram(sibling.public_key(), "echo", DATAGRAM_MTU)
+        )
+        .await
+        .is_err()
+    );
+
+    let _node_ingress = node.attach_datagram(inbound).unwrap();
+    let sibling_flow = origin
+        .dial_datagram(sibling.public_key(), "echo", DATAGRAM_MTU)
+        .await
+        .unwrap();
+    for flow in [&allowed_flow, &sibling_flow] {
+        flow.send(PacketBuf::from_slice(b"echo")).unwrap();
+        assert_eq!(
+            timeout(WAIT, flow.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"echo"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stream_io_shutdown_then_drop_forwards_buffered_data_and_fin() {
+    struct CaptureStream(tokio::sync::mpsc::UnboundedSender<MemStream>);
+    impl StreamEndpointHandler for CaptureStream {
+        type Stream = MemStream;
+
+        async fn open(&self, _auth: SessionAuth) -> Result<MemStream, CoreErr> {
+            let (server, app) = mem_stream_pair(4096, 8192);
+            self.0.send(app).map_err(|_| CoreErr::Closed)?;
+            Ok(server)
+        }
+    }
+
+    let routes = Arc::new(StaticPathSource::default());
+    let auth = AuditAuthorizer::allow_all(Duration::from_secs(30));
+    let origin = make_scope(auth.clone(), routes.clone());
+    let remote = make_scope(auth, routes.clone());
+    let hub = MemStreamHub::new(4096, 8192);
+    let listener = hub.bind(b"remote");
+    origin
+        .register_stream_carrier(CARRIER, hub.bind(b"origin"))
+        .unwrap();
+    routes.set(
+        remote.public_key(),
+        "sink",
+        Plane::Stream,
+        ExplicitPath {
+            id: 1,
+            first_channel: CARRIER.into(),
+            first_locator: b"remote".to_vec(),
+            min_mtu: 64,
+            hops: Vec::new(),
+        },
+    );
+    let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+    let _publication = remote
+        .publish_stream("sink", Arc::new(CaptureStream(send)))
+        .unwrap();
+    let remote_scope = remote.clone();
+    let _server = tokio::spawn(async move { remote_scope.serve_stream_listener(&*listener).await });
+
+    let stream = origin
+        .dial_stream(remote.public_key(), "sink")
+        .await
+        .unwrap();
+    let (mut backend, _writer) = timeout(WAIT, receive.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .split();
+    let mut io = E2eStreamIo::new(stream);
+    io.write_all(b"flush").await.unwrap();
+    io.flush().await.unwrap();
+    let mut buf = [0; 5];
+    timeout(WAIT, backend.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf, b"flush");
+
+    io.write_all(b"final").await.unwrap();
+    io.shutdown().await.unwrap();
+    drop(io);
+    timeout(WAIT, backend.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf, b"final");
+    assert_eq!(
+        timeout(WAIT, backend.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn passive_stream_pool_rotates_idle_connections_and_retries_refill() {
+    let routes = Arc::new(StaticPathSource::default());
+    let auth = AuditAuthorizer::allow_all(Duration::from_secs(30));
+    let relay = make_scope(auth.clone(), routes.clone());
+    let registrant = make_scope(auth, routes);
+    let ttl = Duration::from_millis(500);
+    let registrations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counts = registrations.clone();
+    let verifier = Arc::new(FnRegistrationVerifier(
+        move |_: confluence_relay::RelayRegistrationRequest<'_>| {
+            counts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(RegistrationLease::new(ttl))
+        },
+    ));
+    let service = RelayService::new(&relay, "relay/", verifier, 4096, 1500).unwrap();
+    let hub = MemStreamHub::new(4096, 8192);
+    let client = hub.bind(b"client");
+    let listener = service.wrap_stream_listener(hub.bind(b"relay"));
+    let _server = tokio::spawn(async move { relay.serve_stream_listener(&listener).await });
+    let pool = PassiveStreamPool::start(
+        client,
+        registrant.identity(),
+        b"relay".to_vec(),
+        service.public_key(),
+        "peer",
+        vec![],
+        1,
+    )
+    .await
+    .unwrap();
+
+    let dial_relay = || {
+        confluence_core::StreamTransitHandler::open(
+            &service,
+            "peer",
+            SessionAuth::new(registrant.public_key()),
+        )
+    };
+
+    // The first lease expires while the pool is idle.
+    sleep(ttl + Duration::from_millis(50)).await;
+    let stream = timeout(WAIT, dial_relay()).await.unwrap().unwrap();
+    let active = timeout(WAIT, confluence_core::StreamListener::accept(&*pool))
+        .await
+        .unwrap()
+        .unwrap();
+    drop((stream, active));
+
+    // Cut the parked connection and make the first refill attempts fail.
+    hub.set_link_down(b"client", b"relay", true);
+    hub.cut_active_links(b"client", b"relay");
+    let before = registrations.load(std::sync::atomic::Ordering::Relaxed);
+    sleep(Duration::from_millis(125)).await;
+    hub.set_link_down(b"client", b"relay", false);
+    timeout(WAIT, async {
+        while registrations.load(std::sync::atomic::Ordering::Relaxed) <= before
+            || service.relay().parked_stream_count(b"peer") == 0
+        {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let stream = timeout(WAIT, dial_relay()).await.unwrap().unwrap();
+    let active = timeout(WAIT, confluence_core::StreamListener::accept(&*pool))
+        .await
+        .unwrap()
+        .unwrap();
+    drop((stream, active));
+    pool.shutdown().await;
+}

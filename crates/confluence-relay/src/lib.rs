@@ -17,8 +17,8 @@ use confluence_core::{
     AsyncStream, BoxFut, ChannelCaps, CoreErr, DATAGRAM_MTU, DatagramChannel, DatagramLink,
     DatagramLinkExt, DatagramListener, DatagramTransitHandler, DynAsyncStream, IntoDynDatagramLink,
     LinkId, Node, PacketBuf, Plane, PublicKey, RejoinedStream, ScopeInstance, ScopeKeypair,
-    SessionAuth, StreamChannel, StreamListener, StreamRead, StreamTransitHandler, StreamWriteExt,
-    WeakScope,
+    SessionAuth, StreamChannel, StreamListener, StreamRead, StreamTransitHandler, StreamWrite,
+    StreamWriteExt, WeakScope,
     crypto::{
         noise_ik::{self, REPLY_LEN, Responder, parse_target, target_plaintext},
         replay::SetupReplay,
@@ -29,7 +29,7 @@ use confluence_core::{
 use confluence_net::{CustomUdpAttachment, TcpCarrier, TcpListenerSource, UdpIngress};
 use parking_lot::Mutex;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     pin::Pin,
     sync::{
         Arc, Weak,
@@ -40,7 +40,9 @@ use std::{
 };
 use tokio::{
     net::TcpListener,
-    sync::{Mutex as AsyncMutex, Semaphore, mpsc, oneshot, watch},
+    sync::{Mutex as AsyncMutex, mpsc, oneshot, watch},
+    task::{JoinHandle, JoinSet},
+    time::Instant as TokioInstant,
 };
 
 const MAX_PRESENCES: usize = 4096;
@@ -59,7 +61,90 @@ pub const RELAY_REG_RESP: u8 = 0x53;
 /// Single byte written onto a parked stream by [`RelayService`] when an originator attaches.
 pub const RELAY_WAKE_BYTE: u8 = 0x57;
 
-type Streams = HashMap<Vec<u8>, VecDeque<Box<dyn DynAsyncStream>>>;
+type DynStream = Box<dyn DynAsyncStream>;
+type Streams = HashMap<Vec<u8>, VecDeque<ParkedStream>>;
+
+enum ParkedStream {
+    Raw(DynStream),
+    Registered {
+        registrant: PublicKey,
+        expires_at: TokioInstant,
+        claim: oneshot::Sender<()>,
+        ready: oneshot::Receiver<Result<DynStream, CoreErr>>,
+    },
+}
+
+impl ParkedStream {
+    fn available(&self, now: TokioInstant) -> bool {
+        match self {
+            Self::Raw(_) => true,
+            Self::Registered {
+                expires_at, claim, ..
+            } => now < *expires_at && !claim.is_closed(),
+        }
+    }
+
+    fn registrant(&self) -> Option<PublicKey> {
+        match self {
+            Self::Raw(_) => None,
+            Self::Registered { registrant, .. } => Some(*registrant),
+        }
+    }
+
+    async fn open(self) -> Result<DynStream, CoreErr> {
+        match self {
+            Self::Raw(stream) => Ok(stream),
+            Self::Registered { claim, ready, .. } => {
+                claim.send(()).map_err(|_| CoreErr::TargetUnreachable)?;
+                ready.await.map_err(|_| CoreErr::TargetUnreachable)?
+            }
+        }
+    }
+}
+
+// Both halves retain the registration while an activated circuit is live, so
+// revocation still finds it after the stream has left the parking queue.
+struct RegisteredIo<T> {
+    inner: T,
+    _registration: Arc<()>,
+}
+
+impl<T: StreamRead> StreamRead for RegisteredIo<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, CoreErr>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: StreamWrite> StreamWrite for RegisteredIo<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, CoreErr>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), CoreErr>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), CoreErr>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+fn prune_parked(streams: &mut Streams, id: &[u8], now: TokioInstant) {
+    if let Some(queue) = streams.get_mut(id) {
+        queue.retain(|stream| stream.available(now));
+        if queue.is_empty() {
+            streams.remove(id);
+        }
+    }
+}
 type Datagrams = HashMap<Vec<u8>, Arc<PresenceLink<Arc<dyn DatagramLink>>>>;
 
 fn now_ms() -> u64 {
@@ -180,17 +265,50 @@ impl PassiveRelay {
 
     /// Registers one pre-established stream, consumed by one circuit.
     pub fn register_stream<S: AsyncStream>(&self, id: &[u8], stream: S) -> Result<(), CoreErr> {
+        self.park_stream(
+            id,
+            ParkedStream::Raw(stream.into_dyn_stream()),
+            MAX_IDLE_STREAMS,
+        )
+    }
+
+    fn park_stream(&self, id: &[u8], stream: ParkedStream, limit: usize) -> Result<(), CoreErr> {
         validate(id)?;
         let mut streams = self.streams.lock();
+        prune_parked(&mut streams, id, TokioInstant::now());
         if streams.len() >= MAX_PRESENCES && !streams.contains_key(id) {
             return Err(CoreErr::Busy);
         }
         let queue = streams.entry(id.into()).or_default();
-        if queue.len() >= MAX_IDLE_STREAMS {
+        if queue.len() >= limit {
             return Err(CoreErr::Busy);
         }
-        queue.push_back(stream.into_dyn_stream());
+        queue.push_back(stream);
         Ok(())
+    }
+
+    async fn take_stream(
+        &self,
+        id: &[u8],
+        permit: impl Fn(PublicKey) -> bool,
+    ) -> Result<DynStream, CoreErr> {
+        loop {
+            let parked = {
+                let mut streams = self.streams.lock();
+                prune_parked(&mut streams, id, TokioInstant::now());
+                let queue = streams.get_mut(id).ok_or(CoreErr::TargetUnreachable)?;
+                queue.retain(|stream| stream.registrant().is_none_or(&permit));
+                let stream = queue.pop_front();
+                if queue.is_empty() {
+                    streams.remove(id);
+                }
+                stream.ok_or(CoreErr::TargetUnreachable)?
+            };
+            match parked.open().await {
+                Err(CoreErr::TargetUnreachable) => continue,
+                result => return result,
+            }
+        }
     }
 
     /// Removes all parked streams for `id`.
@@ -243,13 +361,7 @@ impl StreamChannel for PassiveRelay {
     }
 
     async fn dial_stream(&self, locator: &[u8]) -> Result<Box<dyn DynAsyncStream>, CoreErr> {
-        let mut streams = self.streams.lock();
-        let queue = streams.get_mut(locator).ok_or(CoreErr::TargetUnreachable)?;
-        let stream = queue.pop_front().ok_or(CoreErr::TargetUnreachable)?;
-        if queue.is_empty() {
-            streams.remove(locator);
-        }
-        Ok(stream)
+        self.take_stream(locator, |_| true).await
     }
 }
 
@@ -506,11 +618,6 @@ struct DatagramSlot {
     _guard: watch::Sender<()>,
 }
 
-struct StreamSlot {
-    registrant: PublicKey,
-    expires_at: Instant,
-}
-
 /// Out-of-core single-port Passive Relay service.
 ///
 /// Publish it on a [`ScopeInstance`] as a named transit (exact or prefix, e.g. `"relay/"`) and
@@ -526,6 +633,8 @@ pub struct RelayService {
     inner: Arc<RelayServiceInner>,
 }
 
+type StreamRegistrants = HashMap<(String, PublicKey), Weak<()>>;
+
 struct RelayServiceInner {
     relay: PassiveRelay,
     identity: Arc<ScopeKeypair>,
@@ -534,7 +643,7 @@ struct RelayServiceInner {
     scope: WeakScope,
     transit_prefix: String,
     datagram_slots: Mutex<HashMap<String, DatagramSlot>>,
-    stream_slots: Mutex<HashMap<String, StreamSlot>>,
+    stream_registrants: Mutex<StreamRegistrants>,
 }
 
 impl RelayService {
@@ -559,7 +668,7 @@ impl RelayService {
                 scope: scope.downgrade(),
                 transit_prefix: transit_prefix.into(),
                 datagram_slots: Default::default(),
-                stream_slots: Default::default(),
+                stream_registrants: Default::default(),
             }),
         })
     }
@@ -582,21 +691,24 @@ impl RelayService {
     /// Immediately removes `presence_id` and tears down all active transit circuits targeting it.
     pub fn remove_presence(&self, presence_id: &str) {
         self.inner.datagram_slots.lock().remove(presence_id);
-        self.inner.stream_slots.lock().remove(presence_id);
-        self.inner
-            .relay
-            .remove_stream_presence(presence_id.as_bytes());
+        {
+            let mut registrants = self.inner.stream_registrants.lock();
+            registrants.retain(|(name, _), _| name != presence_id);
+            self.inner
+                .relay
+                .remove_stream_presence(presence_id.as_bytes());
+        }
         self.revoke_presence_circuits(presence_id);
     }
 
     /// Immediately removes all presences registered by `registrant` and tears down active circuits.
     pub fn revoke_registrant(&self, registrant: &PublicKey) {
-        let mut names = Vec::new();
+        let mut names = HashSet::new();
         {
             let mut slots = self.inner.datagram_slots.lock();
             slots.retain(|name, slot| {
                 if slot.registrant == *registrant {
-                    names.push(name.clone());
+                    names.insert(name.clone());
                     false
                 } else {
                     true
@@ -604,15 +716,21 @@ impl RelayService {
             });
         }
         {
-            let mut slots = self.inner.stream_slots.lock();
-            slots.retain(|name, slot| {
-                if slot.registrant == *registrant {
-                    self.inner.relay.remove_stream_presence(name.as_bytes());
-                    names.push(name.clone());
-                    false
-                } else {
-                    true
+            let mut registrants = self.inner.stream_registrants.lock();
+            let mut streams = self.inner.relay.streams.lock();
+            registrants.retain(|(name, peer), registration| {
+                if registration.strong_count() == 0 {
+                    return false;
                 }
+                if peer == registrant {
+                    names.insert(name.clone());
+                    return false;
+                }
+                true
+            });
+            streams.retain(|_, queue| {
+                queue.retain(|stream| stream.registrant().as_ref() != Some(registrant));
+                !queue.is_empty()
             });
         }
         for name in names {
@@ -671,7 +789,8 @@ impl RelayService {
                 credential: &credential,
             })
             .await?;
-        if lease.ttl.is_zero() {
+        let ttl_ms = u64::try_from(lease.ttl.as_millis()).map_err(|_| CoreErr::Denied)?;
+        if ttl_ms == 0 {
             return Err(CoreErr::Denied);
         }
         let mtu = match plane {
@@ -680,7 +799,7 @@ impl RelayService {
         };
         let mut ack = [0u8; 10];
         ack[..2].copy_from_slice(&mtu.to_be_bytes());
-        ack[2..10].copy_from_slice(&(lease.ttl.as_millis() as u64).to_be_bytes());
+        ack[2..10].copy_from_slice(&ttl_ms.to_be_bytes());
         let (reply, _keys) = opened.reply(&ack)?;
         Ok((presence_id, peer, lease.ttl, reply))
     }
@@ -693,36 +812,111 @@ impl RelayService {
     ) -> Result<(), CoreErr> {
         let caps = stream.caps();
         let source_tag = stream.source_tag();
-        let (reader, mut writer) = stream.split();
-        let (presence_id, registrant, ttl, reply) =
-            match self.admit_registration(seg, Plane::Stream).await {
-                Ok(ok) => ok,
+        let (mut reader, mut writer) = stream.split();
+        let registration = async {
+            let (presence, registrant, ttl, reply) =
+                self.admit_registration(seg, Plane::Stream).await?;
+            let expires_at = TokioInstant::now()
+                .checked_add(ttl)
+                .ok_or(CoreErr::Denied)?;
+            let (claim, claimed) = oneshot::channel();
+            let (activated, ready) = oneshot::channel();
+            let mut registrants = self.inner.stream_registrants.lock();
+            // During renewal the client may keep an old socket parked until its lease
+            // ends, so an activation racing the renewal can still use that socket.
+            self.inner.relay.park_stream(
+                presence.as_bytes(),
+                ParkedStream::Registered {
+                    registrant,
+                    expires_at,
+                    claim,
+                    ready,
+                },
+                MAX_IDLE_STREAMS * 2,
+            )?;
+            if registrants.len() >= MAX_PRESENCES {
+                registrants.retain(|_, registration| registration.strong_count() != 0);
+            }
+            let entry = registrants
+                .entry((presence.clone(), registrant))
+                .or_default();
+            let registration = entry.upgrade().unwrap_or_else(|| {
+                let registration = Arc::new(());
+                *entry = Arc::downgrade(&registration);
+                registration
+            });
+            Ok::<_, CoreErr>((
+                presence,
+                expires_at,
+                reply,
+                claimed,
+                activated,
+                registration,
+            ))
+        }
+        .await;
+        let (presence, expires_at, reply, mut claimed, mut activated, registration) =
+            match registration {
+                Ok(registration) => registration,
                 Err(err) => {
-                    if let Ok(resp) = encode_reg_resp(req_id, 1, &[]) {
-                        let _ = writer.write_all(&resp).await;
-                    }
+                    let response = encode_reg_resp(req_id, 1, &[])?;
+                    let _ = writer.write_all(&response).await;
                     return Err(err);
                 }
             };
-        let resp = encode_reg_resp(req_id, 0, &reply)?;
-        writer.write_all(&resp).await?;
-        let expires_at = Instant::now() + ttl;
-        self.inner.stream_slots.lock().insert(
-            presence_id.clone(),
-            StreamSlot {
-                registrant,
-                expires_at,
-            },
-        );
-        self.inner.relay.register_stream(
-            presence_id.as_bytes(),
-            RejoinedStream {
-                caps,
-                source_tag,
-                reader,
-                writer,
-            },
-        )
+        let response = encode_reg_resp(req_id, 0, &reply)?;
+        if let Err(err) = writer.write_all(&response).await {
+            drop(claimed);
+            prune_parked(
+                &mut self.inner.relay.streams.lock(),
+                presence.as_bytes(),
+                TokioInstant::now(),
+            );
+            return Err(err);
+        }
+
+        let streams = Arc::downgrade(&self.inner.relay.streams);
+        tokio::spawn(async move {
+            let mut unexpected = [0; 1];
+            let activate = tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(expires_at) => false,
+                result = &mut claimed => result.is_ok(),
+                _ = read_exact(&mut reader, &mut unexpected) => false,
+            };
+            drop(claimed);
+            if activate {
+                let wake = tokio::select! {
+                    _ = activated.closed() => return,
+                    wake = writer.write_all(&[RELAY_WAKE_BYTE]) => wake,
+                };
+                let stream = wake
+                    .map(|()| {
+                        RejoinedStream {
+                            caps,
+                            source_tag,
+                            reader: RegisteredIo {
+                                inner: reader,
+                                _registration: registration.clone(),
+                            },
+                            writer: RegisteredIo {
+                                inner: writer,
+                                _registration: registration,
+                            },
+                        }
+                        .into_dyn_stream()
+                    })
+                    .map_err(|_| CoreErr::TargetUnreachable);
+                let _ = activated.send(stream);
+            } else if let Some(streams) = streams.upgrade() {
+                prune_parked(
+                    &mut streams.lock(),
+                    presence.as_bytes(),
+                    TokioInstant::now(),
+                );
+            }
+        });
+        Ok(())
     }
 
     async fn handle_datagram_registration(
@@ -798,39 +992,15 @@ impl StreamTransitHandler for RelayService {
     }
 
     async fn open(&self, target: &str, _auth: SessionAuth) -> Result<Self::Stream, CoreErr> {
-        let is_registered_slot = {
-            let mut slots = self.inner.stream_slots.lock();
-            if let Some(slot) = slots.get(target) {
-                let vetoed = self
-                    .inner
-                    .scope
-                    .upgrade()
-                    .is_some_and(|s| s.auth_gate().is_vetoed(&slot.registrant));
-                if Instant::now() >= slot.expires_at || vetoed {
-                    slots.remove(target);
-                    self.inner.relay.remove_stream_presence(target.as_bytes());
-                    return Err(CoreErr::TargetUnreachable);
-                }
-                true
-            } else {
-                false
-            }
-        };
-        let stream = self.inner.relay.dial_stream(target.as_bytes()).await?;
-        if !is_registered_slot {
-            return Ok(stream);
-        }
-        let caps = stream.caps();
-        let source_tag = stream.source_tag();
-        let (reader, mut writer) = stream.split();
-        writer.write_all(&[RELAY_WAKE_BYTE]).await?;
-        Ok(RejoinedStream {
-            caps,
-            source_tag,
-            reader,
-            writer,
-        }
-        .into_dyn_stream())
+        let scope = self.inner.scope.upgrade();
+        self.inner
+            .relay
+            .take_stream(target.as_bytes(), |registrant| {
+                scope
+                    .as_ref()
+                    .is_none_or(|scope| !scope.auth_gate().is_vetoed(&registrant))
+            })
+            .await
     }
 }
 
@@ -879,10 +1049,24 @@ pub struct RelayMux {
 }
 
 impl RelayMux {
+    /// Creates a mux. Registrations for ambiguous identities fail closed.
+    /// Use [`Self::try_new`] to validate the identities at construction.
     pub fn new(services: Vec<RelayService>) -> Self {
         Self {
             services: Arc::new(services),
         }
+    }
+
+    /// Creates a mux with distinct registration identities.
+    pub fn try_new(services: Vec<RelayService>) -> Result<Self, CoreErr> {
+        let mut keys = HashSet::new();
+        if services
+            .iter()
+            .any(|service| !keys.insert(service.public_key()))
+        {
+            return Err(CoreErr::AlreadyPublished);
+        }
+        Ok(Self::new(services))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -890,10 +1074,9 @@ impl RelayMux {
     }
 
     fn find_for_segment(&self, seg: &[u8]) -> Option<RelayService> {
-        self.services
-            .iter()
-            .find(|svc| svc.precheck_segment(seg))
-            .cloned()
+        let mut matching = self.services.iter().filter(|svc| svc.precheck_segment(seg));
+        let service = matching.next()?;
+        matching.next().is_none().then(|| service.clone())
     }
 
     /// Stack-only precheck returning `true` if `wire` is a valid `RELAY_REG_REQ` addressed to any
@@ -905,95 +1088,82 @@ impl RelayMux {
     /// Wraps any [`StreamListener`], intercepting `RELAY_REG_REQ` streams for the matching
     /// [`RelayService`] and yielding all other streams (with their first byte preserved) to Core.
     pub fn wrap_stream_listener<L: StreamListener>(&self, listener: L) -> RelayStreamListener {
-        let (core_tx, core_rx) = mpsc::channel(MAX_CONCURRENT_PEEK);
-        let (stop, mut stop_rx) = watch::channel(false);
-        let services = self.clone();
-        let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_PEEK));
-        tokio::spawn(async move {
-            loop {
-                let accepted = tokio::select! {
-                    _ = stop_rx.changed() => break,
-                    res = listener.accept() => res,
-                };
-                let Ok(stream) = accepted else {
-                    break;
-                };
-                let Ok(permit) = permits.clone().try_acquire_owned() else {
-                    continue;
-                };
-                let services = services.clone();
-                let core_tx = core_tx.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    let dyn_stream = stream.into_dyn_stream();
-                    let caps = dyn_stream.caps();
-                    let source_tag = dyn_stream.source_tag();
-                    let (mut reader, mut writer) = dyn_stream.split();
-                    let mut first = [0u8; 1];
-                    if !matches!(
-                        tokio::time::timeout(REG_TIMEOUT, read_exact(&mut reader, &mut first))
-                            .await,
-                        Ok(Ok(()))
-                    ) {
-                        return;
+        let (core_tx, mut core) = RelayStreamListener::channel();
+        core.dispatcher = Some(tokio::spawn(
+            self.clone().dispatch_streams(listener, core_tx),
+        ));
+        core
+    }
+
+    async fn dispatch_streams<L: StreamListener>(
+        self,
+        listener: L,
+        core: mpsc::Sender<DynStream>,
+    ) -> Result<(), CoreErr> {
+        let mut workers = JoinSet::new();
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    let stream = result?;
+                    if workers.len() < MAX_CONCURRENT_PEEK {
+                        let mux = self.clone();
+                        let core = core.clone();
+                        workers.spawn(async move {
+                            let _ = tokio::time::timeout(REG_TIMEOUT, mux.dispatch_stream(stream, core)).await;
+                        });
                     }
-                    if first[0] != RELAY_REG_REQ {
-                        let prefixed = RejoinedStream {
-                            caps,
-                            source_tag,
-                            reader: PrefixedRead {
-                                first: Some(first[0]),
-                                inner: reader,
-                            },
-                            writer,
-                        }
-                        .into_dyn_stream();
-                        let _ = core_tx.send(prefixed).await;
-                        return;
-                    }
-                    let mut rest = [0u8; REG_HEADER_LEN - 1];
-                    if !matches!(
-                        tokio::time::timeout(REG_TIMEOUT, read_exact(&mut reader, &mut rest)).await,
-                        Ok(Ok(()))
-                    ) {
-                        return;
-                    }
-                    if rest[0] != 0 {
-                        return;
-                    }
-                    let len = u16::from_be_bytes([rest[1], rest[2]]) as usize;
-                    if len > MAX_REG_PAYLOAD {
-                        return;
-                    }
-                    let req_id = u32::from_be_bytes([rest[3], rest[4], rest[5], rest[6]]);
-                    let mut seg = vec![0u8; len];
-                    if !matches!(
-                        tokio::time::timeout(REG_TIMEOUT, read_exact(&mut reader, &mut seg)).await,
-                        Ok(Ok(()))
-                    ) {
-                        return;
-                    }
-                    let Some(svc) = services.find_for_segment(&seg) else {
-                        if let Ok(resp) = encode_reg_resp(req_id, 1, &[]) {
-                            let _ = writer.write_all(&resp).await;
-                        }
-                        return;
-                    };
-                    let rejoined = RejoinedStream {
-                        caps,
-                        source_tag,
-                        reader,
-                        writer,
-                    }
-                    .into_dyn_stream();
-                    let _ = svc.handle_stream_registration(rejoined, req_id, &seg).await;
-                });
+                }
+                _ = workers.join_next(), if !workers.is_empty() => {}
             }
-        });
-        RelayStreamListener {
-            core_rx: AsyncMutex::new(core_rx),
-            stop,
         }
+    }
+
+    async fn dispatch_stream(
+        &self,
+        stream: impl AsyncStream,
+        core: mpsc::Sender<DynStream>,
+    ) -> Result<(), CoreErr> {
+        let caps = stream.caps();
+        let source_tag = stream.source_tag();
+        let (mut reader, mut writer) = stream.split();
+        let mut first = [0u8; 1];
+        read_exact(&mut reader, &mut first).await?;
+        if first[0] != RELAY_REG_REQ {
+            let prefixed = RejoinedStream {
+                caps,
+                source_tag,
+                reader: PrefixedRead {
+                    first: Some(first[0]),
+                    inner: reader,
+                },
+                writer,
+            }
+            .into_dyn_stream();
+            return core.send(prefixed).await.map_err(|_| CoreErr::Closed);
+        }
+        let mut rest = [0u8; REG_HEADER_LEN - 1];
+        read_exact(&mut reader, &mut rest).await?;
+        let len = u16::from_be_bytes([rest[1], rest[2]]) as usize;
+        if rest[0] != 0 || len > MAX_REG_PAYLOAD {
+            return Err(CoreErr::Malformed);
+        }
+        let req_id = u32::from_be_bytes([rest[3], rest[4], rest[5], rest[6]]);
+        let mut seg = vec![0u8; len];
+        read_exact(&mut reader, &mut seg).await?;
+        let Some(service) = self.find_for_segment(&seg) else {
+            writer.write_all(&encode_reg_resp(req_id, 1, &[])?).await?;
+            return Err(CoreErr::Denied);
+        };
+        let rejoined = RejoinedStream {
+            caps,
+            source_tag,
+            reader,
+            writer,
+        }
+        .into_dyn_stream();
+        service
+            .handle_stream_registration(rejoined, req_id, &seg)
+            .await
     }
 
     /// Wraps an inbound [`DatagramLink`], returning a multiplexed link for Core and an
@@ -1071,8 +1241,11 @@ impl RelayMux {
         scope: ScopeInstance,
         carrier: TcpCarrier,
     ) -> Result<(), CoreErr> {
-        let mux = self.wrap_stream_listener(TcpListenerSource::new(listener, carrier));
-        scope.serve_stream_listener(&mux).await
+        let (tx, core) = RelayStreamListener::channel();
+        tokio::select! {
+            result = scope.serve_stream_listener(&core) => result,
+            result = self.clone().dispatch_streams(TcpListenerSource::new(listener, carrier), tx) => result,
+        }
     }
 
     /// Serves a bound TCP listener for both relay registrations and a multi-scope [`Node`].
@@ -1082,8 +1255,11 @@ impl RelayMux {
         node: Node,
         carrier: TcpCarrier,
     ) -> Result<(), CoreErr> {
-        let mux = self.wrap_stream_listener(TcpListenerSource::new(listener, carrier));
-        node.serve_stream_listener(&mux).await
+        let (tx, core) = RelayStreamListener::channel();
+        tokio::select! {
+            result = node.serve_stream_listener(&core) => result,
+            result = self.clone().dispatch_streams(TcpListenerSource::new(listener, carrier), tx) => result,
+        }
     }
 
     /// Serves a bound [`UdpIngress`] for both relay registrations and a single [`ScopeInstance`].
@@ -1160,18 +1336,33 @@ impl<R: StreamRead> StreamRead for PrefixedRead<R> {
 
 /// [`StreamListener`] produced by [`RelayService::wrap_stream_listener`] or [`RelayMux`].
 pub struct RelayStreamListener {
-    core_rx: AsyncMutex<mpsc::Receiver<Box<dyn DynAsyncStream>>>,
-    stop: watch::Sender<bool>,
+    core_rx: AsyncMutex<mpsc::Receiver<DynStream>>,
+    dispatcher: Option<JoinHandle<Result<(), CoreErr>>>,
+}
+
+impl RelayStreamListener {
+    fn channel() -> (mpsc::Sender<DynStream>, Self) {
+        let (sender, receiver) = mpsc::channel(MAX_CONCURRENT_PEEK);
+        (
+            sender,
+            Self {
+                core_rx: AsyncMutex::new(receiver),
+                dispatcher: None,
+            },
+        )
+    }
 }
 
 impl Drop for RelayStreamListener {
     fn drop(&mut self) {
-        let _ = self.stop.send(true);
+        if let Some(dispatcher) = &self.dispatcher {
+            dispatcher.abort();
+        }
     }
 }
 
 impl StreamListener for RelayStreamListener {
-    type Stream = Box<dyn DynAsyncStream>;
+    type Stream = DynStream;
 
     async fn accept(&self) -> Result<Box<dyn DynAsyncStream>, CoreErr> {
         self.core_rx
@@ -1409,7 +1600,7 @@ pub async fn register_datagram_presence<L: DatagramLink>(
 /// and implements [`StreamListener`] for plug-and-play attachment to [`ScopeInstance`] or [`Node`].
 pub struct PassiveStreamPool {
     activated: AsyncMutex<mpsc::Receiver<Box<dyn DynAsyncStream>>>,
-    stop: watch::Sender<bool>,
+    workers: Mutex<JoinSet<()>>,
 }
 
 impl PassiveStreamPool {
@@ -1426,55 +1617,47 @@ impl PassiveStreamPool {
     ) -> Result<Arc<Self>, CoreErr> {
         let presence_id = presence_id.into();
         validate(presence_id.as_bytes())?;
+        let connector = Arc::new(StreamPoolConnector {
+            carrier,
+            identity,
+            relay_locator,
+            relay_pubkey,
+            presence_id,
+            credential,
+        });
         let pool_size = pool_size.clamp(1, MAX_IDLE_STREAMS);
         let (tx, rx) = mpsc::channel(pool_size * 2);
-        let (stop, stop_rx) = watch::channel(false);
-
+        let mut parked = Vec::with_capacity(pool_size);
         for _ in 0..pool_size {
-            let parked = park_one_stream(
-                &carrier,
-                &identity,
-                &relay_locator,
-                relay_pubkey,
-                &presence_id,
-                &credential,
-            )
-            .await?;
-            spawn_parked_watcher(
-                parked,
-                carrier.clone(),
-                identity.clone(),
-                relay_locator.clone(),
-                relay_pubkey,
-                presence_id.clone(),
-                credential.clone(),
-                tx.clone(),
-                stop_rx.clone(),
-            );
+            parked.push(connector.park().await?);
         }
 
+        let mut workers = JoinSet::new();
+        for stream in parked {
+            workers.spawn(connector.clone().maintain(stream, tx.clone()));
+        }
         Ok(Arc::new(Self {
             activated: AsyncMutex::new(rx),
-            stop,
+            workers: Mutex::new(workers),
         }))
     }
 
-    /// Stops parking new streams and shuts down idle watchers.
+    /// Stops parking new streams and cancels idle watchers.
     pub fn close(&self) {
-        let _ = self.stop.send(true);
+        self.workers.lock().abort_all();
     }
-}
 
-impl Drop for PassiveStreamPool {
-    fn drop(&mut self) {
-        let _ = self.stop.send(true);
+    /// Stops the pool and awaits cancellation of its refill workers.
+    pub async fn shutdown(&self) {
+        let mut workers = std::mem::take(&mut *self.workers.lock());
+        workers.shutdown().await;
     }
 }
 
 impl StreamListener for PassiveStreamPool {
-    type Stream = Box<dyn DynAsyncStream>;
+    type Stream = DynStream;
 
-    async fn accept(&self) -> Result<Box<dyn DynAsyncStream>, CoreErr> {
+    async fn accept(&self) -> Result<DynStream, CoreErr> {
         self.activated
             .lock()
             .await
@@ -1484,99 +1667,136 @@ impl StreamListener for PassiveStreamPool {
     }
 }
 
-async fn park_one_stream<C: StreamChannel>(
-    carrier: &Arc<C>,
-    identity: &Arc<ScopeKeypair>,
-    relay_locator: &[u8],
-    relay_pubkey: PublicKey,
-    presence_id: &str,
-    credential: &[u8],
-) -> Result<
-    RejoinedStream<<C::Stream as AsyncStream>::Read, <C::Stream as AsyncStream>::Write>,
-    CoreErr,
-> {
-    let stream = carrier.dial_stream(relay_locator).await?;
-    let caps = stream.caps();
-    let source_tag = stream.source_tag();
-    let (mut reader, mut writer) = stream.split();
-
-    let plain = target_plaintext(now_ms(), presence_id, credential)?;
-    let aad = relay_reg_aad(relay_pubkey);
-    let (seg, initiator) = noise_ik::initiate(identity, relay_pubkey, &aad, &plain)?;
-    let frame = encode_reg_req(1, &seg)?;
-    writer.write_all(&frame).await?;
-
-    let mut hdr = [0u8; REG_HEADER_LEN];
-    read_exact(&mut reader, &mut hdr).await?;
-    if hdr[0] != RELAY_REG_RESP || hdr[1] != 0 {
-        return Err(CoreErr::Denied);
-    }
-    let len = u16::from_be_bytes([hdr[2], hdr[3]]) as usize;
-    if len > MAX_REG_PAYLOAD {
-        return Err(CoreErr::Malformed);
-    }
-    let mut body = vec![0u8; len];
-    read_exact(&mut reader, &mut body).await?;
-    let _ = initiator.finish(identity, &body)?;
-
-    Ok(RejoinedStream {
-        caps,
-        source_tag,
-        reader,
-        writer,
-    })
+struct ParkedConnection {
+    stream: DynStream,
+    renew_at: TokioInstant,
+    expires_at: TokioInstant,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_parked_watcher<C: StreamChannel>(
-    stream: RejoinedStream<<C::Stream as AsyncStream>::Read, <C::Stream as AsyncStream>::Write>,
+struct StreamPoolConnector<C> {
     carrier: Arc<C>,
     identity: Arc<ScopeKeypair>,
     relay_locator: Vec<u8>,
     relay_pubkey: PublicKey,
     presence_id: String,
     credential: Vec<u8>,
-    activated_tx: mpsc::Sender<Box<dyn DynAsyncStream>>,
-    mut stop_rx: watch::Receiver<bool>,
-) {
-    tokio::spawn(async move {
-        if *stop_rx.borrow() {
-            return;
+}
+
+impl<C: StreamChannel> StreamPoolConnector<C> {
+    async fn park(&self) -> Result<ParkedConnection, CoreErr> {
+        tokio::time::timeout(REG_TIMEOUT, async {
+            let stream = self.carrier.dial_stream(&self.relay_locator).await?;
+            let caps = stream.caps();
+            let source_tag = stream.source_tag();
+            let (mut reader, mut writer) = stream.split();
+
+            let plain = target_plaintext(now_ms(), &self.presence_id, &self.credential)?;
+            let aad = relay_reg_aad(self.relay_pubkey);
+            let (segment, initiator) =
+                noise_ik::initiate(&self.identity, self.relay_pubkey, &aad, &plain)?;
+            let request_start = TokioInstant::now();
+            writer.write_all(&encode_reg_req(1, &segment)?).await?;
+
+            let mut hdr = [0u8; REG_HEADER_LEN];
+            read_exact(&mut reader, &mut hdr).await?;
+            let len = u16::from_be_bytes([hdr[2], hdr[3]]) as usize;
+            if len > MAX_REG_PAYLOAD {
+                return Err(CoreErr::Malformed);
+            }
+            let mut response = hdr.to_vec();
+            response.resize(REG_HEADER_LEN + len, 0);
+            read_exact(&mut reader, &mut response[REG_HEADER_LEN..]).await?;
+            let (status, req_id, body) = parse_reg_resp(&response)?;
+            if status != 0 {
+                return Err(CoreErr::Denied);
+            }
+            if req_id != 1 {
+                return Err(CoreErr::Malformed);
+            }
+            let (ack, _keys) = initiator.finish(&self.identity, body)?;
+            let ttl = Duration::from_millis(u64::from_be_bytes(ack[2..10].try_into().unwrap()));
+            if ttl.is_zero() {
+                return Err(CoreErr::Denied);
+            }
+            let renew_at = request_start
+                .checked_add(ttl.mul_f64(0.75))
+                .ok_or(CoreErr::Denied)?;
+            let expires_at = TokioInstant::now()
+                .checked_add(ttl)
+                .ok_or(CoreErr::Denied)?;
+            Ok(ParkedConnection {
+                stream: RejoinedStream {
+                    caps,
+                    source_tag,
+                    reader,
+                    writer,
+                }
+                .into_dyn_stream(),
+                renew_at,
+                expires_at,
+            })
+        })
+        .await
+        .map_err(|_| CoreErr::Timeout)?
+    }
+
+    async fn retry_park(&self) -> ParkedConnection {
+        let mut delay = Duration::from_millis(50);
+        loop {
+            if let Ok(parked) = self.park().await {
+                return parked;
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(2));
         }
-        let caps = stream.caps();
-        let source_tag = stream.source_tag();
-        let (mut reader, writer) = stream.split();
-        let mut wake = [0u8; 1];
-        tokio::select! {
-            _ = stop_rx.changed() => {}
-            res = read_exact(&mut reader, &mut wake) => {
-                if res.is_ok() && wake[0] == RELAY_WAKE_BYTE {
-                    let c2 = carrier.clone();
-                    let id2 = identity.clone();
-                    let loc2 = relay_locator.clone();
-                    let pres2 = presence_id.clone();
-                    let cred2 = credential.clone();
-                    let tx2 = activated_tx.clone();
-                    let stop2 = stop_rx.clone();
-                    tokio::spawn(async move {
-                        if !*stop2.borrow()
-                            && let Ok(next) = park_one_stream(
-                                &c2, &id2, &loc2, relay_pubkey, &pres2, &cred2,
-                            ).await
-                        {
-                            spawn_parked_watcher(
-                                next, c2, id2, loc2, relay_pubkey, pres2, cred2, tx2, stop2,
-                            );
+    }
+
+    async fn maintain(
+        self: Arc<Self>,
+        mut parked: ParkedConnection,
+        activated: mpsc::Sender<DynStream>,
+    ) {
+        let mut retiring = JoinSet::new();
+        loop {
+            while retiring.try_join_next().is_some() {}
+            {
+                let caps = parked.stream.caps();
+                let source_tag = parked.stream.source_tag();
+                let (mut reader, writer) = parked.stream.split();
+                let mut byte = [0; 1];
+                let renew = async {
+                    tokio::time::sleep_until(parked.renew_at).await;
+                    self.retry_park().await
+                };
+                tokio::select! {
+                    biased;
+                    result = read_exact(&mut reader, &mut byte) => {
+                        if result.is_ok() && byte[0] == RELAY_WAKE_BYTE {
+                            let stream = RejoinedStream { caps, source_tag, reader, writer };
+                            if activated.send(stream.into_dyn_stream()).await.is_err() {
+                                return;
+                            }
                         }
-                    });
-                    let _ = activated_tx.send(RejoinedStream {
-                        caps,
-                        source_tag,
-                        reader,
-                        writer,
-                    }.into_dyn_stream()).await;
+                    }
+                    replacement = renew => {
+                        // The relay may already have claimed the old stream. Keep
+                        // reading it through expiry so a racing wake can be delivered.
+                        let activated = activated.clone();
+                        let expires_at = parked.expires_at;
+                        retiring.spawn(async move {
+                            let wake = tokio::time::timeout_at(expires_at, read_exact(&mut reader, &mut byte)).await;
+                            if matches!(wake, Ok(Ok(()))) && byte[0] == RELAY_WAKE_BYTE {
+                                let stream = RejoinedStream { caps, source_tag, reader, writer };
+                                let _ = tokio::time::timeout_at(expires_at, activated.send(stream.into_dyn_stream())).await;
+                            }
+                        });
+                        parked = replacement;
+                        continue;
+                    }
+                    _ = tokio::time::sleep_until(parked.expires_at) => {}
                 }
             }
+            parked = self.retry_park().await;
         }
-    });
+    }
 }

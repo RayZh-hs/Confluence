@@ -1,9 +1,10 @@
 use parking_lot::Mutex;
 use std::{
+    collections::HashMap,
     num::NonZeroUsize,
     sync::{
         Arc, Weak,
-        atomic::{AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
 };
 use tokio::sync::{OwnedSemaphorePermit, mpsc, watch};
@@ -13,7 +14,8 @@ use super::{
     inbound::{self, HopSession},
 };
 use crate::{
-    CoreErr, DatagramAction, DatagramLink, DatagramLinkExt, Direction, MtuWatch, PacketBuf,
+    CoreErr, DatagramAction, DatagramLink, DatagramLinkExt, Direction, LinkId, MtuWatch, PacketBuf,
+    Plane, ScopeKid,
     cid::{Cid, SlabTable},
     crypto::aead::ControlCipher,
     node::NodeInner,
@@ -26,25 +28,57 @@ const ADMISSION_PENDING: u8 = 0;
 const ADMISSION_ACCEPTED: u8 = 1;
 const ADMISSION_REJECTED: u8 = 2;
 
-enum IngressOwner {
-    Scope(Weak<Scope>),
-    Node(Weak<NodeInner>),
+#[derive(Default)]
+struct Ingress {
+    node: Weak<NodeInner>,
+    node_wide: bool,
+    scopes: HashMap<ScopeKid, Weak<Scope>>,
+}
+
+impl Ingress {
+    fn allow_scope(&mut self, scope: &Arc<Scope>) {
+        let kid = scope.identity.kid();
+        if self.scopes.len() >= 32 && !self.scopes.contains_key(&kid) {
+            self.scopes.retain(|_, scope| scope.strong_count() != 0);
+        }
+        self.scopes.insert(kid, Arc::downgrade(scope));
+    }
+}
+
+pub(crate) fn datagram_setup(wire: &[u8]) -> Option<(ScopeKid, setup::Segment<'_>)> {
+    let hdr = setup::ForwardHeader::parse(wire).ok()?;
+    if hdr.upstream == Cid::UNBOUND {
+        return None;
+    }
+    let segment = setup::Segment::parse(&wire[setup::FWD_HEADER..]).ok()?;
+    if segment.plane != Plane::Datagram {
+        return None;
+    }
+    let kid = ScopeKid(segment.encrypted.get(..8)?.try_into().ok()?);
+    Some((kid, segment))
+}
+
+fn reserve_port(
+    ports: &mut HashMap<LinkId, Weak<DatagramPort>>,
+    limit: usize,
+) -> Result<(), CoreErr> {
+    if ports.len() >= limit.min(256) {
+        ports.retain(|_, port| port.strong_count() != 0);
+    }
+    if ports.len() >= limit {
+        return Err(CoreErr::Busy);
+    }
+    Ok(())
 }
 
 pub(crate) struct DatagramPort {
     pub link: Arc<dyn DatagramLink>,
     pub mtu: MtuWatch,
     slots: Mutex<SlabTable<mpsc::Sender<PacketBuf>>>,
+    ingress: Mutex<Ingress>,
     gone: watch::Sender<Option<CoreErr>>,
-    count: Arc<AtomicUsize>,
     admission: AtomicU8,
     _stop: watch::Sender<()>,
-}
-
-impl Drop for DatagramPort {
-    fn drop(&mut self) {
-        self.count.fetch_sub(1, Ordering::Relaxed);
-    }
 }
 
 impl DatagramPort {
@@ -53,32 +87,21 @@ impl DatagramPort {
         link: Arc<dyn DatagramLink>,
     ) -> Result<Arc<Self>, CoreErr> {
         let id = link.link_id();
-        {
-            let ports = scope.datagram_ports.lock();
-            if let Some(port) = ports.get(&id).and_then(Weak::upgrade) {
-                return Ok(port);
-            }
-        }
-        if let Some(node) = scope.node.lock().as_ref().and_then(Weak::upgrade)
-            && let Some(port) = node.datagram_ports.lock().get(&id).and_then(Weak::upgrade)
-        {
-            scope.remember_datagram_port(&port);
-            return Ok(port);
-        }
+        // Mount, unmount, and attachment take these locks in the same order.
+        let membership = scope.node.lock();
         let mut ports = scope.datagram_ports.lock();
         if let Some(port) = ports.get(&id).and_then(Weak::upgrade) {
+            port.ingress.lock().allow_scope(scope);
             return Ok(port);
         }
-        if ports.len() >= 256 {
-            ports.retain(|_, port| port.strong_count() != 0);
-        }
-        scope.reserve_port()?;
-        let port = Self::spawn(
-            link,
-            scope.port_count.clone(),
-            scope.tasks.clone(),
-            IngressOwner::Scope(Arc::downgrade(scope)),
-        );
+        reserve_port(&mut ports, scope.max_datagram_ports)?;
+        let port = if let Some(node) = membership.as_ref().and_then(Weak::upgrade) {
+            Self::attach_on_node(&node, link, Some(scope))?
+        } else {
+            let mut ingress = Ingress::default();
+            ingress.allow_scope(scope);
+            Self::spawn(link, &*scope.tasks, ingress)
+        };
         ports.insert(id, Arc::downgrade(&port));
         Ok(port)
     }
@@ -87,44 +110,121 @@ impl DatagramPort {
         node: &Arc<NodeInner>,
         link: Arc<dyn DatagramLink>,
     ) -> Result<Arc<Self>, CoreErr> {
+        Self::attach_on_node(node, link, None)
+    }
+
+    fn attach_on_node(
+        node: &Arc<NodeInner>,
+        link: Arc<dyn DatagramLink>,
+        scope: Option<&Arc<Scope>>,
+    ) -> Result<Arc<Self>, CoreErr> {
         let id = link.link_id();
-        {
-            let ports = node.datagram_ports.lock();
-            if let Some(port) = ports.get(&id).and_then(Weak::upgrade) {
-                return Ok(port);
-            }
-        }
-        if let Some(port) = node.find_scope_port(id) {
-            let mut ports = node.datagram_ports.lock();
-            if ports.len() >= 256 {
-                ports.retain(|_, existing| existing.strong_count() != 0);
-            }
-            ports.insert(id, Arc::downgrade(&port));
-            return Ok(port);
-        }
         let mut ports = node.datagram_ports.lock();
         if let Some(port) = ports.get(&id).and_then(Weak::upgrade) {
+            let mut ingress = port.ingress.lock();
+            if let Some(scope) = scope {
+                ingress.allow_scope(scope);
+            } else {
+                ingress.node_wide = true;
+            }
+            drop(ingress);
             return Ok(port);
         }
-        if ports.len() >= 256 {
-            ports.retain(|_, port| port.strong_count() != 0);
+
+        reserve_port(&mut ports, node.max_datagram_ports)?;
+        let mut ingress = Ingress {
+            node: Arc::downgrade(node),
+            node_wide: scope.is_none(),
+            ..Ingress::default()
+        };
+        if let Some(scope) = scope {
+            ingress.allow_scope(scope);
         }
-        node.reserve_port()?;
-        let port = Self::spawn(
-            link,
-            node.port_count.clone(),
-            node.tasks.clone(),
-            IngressOwner::Node(Arc::downgrade(node)),
-        );
+        let port = Self::spawn(link, &*node.tasks, ingress);
         ports.insert(id, Arc::downgrade(&port));
         Ok(port)
     }
 
+    // The caller holds the scope membership lock, so its standalone registry cannot
+    // change while we validate and adopt all its live dispatchers.
+    pub(crate) fn mount_scope(node: &Arc<NodeInner>, scope: &Arc<Scope>) -> Result<(), CoreErr> {
+        let scoped = scope.datagram_ports.lock();
+        let mut registry = node.datagram_ports.lock();
+        let live: Vec<_> = scoped
+            .iter()
+            .filter_map(|(&id, port)| Some((id, port.upgrade()?)))
+            .collect();
+        if live.is_empty() {
+            return Ok(());
+        }
+        registry.retain(|_, port| port.strong_count() != 0);
+        let mut added = 0;
+        for (id, port) in &live {
+            if port
+                .ingress
+                .lock()
+                .node
+                .upgrade()
+                .is_some_and(|owner| !Arc::ptr_eq(&owner, node))
+            {
+                return Err(CoreErr::AlreadyPublished);
+            }
+            match registry.get(id).and_then(Weak::upgrade) {
+                Some(existing) if !Arc::ptr_eq(&existing, port) => {
+                    return Err(CoreErr::AlreadyPublished);
+                }
+                Some(_) => {}
+                None => added += 1,
+            }
+        }
+        if added > node.max_datagram_ports.saturating_sub(registry.len()) {
+            return Err(CoreErr::Busy);
+        }
+        let owner = Arc::downgrade(node);
+        for (id, port) in live {
+            let mut ingress = port.ingress.lock();
+            if !ingress.node.ptr_eq(&owner) {
+                ingress.node_wide = false;
+                ingress.node = owner.clone();
+            }
+            ingress.allow_scope(scope);
+            registry.insert(id, Arc::downgrade(&port));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn unmount_scope(scope: &Arc<Scope>) {
+        let kid = scope.identity.kid();
+        for port in scope
+            .datagram_ports
+            .lock()
+            .values()
+            .filter_map(Weak::upgrade)
+        {
+            port.ingress.lock().scopes.remove(&kid);
+        }
+    }
+
+    fn resolve_scope(&self, wire: &[u8]) -> Option<Arc<Scope>> {
+        let (kid, segment) = datagram_setup(wire)?;
+        let (scope, node) = {
+            let ingress = self.ingress.lock();
+            (
+                ingress.scopes.get(&kid).and_then(Weak::upgrade),
+                ingress.node_wide.then(|| ingress.node.upgrade()).flatten(),
+            )
+        };
+        let scope = scope.or_else(|| node?.scope_by_kid(kid))?;
+        scope
+            .identity
+            .verify_mac1_with_flag(segment.encrypted, segment.has_mac2)
+            .then_some(scope)
+    }
+
     fn spawn(
         link: Arc<dyn DatagramLink>,
-        count: Arc<AtomicUsize>,
-        tasks: Arc<dyn crate::TaskSpawner>,
-        owner: IngressOwner,
+        tasks: &dyn crate::TaskSpawner,
+        ingress: Ingress,
     ) -> Arc<Self> {
         let (stop, mut stop_rx) = watch::channel(());
         let mtu = link.caps().mtu_watch;
@@ -132,8 +232,8 @@ impl DatagramPort {
             link: link.clone(),
             mtu,
             slots: Mutex::new(SlabTable::new(4096)),
+            ingress: Mutex::new(ingress),
             gone: watch::channel(None).0,
-            count,
             admission: AtomicU8::new(ADMISSION_PENDING),
             _stop: stop,
         });
@@ -165,26 +265,8 @@ impl DatagramPort {
                     if packet.as_slice()[0] != setup::FWD {
                         continue;
                     }
-                    let scope = match &owner {
-                        IngressOwner::Scope(weak) => {
-                            let Some(scope) = weak.upgrade() else {
-                                return;
-                            };
-                            if !scope.precheck_datagram_setup(packet.as_slice()) {
-                                continue;
-                            }
-                            scope
-                        }
-                        IngressOwner::Node(weak) => {
-                            let Some(node) = weak.upgrade() else {
-                                return;
-                            };
-                            let Some(scope) = node.resolve_datagram_scope(packet.as_slice()) else {
-                                continue;
-                            };
-                            scope.remember_datagram_port(&port);
-                            scope
-                        }
+                    let Some(scope) = port.resolve_scope(packet.as_slice()) else {
+                        continue;
                     };
                     let Ok(permit) = scope.pending.clone().try_acquire_owned() else {
                         continue;
@@ -457,5 +539,68 @@ impl Transit {
 pub(crate) async fn mtu_changed(watch: &mut MtuWatch) {
     if watch.changed().await.is_err() {
         std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{BoxFut, ChannelCaps, Node, ScopeInstance, ScopeKeypair, TaskSpawner};
+
+    struct NoTasks;
+
+    impl TaskSpawner for NoTasks {
+        fn spawn(&self, _task: BoxFut<'static, ()>) {}
+    }
+
+    struct SharedLink;
+
+    impl DatagramLink for SharedLink {
+        fn caps(&self) -> ChannelCaps {
+            ChannelCaps::fixed(1500, false)
+        }
+
+        fn try_send(&self, _packet: PacketBuf) -> Result<(), CoreErr> {
+            Ok(())
+        }
+
+        fn poll_recv(
+            &self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<PacketBuf, CoreErr>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[test]
+    fn concurrent_first_attachments_share_one_port_and_cid_table() {
+        let tasks = Arc::new(NoTasks);
+        let node = Node::new(tasks.clone());
+        let first = ScopeInstance::builder(ScopeKeypair::generate(), tasks.clone()).build();
+        let second = ScopeInstance::builder(ScopeKeypair::generate(), tasks).build();
+        node.add_scope(first.clone()).unwrap();
+        node.add_scope(second.clone()).unwrap();
+        let link: Arc<dyn DatagramLink> = Arc::new(SharedLink);
+        let barrier = std::sync::Barrier::new(2);
+
+        let (first_port, second_port) = std::thread::scope(|threads| {
+            let first_attachment = threads.spawn(|| {
+                barrier.wait();
+                DatagramPort::attach_scope(&first.0, link.clone()).unwrap()
+            });
+            let second_attachment = threads.spawn(|| {
+                barrier.wait();
+                DatagramPort::attach_scope(&second.0, link.clone()).unwrap()
+            });
+            (
+                first_attachment.join().unwrap(),
+                second_attachment.join().unwrap(),
+            )
+        });
+
+        assert!(Arc::ptr_eq(&first_port, &second_port));
+        let first_circuit = first_port.bind().unwrap();
+        let second_circuit = second_port.bind().unwrap();
+        assert_ne!(first_circuit.cid, second_circuit.cid);
     }
 }

@@ -1,0 +1,19 @@
+[package]
+name = "confluence-examples"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+confluence-core.workspace = true
+confluence-edge.workspace = true
+confluence-net.workspace = true
+confluence-plugins.workspace = true
+confluence-relay.workspace = true
+confluence-runtime.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
+tracing-subscriber.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

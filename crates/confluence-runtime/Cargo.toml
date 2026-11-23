@@ -1,0 +1,22 @@
+[package]
+name = "confluence-runtime"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+confluence-core.workspace = true
+confluence-edge.workspace = true
+confluence-net.workspace = true
+confluence-plugins.workspace = true
+confluence-relay.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
+zeroize.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true

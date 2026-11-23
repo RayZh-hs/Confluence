@@ -5,10 +5,7 @@
 use parking_lot::Mutex;
 use std::{
     collections::HashMap,
-    sync::{
-        Arc, Weak,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Weak},
 };
 use tokio::sync::{Semaphore, broadcast, watch};
 
@@ -37,7 +34,7 @@ pub struct ScopeLimits {
     pub max_pending: usize,
     /// Maximum concurrent active sessions/circuits across this scope (`default: 4096`).
     pub max_sessions: usize,
-    /// Maximum simultaneously attached per-peer `DatagramPort` dispatchers (`default: 4096`).
+    /// Maximum per-peer datagram links attached through this scope (`default: 4096`).
     pub max_datagram_ports: usize,
 }
 
@@ -163,7 +160,6 @@ pub(crate) struct Scope {
     pub datagram_ports: Mutex<HashMap<LinkId, Weak<DatagramPort>>>,
     pub node: Mutex<Option<Weak<crate::node::NodeInner>>>,
     pub wake_on_drop: watch::Sender<()>,
-    pub port_count: Arc<AtomicUsize>,
     pub max_datagram_ports: usize,
 }
 
@@ -327,7 +323,6 @@ impl ScopeInstance {
             datagram_ports: Default::default(),
             node: Default::default(),
             wake_on_drop: watch::channel(()).0,
-            port_count: Default::default(),
             max_datagram_ports: limits.max_datagram_ports,
         });
         for mut events in scope.auth.revocation_streams() {
@@ -809,24 +804,6 @@ impl Scope {
             .clone()
             .try_acquire_owned()
             .map_err(|_| CoreErr::Busy)
-    }
-
-    pub fn reserve_port(&self) -> Result<(), CoreErr> {
-        self.port_count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                (n < self.max_datagram_ports).then_some(n + 1)
-            })
-            .map(|_| ())
-            .map_err(|_| CoreErr::Busy)
-    }
-
-    pub(crate) fn remember_datagram_port(&self, port: &Arc<DatagramPort>) {
-        let id = port.link.link_id();
-        let mut ports = self.datagram_ports.lock();
-        if ports.len() >= 256 {
-            ports.retain(|_, existing| existing.strong_count() != 0);
-        }
-        ports.entry(id).or_insert_with(|| Arc::downgrade(port));
     }
 }
 

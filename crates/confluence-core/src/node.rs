@@ -5,19 +5,18 @@
 use parking_lot::Mutex;
 use std::{
     collections::HashMap,
-    sync::{
-        Arc, Weak,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Weak},
 };
 use tokio::sync::Semaphore;
 
 use crate::{
     AsyncStream, CoreErr, DatagramIngress, DatagramListener, IntoDynDatagramLink, LinkId,
     PublicKey, ScopeInstance, ScopeKid, StreamListener, TaskSpawner,
-    path::{dg_switch::DatagramPort, inbound},
+    path::{
+        dg_switch::{DatagramPort, datagram_setup},
+        inbound,
+    },
     scope::Scope,
-    wire::setup,
 };
 
 /// Multi-scope runtime container demultiplexing shared Stream and Datagram listeners onto
@@ -42,7 +41,6 @@ pub(crate) struct NodeInner {
     scopes_by_pk: Mutex<HashMap<PublicKey, ScopeInstance>>,
     scopes_by_kid: Mutex<HashMap<ScopeKid, ScopeInstance>>,
     pub datagram_ports: Mutex<HashMap<LinkId, Weak<DatagramPort>>>,
-    pub port_count: Arc<AtomicUsize>,
     pub max_datagram_ports: usize,
 }
 
@@ -64,7 +62,6 @@ impl Node {
             scopes_by_pk: Default::default(),
             scopes_by_kid: Default::default(),
             datagram_ports: Default::default(),
-            port_count: Default::default(),
             max_datagram_ports: max_datagram_ports.max(1),
         }))
     }
@@ -84,9 +81,14 @@ impl Node {
         if by_pk.contains_key(&pk) || by_kid.contains_key(&kid) {
             return Err(CoreErr::AlreadyPublished);
         }
+        let mut membership = scope.0.node.lock();
+        if membership.as_ref().and_then(Weak::upgrade).is_some() {
+            return Err(CoreErr::AlreadyPublished);
+        }
+        DatagramPort::mount_scope(&self.0, &scope.0)?;
         by_pk.insert(pk, scope.clone());
         by_kid.insert(kid, scope.clone());
-        *scope.0.node.lock() = Some(Arc::downgrade(&self.0));
+        *membership = Some(Arc::downgrade(&self.0));
         Ok(())
     }
 
@@ -95,7 +97,11 @@ impl Node {
         let mut by_pk = self.0.scopes_by_pk.lock();
         let removed = by_pk.remove(pubkey)?;
         self.0.scopes_by_kid.lock().remove(&removed.kid());
-        *removed.0.node.lock() = None;
+        {
+            let mut membership = removed.0.node.lock();
+            DatagramPort::unmount_scope(&removed.0);
+            *membership = None;
+        }
         Some(removed)
     }
 
@@ -168,29 +174,11 @@ impl Node {
 }
 
 impl NodeInner {
-    pub(crate) fn reserve_port(&self) -> Result<(), CoreErr> {
-        self.port_count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                (n < self.max_datagram_ports).then_some(n + 1)
-            })
-            .map(|_| ())
-            .map_err(|_| CoreErr::Busy)
-    }
-
-    pub(crate) fn find_scope_port(&self, id: LinkId) -> Option<Arc<DatagramPort>> {
-        let scopes: Vec<_> = self.scopes_by_pk.lock().values().cloned().collect();
-        for scope in scopes {
-            if let Some(port) = scope
-                .0
-                .datagram_ports
-                .lock()
-                .get(&id)
-                .and_then(Weak::upgrade)
-            {
-                return Some(port);
-            }
-        }
-        None
+    pub(crate) fn scope_by_kid(&self, kid: ScopeKid) -> Option<Arc<Scope>> {
+        self.scopes_by_kid
+            .lock()
+            .get(&kid)
+            .map(|scope| scope.0.clone())
     }
 
     /// $O(1)$ scope lookup by `ScopeKid` + stack-only `mac1` check (identical for hops & endpoints).
@@ -212,20 +200,8 @@ impl NodeInner {
 
     /// $O(1)$ scope lookup by `ScopeKid` + stack-only `mac1` check for inbound datagram setups.
     pub(crate) fn resolve_datagram_scope(&self, wire: &[u8]) -> Option<Arc<Scope>> {
-        let Ok(hdr) = setup::ForwardHeader::parse(wire) else {
-            return None;
-        };
-        if hdr.upstream == crate::cid::Cid::UNBOUND {
-            return None;
-        }
-        let Ok(segment) = setup::Segment::parse(&wire[8..]) else {
-            return None;
-        };
-        if segment.plane != crate::Plane::Datagram || segment.encrypted.len() < 8 {
-            return None;
-        }
-        let kid = ScopeKid(segment.encrypted[..8].try_into().ok()?);
-        let scope = self.scopes_by_kid.lock().get(&kid)?.0.clone();
+        let (kid, segment) = datagram_setup(wire)?;
+        let scope = self.scope_by_kid(kid)?;
         scope
             .identity
             .verify_mac1_with_flag(segment.encrypted, segment.has_mac2)

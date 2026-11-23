@@ -11,7 +11,10 @@ For foundational invariants, see [DESIGN.md](../DESIGN.md).
 Compile-time dependency edges enforce the cleanroom boundary: **`confluence-core` has `#![forbid(unsafe_code)]` and zero OS socket, filesystem, or runtime-executor dependencies.**
 
 ```text
-confluence-cli (Declarative TOML config, keygen, node runner)
+confluence-examples (Rust deployment binaries and standalone key generation)
+ └── confluence-runtime and the crates used by each topology
+
+confluence-runtime (NodePlan, local validation, and Tokio service lifecycle)
  ├── confluence-edge     (TCP/UDP port forwarders, E2eStreamIo AsyncRead/AsyncWrite, 0600 Unix admin)
  ├── confluence-relay    (Out-of-core PassiveRelay + single-port RelayService / RelayMux + PassiveStreamPool)
  ├── confluence-net      (Pure native TCP carrier + Linux DF=1 UDP carrier + UdpIngress::serve_custom)

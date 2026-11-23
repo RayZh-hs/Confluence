@@ -3,7 +3,7 @@
 Confluence securely connects explicitly published named **Endpoints** over explicit, pluggable paths and named **Transits**. A dial establishes one bidirectional byte stream or datagram flow. Intermediate hops forward end-to-end ciphertext under route-integrity-bound 1-RTT single-pass setup, and the destination opens its local service only after authenticating the originator's 1.0 RTT confirmation.
 
 * [Core Design](DESIGN.md) — architectural boundaries, symmetric auth model, and the 10 Core invariants
-* [Architecture](docs/architecture.md) · [Wire Protocol](docs/wire-protocol.md) · [API Reference](docs/api.md) · [CLI User Guide](docs/user-guide.md)
+* [Architecture](docs/architecture.md) · [Wire Protocol](docs/wire-protocol.md) · [API Reference](docs/api.md) · [Deployment Guide](docs/user-guide.md)
 
 ## Rust workspace
 
@@ -15,8 +15,9 @@ Confluence securely connects explicitly published named **Endpoints** over expli
 | [confluence-relay](crates/confluence-relay) | Out-of-core zero-dialing `PassiveRelay` and single-port transport-muxed `RelayService` / `RelayMux` + NAT-side `RelayClientDatagramLink` & `PassiveStreamPool` |
 | [confluence-edge](crates/confluence-edge) | TCP/UDP port forwarding, `E2eStreamIo` (`tokio::io::AsyncRead + AsyncWrite`), target handlers, and owner-only `0600` Unix administration |
 | [confluence-testkit](crates/confluence-testkit) | Deterministic fault-injection hubs (`MemDatagramHub`, `MemStreamHub`), wire-tap capture, outbound-dial auditing, `AuditAuthorizer`, and enterprise RBAC end-to-end tests |
-| [confluence-cli](crates/confluence-cli) | `confluence` CLI (`keygen`, `check`, `run`) for declarative TOML topologies (see [examples/](examples)) |
+| [confluence-runtime](crates/confluence-runtime) | Rust `NodePlan` for composing and validating deployments, managing Tokio services, and shutting down |
 | [confluence-ext](crates/confluence-ext) | Out-of-core plugin evaluation suite: Group capability tokens, link-encrypted TCP/UDP, muxed passive TCP relay, Blind Rendezvous UDP P2P + NAT traversal, Striped-TCP & Stream-over-Datagram adapters, and virtual L3 mesh |
+| [confluence-examples](examples) | Runnable direct, passive-relay, and multihop deployments in Rust, plus `confluence-keygen` |
 
 ```sh
 cargo test --workspace
@@ -24,13 +25,20 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo bench -p confluence-core --bench lease_contention
 ```
 
-## Quick start (CLI)
+## Deploy with Rust
 
-```sh
-cargo run -p confluence-cli -- keygen
-cargo run -p confluence-cli -- check examples/multihop-relay/alice.toml
-cargo run -p confluence-cli -- run examples/direct/bob.toml
+```rust
+let mut app = NodePlan::new();
+app.scope("app", identity)?
+    .authorizer(policy)
+    .publish_stream("http", Arc::new(TcpTarget(backend)))?;
+app.listen_tcp(ingress);
+
+let prepared = app.prepare()?;
+prepared.start().await?.run_until(tokio::signal::ctrl_c()).await?;
 ```
+
+The deployment binary supplies the identity, policy, and socket addresses. Build and run Alice and Bob locally with the [deployment guide](docs/user-guide.md), or inspect the [direct](examples/src/direct.rs) and [relayed](examples/src/relayed.rs) wiring.
 
 ## Embedding an instance
 

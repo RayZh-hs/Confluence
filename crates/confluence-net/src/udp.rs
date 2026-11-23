@@ -127,35 +127,51 @@ fn socket(addr: SocketAddr) -> Result<UdpSocket, CoreErr> {
 
 /// Per-peer UDP [`DatagramLink`] reporting live kernel PMTU shrinks via `mtu_watch`.
 pub struct UdpLink {
-    socket: Arc<UdpSocket>,
+    socket: PeerSocket,
     peer: SocketAddr,
     source_tag: [u8; 16],
     mtu: watch::Sender<u16>,
-    incoming: Option<SyncMutex<mpsc::Receiver<PacketBuf>>>,
+}
+
+enum PeerSocket {
+    Connected(UdpSocket),
+    Ingress {
+        socket: Weak<UdpSocket>,
+        incoming: SyncMutex<mpsc::Receiver<PacketBuf>>,
+    },
 }
 
 impl UdpLink {
     fn connected(socket: UdpSocket, peer: SocketAddr, mtu: u16) -> Self {
         Self {
-            socket: Arc::new(socket),
+            socket: PeerSocket::Connected(socket),
             peer,
             source_tag: source_tag_for_addr(peer),
             mtu: watch::channel(mtu).0,
-            incoming: None,
         }
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, CoreErr> {
-        self.socket.local_addr().map_err(io_error)
+        self.with_socket(|socket| socket.local_addr().map_err(io_error))?
     }
 
-    fn send_error(&self, error: io::Error, len: usize) -> CoreErr {
+    fn with_socket<T>(&self, op: impl FnOnce(&UdpSocket) -> T) -> Result<T, CoreErr> {
+        match &self.socket {
+            PeerSocket::Connected(socket) => Ok(op(socket)),
+            PeerSocket::Ingress { socket, .. } => {
+                let socket = socket.upgrade().ok_or(CoreErr::Closed)?;
+                Ok(op(&socket))
+            }
+        }
+    }
+
+    fn send_error(&self, socket: &UdpSocket, error: io::Error, len: usize) -> CoreErr {
         if error.raw_os_error() != Some(libc::EMSGSIZE) {
             return io_error(error);
         }
         let bound = len.saturating_sub(1) as u16;
-        let limit = if self.incoming.is_none() {
-            df::payload_limit(&self.socket, self.peer.is_ipv6()).map_or(bound, |mtu| mtu.min(bound))
+        let limit = if matches!(self.socket, PeerSocket::Connected(_)) {
+            df::payload_limit(socket, self.peer.is_ipv6()).map_or(bound, |mtu| mtu.min(bound))
         } else {
             bound
         };
@@ -177,7 +193,10 @@ impl DatagramLink for UdpLink {
     }
 
     fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), CoreErr>> {
-        self.socket.poll_send_ready(cx).map_err(io_error)
+        match self.with_socket(|socket| socket.poll_send_ready(cx).map_err(io_error)) {
+            Ok(result) => result,
+            Err(error) => Poll::Ready(Err(error)),
+        }
     }
 
     fn try_send(&self, packet: PacketBuf) -> Result<(), CoreErr> {
@@ -185,35 +204,39 @@ impl DatagramLink for UdpLink {
         if packet.len() > usize::from(ceiling) {
             return Err(CoreErr::MtuTooSmall(ceiling));
         }
-        let result = if self.incoming.is_none() {
-            self.socket.try_send(packet.as_slice())
-        } else {
-            self.socket.try_send_to(packet.as_slice(), self.peer)
-        };
-        match result {
-            Ok(amount) if amount == packet.len() => Ok(()),
-            Ok(_) => Err(CoreErr::Carrier("short UDP send".into())),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(CoreErr::WouldBlock),
-            Err(error) => Err(self.send_error(error, packet.len())),
-        }
+        self.with_socket(|socket| {
+            let result = match self.socket {
+                PeerSocket::Connected(_) => socket.try_send(packet.as_slice()),
+                PeerSocket::Ingress { .. } => socket.try_send_to(packet.as_slice(), self.peer),
+            };
+            match result {
+                Ok(amount) if amount == packet.len() => Ok(()),
+                Ok(_) => Err(CoreErr::Carrier("short UDP send".into())),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(CoreErr::WouldBlock),
+                Err(error) => Err(self.send_error(socket, error, packet.len())),
+            }
+        })?
     }
 
     fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Result<PacketBuf, CoreErr>> {
-        if let Some(queue) = &self.incoming {
-            return queue
-                .lock()
-                .poll_recv(cx)
-                .map(|opt| opt.ok_or(CoreErr::Closed));
-        }
+        let socket = match &self.socket {
+            PeerSocket::Connected(socket) => socket,
+            PeerSocket::Ingress { incoming, .. } => {
+                return incoming
+                    .lock()
+                    .poll_recv(cx)
+                    .map(|opt| opt.ok_or(CoreErr::Closed));
+            }
+        };
         loop {
-            match self.socket.poll_recv_ready(cx) {
+            match socket.poll_recv_ready(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(io_error(error))),
                 Poll::Ready(Ok(())) => {}
             }
             let ceiling = usize::from(*self.mtu.borrow());
             let mut packet = PacketBuf::with_payload_cap(ceiling + 1);
-            match self.socket.try_recv(packet.spare_payload()) {
+            match socket.try_recv(packet.spare_payload()) {
                 Ok(count) => {
                     if count <= ceiling {
                         packet.advance_payload(count);
@@ -222,7 +245,7 @@ impl DatagramLink for UdpLink {
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(error) if error.raw_os_error() == Some(libc::EMSGSIZE) => {
-                    if let Some(mtu) = df::payload_limit(&self.socket, self.peer.is_ipv6()) {
+                    if let Some(mtu) = df::payload_limit(socket, self.peer.is_ipv6()) {
                         self.mtu.send_if_modified(|current| {
                             let changed = mtu < *current;
                             *current = (*current).min(mtu);
@@ -430,11 +453,13 @@ impl UdpIngress {
             if peers.len() < self.max_peers && provisional.len() < self.max_provisional {
                 let (queue, incoming) = mpsc::channel(PEER_QUEUE);
                 let link = Arc::new(UdpLink {
-                    socket: self.socket.clone(),
+                    socket: PeerSocket::Ingress {
+                        socket: Arc::downgrade(&self.socket),
+                        incoming: SyncMutex::new(incoming),
+                    },
                     peer: address,
                     source_tag: source_tag_for_addr(address),
                     mtu: watch::channel(self.mtu).0,
-                    incoming: Some(SyncMutex::new(incoming)),
                 });
                 if let Ok(attached) = attach(link) {
                     let _ = queue.try_send(PacketBuf::from_slice(&receive[..size]));

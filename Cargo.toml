@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*"]
+members = ["crates/*", "examples"]
 resolver = "2"
 
 [workspace.package]
@@ -13,6 +13,7 @@ confluence-plugins = { path = "crates/confluence-plugins" }
 confluence-net = { path = "crates/confluence-net" }
 confluence-relay = { path = "crates/confluence-relay" }
 confluence-edge = { path = "crates/confluence-edge" }
+confluence-runtime = { path = "crates/confluence-runtime" }
 confluence-testkit = { path = "crates/confluence-testkit" }
 bytes = "1"
 blake3 = "1"
@@ -30,7 +31,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-clap = { version = "4", features = ["derive"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

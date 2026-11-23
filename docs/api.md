@@ -1,5 +1,7 @@
 # Extension Seams & Rust API Reference
 
+For a complete node binary, compose these APIs with [`confluence-runtime`](../crates/confluence-runtime). See the [deployment guide](user-guide.md) for `NodePlan`, validation, and runnable topologies.
+
 `confluence-core` exposes a narrow programmatic API centered on `ScopeInstance`, multi-scope `Node`, and four extension seams in `confluence_core::seams`.
 
 ---

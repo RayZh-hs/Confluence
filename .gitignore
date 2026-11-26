@@ -1,2 +1,8 @@
 # IDE files
 .vscode
+
+# Build artifacts
+/target/
+
+# Local archived reference materials (not for cleanroom agents)
+/archived/

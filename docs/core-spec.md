@@ -512,6 +512,7 @@ Opcodes `0x21`, `0x22`, `0x31`, `0x32` are reserved (MUST be rejected/ignored).
 * Byte 1 **MUST** be `0x00` (else `Malformed`).
 * On Stream Plane: `upstream_cid` **MUST** be `0` (`Cid::UNBOUND`).
 * On Datagram Plane: `upstream_cid` **MUST NOT** be `0`.
+* **Originator Initialization:** On each setup attempt, the Originator initializes `ForwardHeader.max_mtu` to its opened first-hop carrier's effective local MTU (`stream.caps().mtu()` on Stream; live `MtuWatch` effective MTU on Datagram, after verifying `>= min`), and writes the identical effective floor `min` (`max(path.min_mtu, 20)` on Stream; `max(path.min_mtu, caller_min_mtu, 1152)` on Datagram) into every segment's `DispatchPrefix.min_mtu`.
 
 #### Nested Segment Chain
 
@@ -604,11 +605,13 @@ Used identically by `SETUP_ERR`, `ST_CLOSE`, `DG_CLOSE` (hop), and `e2e::DG_CLOS
 | `7` | `0` | `Revoked` |
 | `8` | `0` | `Expired` |
 | `9` | `0` | `Closed` |
-| `10` | `0` | Remote/generic carrier failure (catch-all when encoding any unlisted `CoreErr`) |
+| `10` | `0` | Remote/generic carrier failure (catch-all when encoding any unlisted `CoreErr`; decodes to permanent carrier failure: `FailureClass::PathFailure`, `is_retryable() == false`) |
 | `11` | `0` | `TargetRefused` |
 | `12` | `0` | `TargetUnreachable` |
 | `13` | `0` | `UnexpectedEof` |
 | Any other | — | `Malformed` (on decode) |
+
+Encoders **MUST** write `arg = 0` for codes `2..=13`. Decoders **MUST** verify the decrypted payload is exactly `4` bytes, read `arg` exclusively for code `1` (`MtuTooSmall(arg)`), ignore `arg` on codes `2..=13`, and reject only unknown codes outside `1..=13` as `Malformed`.
 
 ### 5.5 `SETUP_COOKIE` (`0x14`, `64` bytes)
 
@@ -677,7 +680,7 @@ Applies **only** on the Datagram Plane when an adjacent hop's `SETUP_FWD` flight
        * `Drop` -> increment `mac1_drops_total`, discard.
        * `Challenge(c)` -> increment `mac2_challenges_total`, send `SETUP_COOKIE(0, upstream_cid, c)` immediately, discard without allocating.
        * `Verified` -> proceed if `active.len() < 16` and `total + allocated_bytes <= MAX_SETUP (131086)`. Allocate reassembly buffer of `total` bytes, copy fragment 0, set `stride = payload.len()`, `received_mask = 1`, `expires = now + 3 s`.
-6. **Post-Authentication Acknowledgment:** `SETUP_FRAG_ACK` **MUST NOT** be sent until `Responder::authenticate` succeeds (verifying `tail_aad` over the full reassembled flight and Noise_IK authentication). Upon success, remove active slot, push `(id, now + 3 s)` to `completed` (evicting oldest if full), and transmit `SETUP_FRAG_ACK`. On authentication failure or drop before acknowledgment, remove the active slot without adding to `completed` and without sending `SETUP_FRAG_ACK`.
+6. **Post-Authentication Acknowledgment & Mid-Reassembly Cookie Re-Evaluation:** Once reassembly completes, the setup task **MUST** re-evaluate `update_load()` and `CookieProtector::verify_segment` BEFORE `Responder::authenticate`. If `under_load` activated or the cookie secret rotated past its grace window mid-reassembly, the setup task sends `SETUP_COOKIE`, drops `FragmentReceipt` without acknowledging (removing the active slot without adding to `completed` and without sending `SETUP_FRAG_ACK`), and aborts with `CookieRequired`. `SETUP_FRAG_ACK` **MUST NOT** be sent until both `CookieProtector::verify_segment` and `Responder::authenticate` succeed (verifying `tail_aad` over the full reassembled flight and Noise_IK authentication). Upon success, remove the active slot, push `(id, now + 3 s)` to `completed` (evicting oldest if full), and transmit `SETUP_FRAG_ACK`. On authentication failure or drop before acknowledgment, remove the active slot without adding to `completed` and without sending `SETUP_FRAG_ACK`.
 
 ### 5.7 Steady-State Hop Framing
 
@@ -698,11 +701,12 @@ Applies **only** on the Datagram Plane when an adjacent hop's `SETUP_FWD` flight
   | kind | ttl_or_dist| cid:u32 BE | ControlCipher Body (24..160)|
   +------+------------+------------+----------------------------+
   ```
-  * Direction enforcement at intermediate transits: `DG_MTU (0x24)` MUST be dropped if received on the forward path (origin -> dest); `DG_MTU_ACK (0x27)` MUST be dropped if received on the reverse path (dest -> origin).
+  * Direction enforcement at intermediate transits: `DG_MTU (0x24)` MUST be dropped if received on the forward path (origin -> dest); `DG_MTU_ACK (0x27)` MUST be dropped if received on the reverse path (dest -> origin). `DG_RENEW (0x25)` and `DG_RENEW_OK (0x26)` are not direction-filtered by opcode at transits beyond cryptographic forward/reverse key separation and `ttl`/`distance` bounds (at `ttl == 0` on the forward path, unexpected opcodes such as `DG_RENEW_OK` are ignored).
   * Forward path (origin -> dest): if `ttl == 0`, addressed to this hop (open with `ControlCipher(aad=&[kind])`, silently drop on bad AEAD); if `ttl > 0`, rewrite `ttl = ttl - 1`, `cid = next_cid`, forward downstream.
   * Reverse path (dest -> origin): `distance = ttl.checked_add(1)` (drop on overflow), rewrite `ttl = distance`, `cid = caller_cid`, forward upstream.
   * Hop-originated control (`DG_CLOSE`, `DG_MTU`, `DG_RENEW_OK`): emitted toward origin with `ttl = 0`, `cid = caller_cid`. Origin sees `distance == hop_index` (`0..N-1`).
   * Origin-originated hop control (`DG_CLOSE`, `DG_RENEW`, `DG_MTU_ACK`) targeting hop `i`: emitted with `ttl = i as u8`, `cid = remote_cid`.
+  * **Terminal Handling:** Datagram Destination silently ignores all non-`DG_DATA` packets (including all `0x23..=0x27`) in both `AwaitingConfirm` and steady state. Datagram Origin silently ignores `0x23..=0x27` packets with `len < 6`, `distance >= N`, failed `ControlCipher::open`, or opcodes other than `DG_CLOSE`, `DG_MTU`, and `DG_RENEW_OK` (an authenticated `DG_CLOSE` or `DG_RENEW_OK` with an invalid payload terminates with `Malformed`).
 * **Inbound CID Dispatch (`route_cid`):**
   * `0x20`: `u32 BE` at offset `1`.
   * `0x23..=0x27`: `u32 BE` at offset `2`.
@@ -721,7 +725,7 @@ Applies **only** on the Datagram Plane when an adjacent hop's `SETUP_FWD` flight
 
 * `ST_DATA (0x30)`: **MUST** have `ttl == 0` AND `1 <= len <= 16384` (`STREAM_CHUNK`), else `Malformed`. Carries opaque bytes of the E2E record stream (an E2E record MAY span multiple `ST_DATA` chunks, and a single `ST_DATA` chunk MAY carry bytes of multiple E2E records; hop control frames MAY interleave between any two `ST_DATA` chunks).
 * `ST_CLOSE (0x33)`, `ST_RENEW (0x34)`, `ST_RENEW_OK (0x35)`: **MUST** have `24 <= len <= 160` (`MAX_CONTROL`), else `Malformed`.
-* Forward/reverse `ttl`/`distance` decrement/increment rules are identical to Datagram hop controls.
+* Forward/reverse `ttl`/`distance` decrement/increment rules are identical to Datagram hop controls (transits do not apply per-opcode direction filters to `ST_RENEW`/`ST_RENEW_OK`; at `ttl == 0` on the forward path, only `ST_CLOSE` and `ST_RENEW` are handled and `ST_RENEW_OK` is ignored).
 * **Terminal Hop Control:** Destination `B` also owns `terminal_key` (`HopKey` from destination's Noise_IK Message 1). When closing abnormally (`error != Closed`), `B` emits `ST_CLOSE` with `ttl = 0` sealed under `terminal_key.control(false)`; upstream hops increment `ttl` so Origin receives `distance == N`, decrypts with `terminal_key.control(true)`, and reports the decoded error directly (not wrapped in `HopRejected`). Destination also accepts `ST_CLOSE` with `ttl == 0` sealed under `terminal_key`.
 
 ### 5.8 End-to-End Record Framing
@@ -741,7 +745,7 @@ Encrypted E2E records use their own opcode space distinct from outer hop opcodes
 * Cipher: ChaCha20-Poly1305 with `key = session_tx / session_rx`, `nonce = nonce(seq)`, `aad = be64(seq)` (8 bytes).
 * Receiver checks 64-packet `ReplayWindow` before decryption, decrypts, commits `seq` on success. Invalid length, replay rejection, or bad AEAD tag **MUST** be silently discarded without terminating the session.
 * **Datagram E2E Opcodes (`type`):**
-  * `0x01` `DG_DATA`: Application payload (`0..=max_payload`). Special case: `seq == 0 && body.is_empty()` from originator is the 1.0 RTT confirmation marker and **MUST NOT** be delivered to the destination application.
+  * `0x01` `DG_DATA`: Application payload (`0..=max_payload`). Special case: `seq == 0 && body.is_empty()` from originator is the 1.0 RTT confirmation marker and **MUST** be suppressed at Destination in both `AwaitingConfirm` and steady state (no application delivery, no `TrafficGate` charging, and no ingress traffic accounting; Originator does not suppress empty `seq == 0` packets sent by Destination).
   * `0x04` `DG_CLOSE`: `[code: u16 BE | arg: u16 BE]` (4 bytes). Terminates session with decoded `CoreErr`.
   * `0x05` `DG_MTU`: `[epoch: u32 BE | mtu: u16 BE]` (6 bytes). Authenticated path/local MTU advertisement.
   * `0x06` `DG_MTU_ACK`: `[epoch: u32 BE]` (4 bytes). Acknowledgment for `DG_MTU`.
@@ -821,7 +825,7 @@ Originator supports four conceptual dial modes per plane:
   * On failure, report `PathOutcome::Failed(error)`.
 * **Confirm (`StagedDatagram::confirm`):**
   * If scope is shutting down, report `PathOutcome::Failed(Closed)` and return `Closed`.
-  * Transmit empty `e2e::DG_DATA` (`seq = 0`) within `SETUP_TIMEOUT` (failing reports `PathOutcome::Failed(error)`).
+  * Transmit empty `e2e::DG_DATA` (`seq = 0`) once within `SETUP_TIMEOUT` without retransmission (failing reports `PathOutcome::Failed(error)`; any subsequent application `DG_DATA` also confirms Destination if the empty marker is lost in flight).
   * Immediately spawn worker, report `PathOutcome::Established { mtu }`, and return `E2eDatagram` (zero extra RTT wait).
 * **Drop Without Confirming (Abort):**
   * Report `PathOutcome::Closed` to `PathSource`.
@@ -836,10 +840,10 @@ Originator supports four conceptual dial modes per plane:
 1. Acquire pending permit (`Node` semaphore first if accepted via `Node`, then `Scope` semaphore after resolving scope).
 2. Read `SETUP_FWD` within `SETUP_TIMEOUT`, performing stack-only `ScopeKid` + `mac1` verification before allocating the tail buffer. Reject `hdr.upstream != 0` with `Malformed`.
 3. Update scope load state, run `CookieProtector::verify_segment(&source_tag, encrypted, has_mac2)`. On `Challenge`, send `SETUP_COOKIE(0, 0, challenge)` (50 ms best-effort) and abort with `CookieRequired`.
-4. Run `Responder::authenticate` (`mac1`, replay check `insert = false`, Noise decrypt, `±30 s` freshness).
+4. Run `Responder::authenticate` (`mac1`, replay check `insert = false`, Noise decrypt, `±30 s` freshness). Any failure inside `Responder::authenticate` (`BadMac`, `Replay`, `Authentication`, `ClockSkew`) **MUST** drop silently without emitting `SETUP_ERR`.
 5. **If Hop (`is_hop == true`):**
    * Verify `segment.plane == Plane::Stream` (else send `SETUP_ERR(WrongPlane)`).
-   * Parse `(target_name, credential)`, acquire per-peer `PendingSetup`, resolve Stream transit (`Unpublished` / `WrongPlane`), verify `handler.caps().mtu() >= floor` (`floor = max(seg.min_mtu, 20)`), capture `epoch_for_transit`, invoke `AuthGate::authorize(Transit, is_renewal=false)`, create `LeaseHandle`, call `track_transit(epoch, ...)`, call `responder.commit(wall_time_ms())` (rechecking freshness & inserting replay entry), invoke `handler.open(subtarget, session_auth)` racing against `lease.cancelled()` and `SETUP_TIMEOUT`, recheck `lease.remaining()`. On any error -> send `SETUP_ERR` (50 ms best-effort).
+   * Parse `(target_name, credential)`, acquire per-peer `PendingSetup`, resolve Stream transit (`Unpublished` / `WrongPlane`), verify `handler.caps().mtu() >= floor` (`floor = max(seg.min_mtu, 20)`), capture `epoch_for_transit`, invoke `AuthGate::authorize(Transit, is_renewal=false)`, create `LeaseHandle`, call `track_transit(epoch, ...)`, call `responder.commit(wall_time_ms())` (rechecking freshness & inserting replay entry), invoke `handler.open(subtarget, session_auth)` racing against `lease.cancelled()` and `SETUP_TIMEOUT`, recheck `lease.remaining()`. On any post-`authenticate` error (including post-decrypt `Malformed` plaintext or `commit()` `ClockSkew`/`Replay`, which encode via catch-all wire code `(10, 0)`) -> send `SETUP_ERR` (50 ms best-effort).
    * Verify actual opened stream `outbound_mtu >= floor && inbound_mtu >= floor` (else send `SETUP_ERR(MtuTooSmall(min))`).
    * Forward `SETUP_FWD(max_mtu=min(hdr.max_mtu, inbound_mtu, outbound_mtu), upstream=0) || tail` downstream and read reply racing against `lease.cancelled()` and `SETUP_TIMEOUT` (on error/cancel -> send `SETUP_ERR`).
    * Handle downstream reply:
@@ -847,19 +851,19 @@ Originator supports four conceptual dial modes per plane:
      * `SETUP_OK`: validate `target == 0 && responder == 0`, increment `hop_acks`, clamp `reverse_mtu`, append 26B trailer (`min(inbound_mtu, outbound_mtu), lease_ttl_ms`), ensure `len <= 16384`, acquire `Scope` session permit (`Role::Transit`), write `SETUP_OK` upstream, release `PendingPermit` and `PendingSetup`, enter `splice`.
 6. **If Destination (`is_hop == false`):**
    * Verify `segment.plane == Plane::Stream` (else `SETUP_ERR(WrongPlane)`).
-   * Parse `(ep_name, credential)`, acquire per-peer `PendingSetup`, capture `epoch_for_endpoint`, look up published endpoint (`Unpublished` / `WrongPlane`), check `forwarded_mtu = min(hdr.max_mtu, inbound_mtu) >= max(ep.min_mtu, seg.min_mtu, 20)`, invoke `AuthGate::authorize(Endpoint, is_renewal=false)`, create `LeaseHandle`, verify the exact same endpoint publication instance is still registered + `track_endpoint(epoch, ...)`, call `responder.commit(wall_time_ms())`, acquire `Scope` session permit (`Role::Destination`). On any error -> send `SETUP_ERR`.
-   * Generate Noise Message 2 reply carrying `[inbound_mtu: 2B | ttl_ms: 8B]`, create `AwaitingConfirm` holding both `PendingPermit` and `PendingSetup` with deadline `now + SETUP_TIMEOUT`, write `SETUP_OK(hop_acks=0, reverse_mtu=inbound_mtu, target=0, responder=0) || reply`, enter Stream `serve`.
+   * Parse `(ep_name, credential)`, acquire per-peer `PendingSetup`, capture `epoch_for_endpoint`, look up published endpoint (`Unpublished` / `WrongPlane`), check `forwarded_mtu = min(hdr.max_mtu, inbound_mtu) >= max(seg.min_mtu, 20)` (Stream endpoint publication takes no `min_mtu`; its floor is `0`), invoke `AuthGate::authorize(Endpoint, is_renewal=false)`, create `LeaseHandle`, verify the exact same endpoint publication instance is still registered + `track_endpoint(epoch, ...)`, call `responder.commit(wall_time_ms())`, acquire `Scope` session permit (`Role::Destination`). On any post-`authenticate` error (including `Malformed` plaintext or `commit()` `ClockSkew`/`Replay`, encoded via catch-all `(10, 0)`) -> send `SETUP_ERR`.
+   * Generate Noise Message 2 reply carrying `[inbound_mtu: 2B | ttl_ms: 8B]`, create `AwaitingConfirm` holding both `PendingPermit` and `PendingSetup` with deadline `now + SETUP_TIMEOUT`, write `SETUP_OK(hop_acks=0, reverse_mtu=inbound_mtu, target=0, responder=0) || reply`, enter Stream `serve` (with `negotiated_mtu = forwarded_mtu`).
 
 #### Datagram Inbound Flow
 
 1. `DatagramPort` background pump reads packets from `DatagramLink`:
    * Non-`UNBOUND` `route_cid` -> O(1) `SlabTable` lookup -> `try_send` to circuit's 32-slot mailbox (on full: drop + increment `queue_drops_total` and `datagram_mailbox_drops_total`).
    * `Cid::UNBOUND` (`SETUP_FWD` or `SETUP_FRAG`):
-     * If `SETUP_FRAG`, feed into `Reassembly` (Section 5.6); proceed only when reassembled.
-     * Track `AdmissionAttempt` on the `DatagramPort` (`DatagramAdmission`: `Idle` -> `Pending` -> `Admitted` (sticky) or `Rejected` when all attempts fail without admission).
+     * If `SETUP_FRAG`, feed into `Reassembly` (Section 5.6); proceed only when reassembled (incomplete fragments keep admission `Idle`).
+     * Track `AdmissionAttempt` on the `DatagramPort` exposed via `DatagramIngress::admission() -> DatagramAdmission` (`attach_datagram` returns `DatagramIngress` exposing async `closed()` and sync `admission()`): starts `Idle` (`in_flight = 0`), reports `Pending` while any opening attempt is in flight (unless already `Admitted`), becomes permanently `Admitted` once transit or destination admission + permit + CID binding succeeds, and reports `Rejected` once `in_flight == 0` after an attempt drops before `Admitted` (subsequent opening packets transition `Rejected -> Pending` and may still reach `Admitted`). Reaching `Rejected` takes **no** automatic action (it does not close or detach the `DatagramPort`), and Core enforces **no** idle timeout on `Idle`/`Rejected` links.
      * Resolve scope via `ScopeKid` + `mac1`, acquire `Scope::pending_permit`, spawn setup task.
-2. Inside setup task: validate `hdr.upstream != 0`, `Segment::parse`, `update_load()`, `CookieProtector::verify_segment` (emitting `SETUP_COOKIE(0, hdr.upstream, challenge)` on challenge), `Responder::authenticate`.
-3. If the flight was fragmented, acknowledge the `FragmentReceipt` (`SETUP_FRAG_ACK` + `completed` cache) **immediately after `Responder::authenticate` succeeds**.
+2. Inside setup task: validate `hdr.upstream != 0`, `Segment::parse`, `update_load()`, `CookieProtector::verify_segment` (emitting `SETUP_COOKIE(0, hdr.upstream, challenge)` on challenge and dropping any `FragmentReceipt` without `SETUP_FRAG_ACK`), `Responder::authenticate` (any failure here—including `ClockSkew` or `Replay`—silently drops without `SETUP_ERR` and drops any `FragmentReceipt` without `SETUP_FRAG_ACK`).
+3. If the flight was fragmented, acknowledge the `FragmentReceipt` (`SETUP_FRAG_ACK` + `completed` cache) **immediately after `Responder::authenticate` succeeds**. Post-`authenticate` failures (including plaintext `Malformed` and `commit()` `ClockSkew`/`Replay`) emit best-effort `SETUP_ERR` (using catch-all `(10, 0)` for unlisted errors).
 4. **If Hop (`is_hop == true`):**
    * Same transit admission sequence as Stream (with `Plane::Datagram`, `floor = max(seg.min_mtu, 1152)`). On error -> send `SETUP_ERR(0, hdr.upstream)` via inbound link.
    * Mark inbound port `Admitted`.
@@ -876,7 +880,7 @@ Originator supports four conceptual dial modes per plane:
 ### 6.3 1.0 RTT Deferred Destination Open
 
 * **Stream Destination (`serve`):**
-  1. Wait (bounded by `AwaitingConfirm.deadline`, `lease.cancelled()`, and inbound `mtu < floor`) for the first E2E record. MUST be `e2e::ST_DATA` (any other record fails with `Authentication`), with `len <= min(mtu, 16384) - 19` (else `Malformed`).
+  1. Wait (bounded by `AwaitingConfirm.deadline`, `lease.cancelled()`, and inbound `mtu < floor`) for the first E2E record. MUST be `e2e::ST_DATA` (any other record fails with `Authentication`), with `len <= min(negotiated_mtu, 16384) - 19` where `negotiated_mtu = forwarded_mtu = min(hdr.max_mtu, inbound_mtu)` (else `Malformed`).
   2. Re-check `lease.remaining()`, release `AwaitingConfirm` permits (`PendingPermit` + `PendingSetup`).
   3. If first `ST_DATA` carries non-empty 1.0 RTT data, charge `TrafficGate::charge_stream(Direction::Ingress, len)` (handling `Delay` while watching `lease.cancelled()` and `mtu < floor`, or `Close`).
   4. Invoke `EndpointHandler::open(session_auth)` bounded by `SETUP_TIMEOUT`, `lease.cancelled()`, and `mtu < floor`:
@@ -905,9 +909,9 @@ Originator supports four conceptual dial modes per plane:
   * Runs two directional loops (`left -> right` = `Ingress`, `right -> left` = `Egress`), live MTU floor monitors on both links (`below_floor`), lease cancellation, scope shutdown, and a renewal verifier task.
   * Reads `ST_DATA` in quanta of up to `min(remaining_chunk_len, outbound_mtu.max(1), 4096)` bytes. For each quantum: checks `lease.remaining()`, evaluates `TrafficGate::charge_stream(dir, quantum_len)` (sleeping on `Delay` and re-checking `lease.remaining()`), forwards as `ST_DATA`, updates traffic counters.
   * Control frames (`ST_CLOSE`, `ST_RENEW`, `ST_RENEW_OK`) bypass `TrafficGate`. `ST_CLOSE` addressed to this hop (`ttl == 0`, authentic) terminates splice cleanly (`Ok(())`).
-  * On abnormal termination (`Err(e)`), sends best-effort (50 ms) `hop::ST_CLOSE(e)` upstream (`ttl = 0`).
+  * On abnormal termination (`Err(e)`), including an unexpected EOF on the downstream (`right`) carrier before a `hop::ST_CLOSE` (`Err(UnexpectedEof)`), sends best-effort (50 ms) `hop::ST_CLOSE(e)` upstream (`ttl = 0`).
 * **E2E Stream Lifecycle & Clean Half-Close (`ST_FIN`):**
-  * `max_write_size = min(negotiated_mtu, 16384) - 19` (at most `16365`).
+  * `max_write_size = min(negotiated_mtu, 16384) - 19` (at most `16365`), fixed at setup from `negotiated_mtu` (on Destination, `forwarded_mtu = min(hdr.max_mtu, inbound_mtu)`). Subsequent live `MtuWatch` drops while `>= floor` shrink outgoing `ST_DATA` hop chunk sizes without changing `max_write_size`; dropping `< floor` terminates with `MtuTooSmall`.
   * `read()` returns `Ok(0)` **only** after an authenticated `ST_FIN` has been received. Carrier EOF before `ST_FIN` fails the session with `UnexpectedEof`.
   * Once `ST_FIN` is received (`RECEIVED_FIN`), carrier EOF (or hop `ST_CLOSE` with `Closed`/`UnexpectedEof`) does **not** abort the outbound half until local `ST_FIN` (`SENT_FIN`) is also sent.
   * Once BOTH `RECEIVED_FIN` and `SENT_FIN` have occurred, the session terminates cleanly (`Closed`, clean = true) even if an underlying hop or carrier closes concurrently.
@@ -1004,8 +1008,8 @@ Both planes use the identical renewal payload format and idempotency state machi
 
 * `begin_shutdown()` on a scope:
   1. Closes both `pending` and `sessions` semaphores so all new inbound setups, `accept_stream`, `attach_datagram`, and outbound dials fail immediately with `Closed`.
-  2. Signals the scope shutdown watch:
-     * Active Stream sessions initiate an authenticated `ST_FIN` (once any delayed pending write completes).
+  2. Signals the scope shutdown watch (with no imposed drain timeout bound):
+     * Active Stream sessions initiate an authenticated `ST_FIN` (once any delayed pending write completes) and remain open until peer `ST_FIN`, carrier EOF/error, `hop::ST_CLOSE`, lease expiry/revocation, MTU floor violation, or local handle drop.
      * Active Datagram sessions and Stream/Datagram transit circuits terminate cleanly with `Closed` (sending best-effort close frames).
 * `is_drained()` returns `true` when all pending permits, session permits, and destination stream bridge tasks have finished and been released.
 * `Node::close_admission()` closes the shared node ingress semaphore (`accept_stream` and `attach_datagram` return `Closed`).
@@ -1059,7 +1063,7 @@ Every `ScopeInstance` wraps its `Authorizer` in an `AuthGate` with clamped `Auth
 ### 7.4 Publication Namespaces, Precedence & Scoped Revocation
 
 * **Name Validation:** All carrier, endpoint, exact-transit, and prefix-transit names MUST be `1..=255` UTF-8 bytes (else `InvalidParameter`). Duplicate registration in the same table returns `AlreadyPublished`.
-* **Endpoint Namespace:** Single table shared across Stream and Datagram planes. Publishing a Datagram endpoint rejects `min_mtu < 1152` (`MtuTooSmall`). Dialing an endpoint on the wrong plane returns `WrongPlane`.
+* **Endpoint Namespace:** Single table shared across Stream and Datagram planes. Publishing a Stream endpoint takes no `min_mtu` parameter (implicit floor `0`, clamped to `20` during setup); publishing a Datagram endpoint accepts `min_mtu` and rejects `min_mtu < 1152` at publish time (`MtuTooSmall`). Dialing an endpoint on the wrong plane returns `WrongPlane`.
 * **Transit Namespace:** Four separate tables: `(Stream, exact)`, `(Datagram, exact)`, `(Stream, prefix)`, `(Datagram, prefix)`.
   * Exact and prefix publications for the same plane MAY coexist, and identical names on different planes MAY coexist.
   * **Resolution Precedence (for plane `P` and target `T`):**

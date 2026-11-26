@@ -1,8 +1,8 @@
 # Confluence — Core Design
 
-**Scope:** Core ideas, architectural insights, and system boundaries for the **Confluence Core**. Concrete wire protocols, cryptographic constructions, transports, passive relay signaling, QoS traffic shapers, cross-plane channel adapters, stream multiplexers, peer discovery, routing/failover controllers, credential issuers, and enterprise policy engines are intentionally out of scope—the Core is designed to remain small, auditable, and easy to explain while supporting business-grade access control and arbitrary network stacks outside Core.
+**Scope:** Design philosophy, core abstractions, architectural boundaries, and system invariants for **Confluence Core**. Concrete wire formats, cryptographic suites, API signatures, transports, passive relay signaling, QoS traffic shapers, cross-plane channel adapters, stream multiplexers, peer discovery, routing/failover controllers, credential issuers, and enterprise policy engines are intentionally out of scope.
 
-> **Relationship to `docs/core-spec.md`:** This document captures architectural intent, boundaries, and the 10 Core invariants; type and method names used below are illustrative concepts. [docs/core-spec.md](docs/core-spec.md) is the authoritative normative specification for the v1 wire protocol, cryptography, state machines, limits, and behavioral semantics.
+> For the normative v1 wire protocol, cryptographic specification, state machines, limits, and conformance criteria, see [docs/core-spec.md](docs/core-spec.md).
 
 ---
 
@@ -16,17 +16,17 @@ Existing connectivity tools tend to lock users into one rigid trade-off:
 * **Single-server reverse proxies** scope exposure cleanly to a port, but force all traffic through a fixed central bottleneck.
 * **Standalone firewall-traversal tunnels** solve hostile-network reachability, but lack composable peer routing, trust isolation, and clean application boundaries.
 
-Confluence resolves this with a single foundational abstraction: **connecting an Originator `A` to an explicitly published named Endpoint on `B`** over an explicit path of **named Transits** and **pure transport Channels**, while cleanly separating *how data moves*, *who is permitted*, *how credentials are obtained*, and *how local applications enter the fabric*.
+Confluence resolves this with a single foundational abstraction: **connecting an Originator `A` to an explicitly published named Endpoint on Destination `B`** over an explicit path of **named Transits** and **pure transport Channels**, while cleanly separating *how data moves*, *who is permitted*, *how credentials are obtained*, and *how local applications enter the fabric*.
 
 ### Non-Goals for the Core
 
-* **No application-protocol awareness:** The Core transports opaque byte streams and discrete datagrams; it never parses or terminates application or L3/L4 protocols.
-* **No QoS, bandwidth shaping, or concurrency-cap logic in Core:** Core enforces cryptographically authenticated **Lease** lifetimes, instant revocation, and an algorithm-agnostic `TrafficGate` hook + RAII `SessionGuard` permits on `DATA` frames only. Token buckets, rate/PPS shapers, and concurrency counters stay completely outside Core, while composing cleanly under `IntersectAuthorizer` and updating live on renewal.
-* **No passive-relay registration protocol in Core:** Passive relay presence signaling belongs at the transport/channel layer outside Core.
-* **No implicit cross-plane conversion or datagram fragmentation:** The Core never silently wraps streams into datagrams, wraps datagrams into streams, or fragments/reassembles datagrams; crossing planes or handling fragmentation is always an explicit out-of-core choice.
-* **No in-core multiplexing:** One connection from A to B establishes one bidirectional stream or one bidirectional datagram flow; multiplexing multiple logical flows over a single carrier or passive relay lives in composable channels.
-* **No auto-routing, discovery, or multi-path switching:** The Core executes one explicitly specified path cleanly; peer discovery, candidate-path management, probing/racing, and live path failover stay outside the Core.
-* **No built-in user management, credential issuance, or network control server:** The Core verifies access via pluggable authorizers rather than issuing credentials, and exposes zero default network control endpoints.
+* **No application-protocol awareness:** Core transports opaque byte streams and discrete datagrams; it never parses or terminates application or L3/L4 protocols.
+* **No QoS, bandwidth shaping, or concurrency-cap algorithms in Core:** Core enforces time-bounded, revocable leases together with algorithm-agnostic data-plane traffic gates and session-scoped permits. Token buckets, rate/packet shapers, and concurrency counters stay completely outside Core, while composing cleanly under host-sovereign policy intersection and updating live on renewal.
+* **No passive-relay presence protocol in Core:** Passive relay registration and presence signaling belong at the transport/channel layer outside Core.
+* **No implicit cross-plane conversion or steady-state datagram fragmentation:** Core never silently wraps streams into datagrams, wraps datagrams into streams, or fragments/reassembles application datagrams; crossing planes or handling fragmentation is always an explicit out-of-core choice.
+* **No in-core multiplexing:** One connection from `A` to `B` establishes one bidirectional byte stream or one bidirectional datagram flow; multiplexing multiple logical flows over a shared underlay lives in composable channels.
+* **No auto-routing, discovery, or multi-path switching:** Core executes one explicitly specified path cleanly; peer discovery, candidate-path management, probing/racing, and live path failover stay outside Core.
+* **No built-in user management, credential issuance, or network control server:** Core verifies access through pluggable authorizers rather than issuing credentials, and exposes zero default network control endpoints.
 * **No assumed global topology or host-wide ownership:** There is no mandatory central coordinator, global network namespace, or host-wide privilege requirement.
 
 ---
@@ -35,12 +35,13 @@ Confluence resolves this with a single foundational abstraction: **connecting an
 
 ```text
 +-----------------------------------------------------------------------+
-| Edge Adapters & App Middleware (Out of Core — [Seam 4])               |
-|   TCP/UDP port forwarders · E2eStreamIo · Virtual L3 · App RBAC       |
-|   Live SessionAuth claims (updated automatically on renewal)          |
+| Edge Adapters & Application Middleware (Out of Core — Seam 4)         |
+|   Port forwarders · Local I/O bridges · Virtual L3 · App RBAC         |
+|   Reads live verified session claims (updated automatically on renew) |
 +-----------------------------------------------------------------------+
                      │                             │
-      1:1 Stream     │  SessionAuth(peer, live)    │  1:1 Datagram Flow
+      1:1 Stream     │   Authenticated Peer &      │  1:1 Datagram Flow
+                     │   Live Verified Claims      │
                      ▼                             ▼
 +=======================================================================+
 |                          CONFLUENCE CORE                              |
@@ -54,131 +55,131 @@ Confluence resolves this with a single foundational abstraction: **connecting an
 |                 ▼                                  ▼                  |
 |  +-----------------------------------------------------------------+  |
 |  |          Unified Trust & Enforcement Boundary (Core)            |  |
-|  |   Mutual Noise_IK · MAC2 Flood Cookies · Replay Protection      |  |
-|  |   1.0 RTT Replay-Safe Open · Lease TTL & Instant Revocation     |  |
-|  |   Caller credentials ◄──── [Seam 3A: CredentialProvider]        |  |
-|  |   Verifier decisions ────► [Seam 3B: Authorizer / Intersect]    |  |
+|  |   Mutual Auth · DoS Flood Protection · Replay Protection        |  |
+|  |   Replay-Safe Deferred Open · Revocable Leases & Live Renewal   |  |
+|  |   Caller credentials ◄──── [Seam 3A: Credential Acquisition]    |  |
+|  |   Verifier decisions ────► [Seam 3B: Authorization & Veto]      |  |
 |  +-----------------------------------------------------------------+  |
 |                                  │                                    |
 |                                  ▼                                    |
 |  +-----------------------------------------------------------------+  |
 |  |                    Composable Path Engine                       |  |
-|  |   Explicit single-path execution · End-to-end MTU agreement     |  |
-|  |   Named Endpoints & Named Transits (SSRF-safe by construction)  |  |
+|  |   Explicit single-path execution · End-to-end payload-limit     |  |
+|  |   agreement · Named Endpoints & Transits (SSRF-safe)            |  |
 |  |   Direct per-hop auth · Route integrity · Opaque forwarding     |  |
-|  |   Receives chosen path ◄───────── [Seam 2: PathSource]          |  |
+|  |   Receives chosen path ◄───────── [Seam 2: Path Selection]      |  |
 |  +-----------------------------------------------------------------+  |
 +=======================================================================+
                                    │
                                    ▼
 +-----------------------------------------------------------------------+
-| Pure Composable Channels (Out of Core — [Seam 1])                     |
-|   2-method pure transports (zero crypto, auth, or policy logic):      |
-|   Native TCP / Linux DF=1 UDP · Link-encrypted wrappers               |
-|   Out-of-core single-port Passive Relays · Cross-plane adapters       |
+| Pure Composable Channels (Out of Core — Seam 1)                       |
+|   Pure transports (zero Core auth, credentials, or policy logic):     |
+|   Native stream & datagram underlays · Link-encrypted wrappers        |
+|   Passive relay carriers · Explicit cross-plane adapters              |
 +-----------------------------------------------------------------------+
 ```
 
 ---
 
-## 3. Core Concepts
+## 3. Core Design Principles
 
-### 3.1 Decoupled Identity, Scope, and Control Surfaces
+### 3.1 Decoupled Identity, Trust Scopes, and Control Surfaces
 
-Machine, user, identity, and network membership are independent dimensions:
+Machine, user, cryptographic identity, and network membership are independent dimensions:
 
-* **Instance (`Node`):** A self-contained Confluence runtime (standalone or embedded), unprivileged by default, able to host multiple isolated `ScopeInstance`s on a single shared TCP/UDP listener via unlinkable `ScopeKid` demultiplexing.
-* **Trust Scope (`ScopeInstance`):** An isolated trust domain owning one independent X25519 identity keypair so observers and intermediaries cannot correlate its presence across unrelated scopes.
-* **Host Sovereignty:** Every instance retains sole authority over its own machine; external authorities or peers can never expose an unpublished endpoint/transit or bypass a node's local hard veto (`IntersectAuthorizer`, `revoke_peer`, `PublishGuard` drop).
-* **Explicit Exposure & Three-Way Control Split:** A node exposes zero built-in network control endpoints; only explicitly published named **Endpoints** and named **Transits** are reachable. Control separates cleanly into:
-  1. **Connection & Path Control (In-Core, In-Band):** Path setup, MTU agreement, lease renewal, and teardown travel in-band with the active connection.
-  2. **Fabric Coordination (Out-of-Core, Opt-In Endpoints):** Optional discovery, route distribution, or revocation feeds run over ordinary named endpoints when configured.
-  3. **Host Administration (Local Boundary Only):** Publishing endpoints/transits and enforcing local vetoes stay within the local host boundary (in-process API or owner-only `0600` Unix IPC).
+* **Node:** A self-contained runtime (standalone or embedded), unprivileged by default, capable of hosting multiple isolated Trust Scopes behind shared network listeners by demultiplexing inbound traffic via unlinkable scope identifiers.
+* **Trust Scope:** An isolated trust domain owning one independent identity keypair so observers and intermediaries cannot correlate a node's presence across unrelated scopes.
+* **Host Sovereignty:** Every host retains sole authority over its own machine; external authorities or peers can never expose an unpublished endpoint or transit, nor weaken or bypass a host's local hard veto and local unpublish/revocation controls.
+* **Explicit Exposure & Three-Way Control Split:** A node exposes zero built-in network control endpoints; only explicitly published named **Endpoints** and named **Transits** are reachable. Control separates cleanly into three planes:
+  1. **Connection & Path Control (In-Core, In-Band):** Path setup, payload-limit agreement, lease renewal, and teardown travel in-band with the active connection.
+  2. **Fabric Coordination (Out-of-Core, Opt-In Endpoints):** Optional peer discovery, route distribution, or revocation feeds run over ordinary published endpoints when configured.
+  3. **Host Administration (Local Boundary Only):** Publishing endpoints or transits and enforcing local vetoes stay strictly inside the local host boundary.
 
 ---
 
-### 3.2 Datagram & Stream Separation (Two-Plane Model)
+### 3.2 Strict Two-Plane Separation
 
 Network traffic falls into two fundamentally distinct semantic classes:
 
-1. **Datagrams:** Unreliable, discrete, message-oriented payloads prioritizing independence between messages and low latency over ordered delivery.
+1. **Datagrams:** Unreliable, discrete, message-oriented payloads prioritizing message independence and low latency over ordered delivery.
 2. **Streams:** Reliable, ordered, continuous byte flows with end-to-end backpressure.
 
 Confluence enforces a strict, symmetric separation:
 
-* **Two Strictly Separate End-to-End Planes:** Inside Core, stream traffic only traverses Stream channels/transits and datagram traffic only traverses Datagram channels/transits, with zero hidden cross-plane conversion.
-* **Explicit, Symmetric Cross-Plane Channel Adapters:** Traversing a mismatched underlay requires an explicit *Stream-over-Datagram* or *Datagram-over-Stream* adapter exposing the exact same pure channel contract, payload limits, and health signals as a native carrier.
+* **Two Separate End-to-End Planes:** Inside Core, stream traffic traverses only Stream channels and transits, and datagram traffic traverses only Datagram channels and transits, with zero hidden cross-plane conversion.
+* **Explicit, Symmetric Cross-Plane Adapters:** Crossing a mismatched underlay requires an explicit *Stream-over-Datagram* or *Datagram-over-Stream* channel adapter outside Core that exposes the exact same pure channel contract, payload limits, and health signals as a native carrier.
 
 ---
 
 ### 3.3 Pure Channels & Named Transits
 
-Confluence draws a sharp line between **moving bytes** and **deciding who can forward where**:
+Confluence draws a sharp line between **moving bytes** and **deciding who may forward where**:
 
-* **Pure Channels (Seam 1):** `StreamChannel` (`caps`, `dial_stream`) and `DatagramChannel` (`caps`, `open_link`) are pure 2-method transports. They never handle `Noise_IK`, `MAC2` cookies, credentials, or policy. Native carriers stay simple, and vertical wrappers (link encryption, multiplexing, cross-plane adapters) compose statically at compile time.
-* **Named Endpoints & Named Transits:** Every inbound target on a node is a human-readable logical name:
-  * **Endpoint** (`TargetRef::Endpoint { name, plane }`): a terminal service published on destination `B` (e.g., `"analytics-db"`).
-  * **Transit** (`TargetRef::Transit { name, plane }`): a forwarding route published on hop `H` (exact name like `"to-prod"`, or prefix like `"relay/"` matching `"relay/bob"`).
-* **Core Owns Hop Admission Uniformly:** Because every hop is a `ScopeInstance` publishing named transits, Core itself executes the exact same `Noise_IK` handshake, `MAC2` flood-cookie verification, replay check, `AuthGate` authorization, and in-band renewal pipeline for both Endpoints and Transits—eliminating duplicated auth wrappers.
-* **SSRF Prevention & Local Stack Privacy by Construction:** An originator only names the logical transit target (e.g., `HopSpec { peer: bastion, target: "to-prod" }`). It never specifies raw downstream IPs, ports, or internal channel types. Hop `H` privately owns how `"to-prod"` is reached (plain TCP, link-encrypted UDP, passive presence pool, etc.), and cannot be tricked into dialing arbitrary internal addresses.
+* **Pure Channels (Seam 1):** Transport channels move opaque byte streams or discrete datagrams and report live payload limits and link health. They never perform Core handshakes, flood challenges, credential handling, or access policy. This keeps native carriers simple and lets transport wrappers (link encryption, multiplexing, cross-plane adapters, passive relays) compose cleanly.
+* **Named Endpoints & Named Transits:** Every inbound target on a node is addressed by a logical name:
+  * **Endpoint:** A terminal service explicitly published on destination `B`.
+  * **Transit:** A forwarding exit explicitly published on an intermediate hop `H` (matched either by exact name or by prefix).
+* **Uniform Core Admission:** Because every hop is a Trust Scope publishing named transits, Core executes the exact same authentication, pre-auth DoS filtering, replay protection, authorization, and in-band renewal pipeline for both Endpoints and Transits—eliminating duplicated security logic.
+* **SSRF Prevention & Local Stack Privacy by Construction:** An originator names only the logical transit target at each hop; it never supplies raw downstream network addresses, ports, or internal carrier types. Each hop privately owns how a named transit reaches the next hop and cannot be coerced into dialing arbitrary internal addresses. Registering an outbound first-hop carrier never enables inbound forwarding (default-deny forwarding).
 
 #### Setup vs. Steady-State Forwarding
 
-* **Setup (Direct Hop Authorization & Route Integrity):** Originator `A` emits one pipelined 1-RTT `SETUP_FWD` flight. Each hop authorizes `A` directly (never trusting the preceding hop) and binds `BLAKE3(Dispatch_Prefix || Remaining_Tail)` as AEAD AAD so upstream hops cannot splice or alter downstream legs.
-* **Forwarding (Opaque, Low-Overhead Data Plane):** Once established, intermediate hops forward opaque end-to-end ciphertext without per-hop payload decryption or re-encryption. Per-hop encrypted trailers returned on `SETUP_OK` authenticate each hop's local MTU and establish every hop's lease TTL in the initial 1-RTT flight with zero `t = 0` renewal burst.
+* **Setup (Direct Per-Hop Authorization & Route Integrity):** Originator `A` initiates a single pipelined multi-hop setup flight. Every hop authenticates `A` directly (never trusting the preceding hop), and every hop cryptographically binds the entire remaining downstream route so compromised upstream hops cannot splice, reorder, truncate, or alter downstream legs.
+* **Forwarding (Opaque, Low-Overhead Data Plane):** Once established, intermediate hops forward opaque end-to-end ciphertext without per-hop payload decryption or re-encryption. Authenticated setup responses deliver every hop's payload limit and initial lease lifetime during the initial round trip with zero initial renewal burst.
 
 ---
 
 ### 3.4 Explicit Single-Path Execution & Honest Path Semantics
 
-The Core's routing mission is minimal: **execute one explicitly specified path cleanly**.
+Core's routing responsibility is minimal: **execute one explicitly specified path cleanly**.
 
-* **End-to-End Capability & Payload-Limit Agreement:** Every hop must support the requested plane and satisfy the caller's minimum MTU floor across forward clamping, authenticated setup trailers, and live mid-session MTU updates (combining carrier `MtuWatch` signals, `MtuTooSmall`/`EMSGSIZE` clamping, and authenticated `DG_MTU`/`DG_MTU_ACK` propagation; link-local DPLPMTUD probing lives outside Core).
-* **1.0 RTT Replay-Safe Destination Open & Explicit Lifecycle:** Destination `B` holds an `AwaitingConfirm` state on `SETUP_FWD` and opens its `EndpointHandler` only after decrypting `A`'s first `ee`-authenticated E2E frame. End-to-end signaling cleanly distinguishes `OPEN_OK`, `TARGET_REFUSED`, `TARGET_UNREACHABLE`, `TARGET_BUSY`, `TARGET_DENIED`, clean `E2E_FIN`, and abrupt `UnexpectedEof`.
-* **Honest Failure Handling:** Broken links and payload-limit violations tear down affected sessions immediately and report structured `PathOutcome` events (with `CoreErr::failure_class()`) upward to `PathSource`.
+* **End-to-End Capability & Payload-Limit Agreement:** Every hop along the path must support the requested plane and satisfy the negotiated minimum payload-limit floor across initial setup and live mid-session path changes. Limits are authenticated end-to-end rather than trusted from mutable cleartext headers.
+* **Replay-Safe Deferred Destination Open & Explicit Lifecycle:** Destination `B` holds an unconfirmed pending state upon receiving initial setup and invokes its local endpoint handler only after receiving an end-to-end authenticated confirmation from `A`. Exposing a staged pre-confirmation boundary lets out-of-core path racers compare candidate paths with zero destination side effects. End-to-end signaling cleanly distinguishes successful open, application refusal, capacity busy, policy denial, target unreachability, clean half-close, and abrupt transport drop.
+* **Honest Failure Handling:** Broken links and payload-limit floor violations tear down affected sessions cleanly and report structured outcome classifications upward so out-of-core routers can distinguish path/hop failures from destination policy or application rejections.
 
 ---
 
-### 3.5 Symmetric Auth, "Verifier, Not Issuer", and Fine-Grained Application RBAC
+### 3.5 Symmetric Auth, "Verifier, Not Issuer", and Zero-Double-Auth App RBAC
 
-Every channel and intermediary is treated as untrusted transport relied upon solely for liveness and bandwidth—never for confidentiality, integrity, or authorization.
+Every transport channel and intermediate hop is treated as untrusted infrastructure relied upon solely for liveness and bandwidth—never for confidentiality, integrity, or authorization.
 
 #### Symmetric Credential & Authorization Split (Seam 3)
 
-Auth is cleanly decoupled from both routing (`PathSource`) and application dial calls:
+Authentication and authorization are cleanly decoupled from both routing and application dial calls:
 
-1. **Originator Side (`CredentialProvider`):** Whenever Core builds a setup flight or refreshes a lease in-band, it asks `CredentialProvider::credential(CredentialRequest)` for an opaque credential (`0..=128` bytes) for each verifier `(verifier_pubkey, TargetRef, is_refresh)`. Credentials can be empty (public-key-only), static secrets, or short-lived signed capability tokens fetched from an external OIDC/SSO/Vault broker. Each verifier's credential is encrypted inside its own `Noise_IK` envelope so no other hop can read it.
-2. **Verifier Side (`Authorizer`):** After cryptographic peer proof (`Noise_IK`), Core's fail-closed `AuthGate` invokes `Authorizer::authorize(AuthRequest)` on **control events only** (setup and in-band renewal, never per packet), with bounded timeouts, bounded concurrency, and local hard-veto intersection (`IntersectAuthorizer`).
-3. **Revocable `Lease` + `TrafficGate` + Live `AuthExtensions` (`SessionAuth`):**
-   * An `Authorizer` returns `Lease { ttl, gate, guards, extensions }`.
-   * **Core stays algorithm-agnostic while enforcing uniformly:** lock-free `LeaseHandle` TTL expiry, seamless in-band renewal before expiry, O(1) instant teardown via `Revocation` events (`Peer`, `Endpoint`, `Transit`, `All`) or local `revoke_peer` / `PublishGuard` drop, per-circuit `TrafficGate` enforcement strictly on `DATA` frames (after CID demuxing, keeping `SETUP`/`RENEW`/`CLOSE`/`DG_MTU`/`DG_MTU_ACK`/`ST_FIN` immune), and session-scoped RAII `SessionGuard` permits held across renewals until session close.
-   * **Host-sovereign composition & live updates:** `IntersectAuthorizer` composes both `TrafficGate`s, preserves both sets of RAII `guards`, and merges type-keyed `AuthExtensions` with local-host precedence. On in-band renewal (`is_renewal: true`), Core atomically swaps `ttl`, `gate`, and live `SessionAuth` claims while keeping initial session `guards` intact.
-   * **Zero-double-auth fine-grained RBAC:** Core passes live `SessionAuth` into confirmed `EndpointHandler::open(auth)` and `TransitHandler::open(target, auth)`. Application handlers read rich verified claims (user ID, roles, tenant, scopes) directly from `SessionAuth::context::<MyClaims>()`—automatically observing role/claim updates on renewal without re-authenticating inside the app protocol.
+1. **Originator Side (Credential Acquisition):** Whenever Core builds a setup flight or renews a lease in-band, it requests an opaque credential per verifier and logical target. Credentials may be empty (public-key-only), static secrets, or short-lived capability tokens acquired from an external identity broker. Each verifier's credential is encrypted solely for that verifier so no other hop can inspect it.
+2. **Verifier Side (Fail-Closed Authorization):** After cryptographic peer proof, Core evaluates the pluggable authorizer strictly on **control events** (initial setup and in-band renewal, never per data packet), under bounded timeouts, bounded concurrency, and fail-closed semantics.
+3. **Revocable Leases, Data-Plane Gates, Permits & Live Claims:**
+   * An authorization decision yields a time-bounded **Lease** carrying: a lifetime, an optional algorithm-agnostic data-plane traffic gate, optional session-scoped resource permits, and typed verified application claims.
+   * **Uniform, algorithm-agnostic enforcement:** Core enforces lease expiration, idempotent in-band renewal before expiry, and instant out-of-band revocation (by peer, endpoint, transit, publication, or full scope). Data-plane traffic gates run strictly on user data after per-circuit demultiplexing so control frames (setup, renewal, payload-limit updates, close) remain immune and circuits sharing a link remain isolated. Session-scoped permits stay alive across renewals until session close.
+   * **Host-sovereign composition:** Local and external policies compose by intersection—local policy evaluates first as a hard veto, lifetimes take the shorter bound, traffic gates intersect fail-closed, both sets of permits are retained, and typed claims merge with local-host precedence.
+   * **Live updates & zero-double-auth application RBAC:** On in-band renewal, Core atomically updates the lease lifetime, active traffic gate, and verified claims visible to endpoint and transit handlers. Applications read verified identity and live claims directly from Core's session context—automatically observing role or scope changes without re-authenticating inside the application protocol.
 
 ---
 
 ## 4. Core Boundary & Extension Seams
 
-Everything outside the foundational engine attaches through four narrow seams:
+Everything outside the foundational engine attaches through four narrow, implementation-independent seams:
 
 | Seam | Responsibility | Out-of-Core Examples |
 | --- | --- | --- |
-| **1. Channels** | Pure 2-method Stream or Datagram transport (`caps`, `dial_stream` / `open_link`), live MTU watch, and symmetric inbound listeners. | Native TCP/UDP, link-encrypted TCP/UDP, single-port Passive Relays, explicit `Stream↔Datagram` adapters. |
-| **2. Path Source** | Pure routing: supplies one `ExplicitPath` per `(peer, endpoint, plane)` and receives `PathOutcome` feedback (zero credentials). | `StaticPathSource`, Blind Rendezvous discovery, active probing/racing (`dial_*_staged`), and failover controllers. |
-| **3. Auth (`CredentialProvider` ↔ `Authorizer`)** | Caller acquires/refreshes opaque credentials; verifier evaluates `(peer, TargetRef, credential)` on control events into a revocable `Lease` (`ttl`, optional `TrafficGate`, RAII `SessionGuard`s, typed `AuthExtensions`), and emits `Revocation`s. | `StaticCredentials`, `StaticPolicy`, `IntersectAuthorizer`, `RateGate`, `ConcurrencyLimiter`, `QosAuthorizer`, OIDC/capability-token brokers, enterprise policy engines. |
-| **4. Endpoints, Transits & Edge Adapters** | Projects confirmed 1:1 Stream/Datagram flows (with live `SessionAuth`) to local targets, named forwarding transits (1:1 streams or 1:N shared datagram links), or embedded apps. | `StaticTransit` / `DynamicTransit`, `TcpTarget` / `UdpTarget`, `serve_local_tcp` / `serve_local_udp`, `E2eStreamIo`, virtual L3 mesh, native RPC apps. |
+| **1. Channels** | Pure stream or datagram transport, live payload-limit reporting, and symmetric inbound listeners. | Native TCP/UDP underlays, link-encrypted wrappers, passive relay carriers, explicit stream↔datagram adapters, link multiplexers. |
+| **2. Path Selection** | Pure routing: supplies one explicit single path for a destination, endpoint, and plane, and receives structured lifecycle and failure feedback (zero credentials). | Static routes, blind rendezvous discovery, staged path probing/racing, failover controllers. |
+| **3. Symmetric Auth** | Originator acquires and refreshes opaque per-verifier credentials; verifier evaluates authenticated control-plane requests into revocable leases (lifetime, traffic gate, session permits, typed claims) and emits live revocations. | Public-key allowlists, capability-token brokers, OIDC/SSO verifiers, host-sovereign policy combinators, rate/PPS shapers, concurrency limiters. |
+| **4. Endpoints, Transits & Edge Adapters** | Projects confirmed 1:1 streams or datagram flows (carrying verified peer identity and live claims) onto local services, named forwarding exits, or embedded applications. | Static/dynamic forwarding transits, local port forwarders, virtual L3 adapters, embedded RPC/application servers. |
 
 ---
 
 ## 5. Core Invariants Checklist
 
 1. **Core knows no application, L3/L4, QoS, or passive-relay protocols** — only opaque byte streams, opaque discrete datagrams, and revocable time-bounded leases.
-2. **Datagram and Stream planes never mix or fragment in Core** — crossing planes requires an explicit channel adapter, and datagrams are never fragmented inside Core.
-3. **Channels are pure, composable, and locally private** — channels move bytes without policy/auth logic; vertical stacks stay private behind named transits so originators only need their own first-hop carrier.
-4. **One explicit path and 1:1 session per connection** — discovery, probing, failover, and stream multiplexing stay outside Core.
-5. **Passive Relay and Active Transit never blur** — Passive Relay lives out of Core, performs structurally zero outbound dialing, and exposes presences strictly as named transits.
-6. **Direct hop authorization and opaque forwarding** — Core authenticates the originator directly at every named transit hop with route-integrity AAD and forwards opaque end-to-end ciphertext without per-hop payload decryption.
-7. **Replay-safe admission and explicit end-to-end lifecycle** — destination handlers open only after 1.0 RTT confirmation, cleanly distinguishing `OPEN_OK`, refusal, busy, denied, unreachable, `E2E_FIN`, and `UnexpectedEof`.
-8. **Symmetric auth & "verifier, never issuer"** — `CredentialProvider` is decoupled from routing and dials; `Authorizer` runs strictly on control events, fails closed, never overrides local host veto (`IntersectAuthorizer`), enforces out-of-core QoS via composable `Lease` `TrafficGate` / `SessionGuard` hooks strictly on `DATA` frames, and flows live `AuthExtensions` into `SessionAuth` for zero-double-auth app RBAC.
-9. **Path and payload-limit failures surface honestly** — broken links and MTU violations tear down cleanly and report structured `PathOutcome` upward.
+2. **Datagram and Stream planes never mix or fragment application data in Core** — crossing planes requires an explicit out-of-core channel adapter, and application datagrams are never fragmented inside Core.
+3. **Channels are pure, composable, and locally private** — channels move bytes without Core auth or policy logic; downstream transport stacks stay private behind named transits so originators need only their own first-hop carrier.
+4. **One explicit path and 1:1 session per connection** — discovery, probing, racing, failover, and logical stream multiplexing stay outside Core.
+5. **Passive Relay and Active Transit never blur** — passive relay presence lives outside Core, performs structurally zero outbound dialing, and exposes presences strictly as named transits.
+6. **Direct per-hop authorization and opaque steady-state forwarding** — Core authenticates the originator directly at every named transit hop with cryptographic route integrity during setup, and forwards opaque end-to-end ciphertext without per-hop payload decryption afterward.
+7. **Replay-safe deferred admission and explicit end-to-end lifecycle** — destination handlers open only after end-to-end confirmation, cleanly distinguishing open success, refusal, busy, denial, unreachability, clean half-close, and abrupt transport failure.
+8. **Symmetric fail-closed auth & "verifier, never issuer"** — credential acquisition is decoupled from routing and dials; authorization runs strictly on control events, fails closed, never overrides local host veto, enforces out-of-core traffic gates strictly on data traffic (immune to control frames), preserves session permits across renewals, and surfaces live verified claims to applications.
+9. **Path and payload-limit failures surface honestly** — broken links and payload-limit floor violations tear down cleanly and report structured root-cause feedback upward.
 10. **Zero default endpoints and rootless isolation** — nodes run unprivileged by default, keep identities unlinkable across Trust Scopes, keep connection control in-band and host administration strictly local, and expose only explicitly published Endpoints and Transits.

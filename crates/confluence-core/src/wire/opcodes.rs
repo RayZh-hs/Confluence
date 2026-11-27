@@ -53,7 +53,7 @@ pub mod e2e_dg {
     pub const DG_CLOSE: u8 = 0x04;
     pub const DG_MTU: u8 = 0x05;
     pub const DG_MTU_ACK: u8 = 0x06;
-    pub const DG_RENEW: u8 = 0x07;
+    pub const DG_RENEW: u8 = crate::constants::E2E_DG_RENEW_OPCODE;
     pub const DG_RENEW_OK: u8 = 0x08;
 
     #[inline]
@@ -73,7 +73,7 @@ pub mod e2e_st {
     pub const TARGET_DENIED: u8 = 0x04;
     pub const ST_DATA: u8 = 0x10;
     pub const ST_FIN: u8 = 0x11;
-    pub const ST_RENEW: u8 = 0x14;
+    pub const ST_RENEW: u8 = crate::constants::E2E_ST_RENEW_OPCODE;
     pub const ST_RENEW_OK: u8 = 0x15;
 
     #[inline]

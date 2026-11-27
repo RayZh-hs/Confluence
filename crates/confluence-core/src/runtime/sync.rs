@@ -5,7 +5,7 @@
 use core::future::{Future, poll_fn};
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_broadcast::{InactiveReceiver, Receiver as BcReceiver, Sender as BcSender};
@@ -173,7 +173,16 @@ struct WatchState<T> {
 
 struct WatchInner<T> {
     state: Mutex<WatchState<T>>,
+    /// Lock-free mirror of `state.version` updated with `Ordering::Release` under `state` lock.
+    /// Starts at `1` and skips `0` on wrap so `0` is always an uninitialized sentinel for caches.
+    version: AtomicU64,
     event: Event,
+}
+
+#[inline]
+const fn next_watch_version(v: u64) -> u64 {
+    let next = v.wrapping_add(1);
+    if next == 0 { 1 } else { next }
 }
 
 /// Runtime-independent single-value watch publisher notifying all subscribers on update.
@@ -194,26 +203,70 @@ impl<T> Watch<T> {
         let inner = Arc::new(WatchInner {
             state: Mutex::new(WatchState {
                 value: initial,
-                version: 0,
+                version: 1,
                 senders: 1,
             }),
+            version: AtomicU64::new(1),
             event: Event::new(),
         });
         let rx = WatchReceiver {
             inner: Arc::clone(&inner),
-            seen_version: 0,
+            seen_version: 1,
         };
         (Self { inner }, rx)
     }
 
-    /// Publishes a new value and wakes all waiting receivers.
+    /// Publishes a new value, wakes all waiting receivers, and drops the retired value strictly
+    /// after releasing the internal mutex (preventing re-entrant destructor deadlocks).
     pub fn send(&self, value: T) {
-        {
+        let old = {
             let mut st = lock_unpoisoned(&self.inner.state);
-            st.value = value;
-            st.version = st.version.wrapping_add(1);
-        }
+            let old = core::mem::replace(&mut st.value, value);
+            let next_ver = next_watch_version(st.version);
+            st.version = next_ver;
+            self.inner.version.store(next_ver, Ordering::Release);
+            old
+        };
         self.inner.event.notify(usize::MAX);
+        drop(old);
+    }
+
+    /// Replaces the stored value atomically, advances the version, invokes `on_commit` while
+    /// still holding the watch lock, and returns the retired value WITHOUT notifying or dropping
+    /// it so the caller can release outer locks before notifying waiters and dropping `old`.
+    pub fn replace_with_commit(&self, value: T, on_commit: impl FnOnce(u64)) -> T {
+        let mut st = lock_unpoisoned(&self.inner.state);
+        let old = core::mem::replace(&mut st.value, value);
+        let next_ver = next_watch_version(st.version);
+        st.version = next_ver;
+        self.inner.version.store(next_ver, Ordering::Release);
+        on_commit(next_ver);
+        old
+    }
+
+    /// Wakes all receivers awaiting updates after a [`Self::replace_with_commit`].
+    #[inline]
+    pub fn notify_waiters(&self) {
+        self.inner.event.notify(usize::MAX);
+    }
+
+    /// Conditionally replaces the stored value WITHOUT changing the version or notifying waiters,
+    /// returning any retired value so the caller drops it outside the lock.
+    pub fn replace_silent_if(&self, f: impl FnOnce(&T) -> Option<T>) -> Option<T> {
+        let mut st = lock_unpoisoned(&self.inner.state);
+        f(&st.value).map(|new_val| core::mem::replace(&mut st.value, new_val))
+    }
+
+    /// Lock-free load of the latest committed version (`>= 1`).
+    #[inline]
+    pub fn version(&self) -> u64 {
+        self.inner.version.load(Ordering::Acquire)
+    }
+
+    /// Reads the current value and its exact committed version atomically under the watch lock.
+    pub fn borrow_with_version<R>(&self, f: impl FnOnce(&T) -> R) -> (u64, R) {
+        let st = lock_unpoisoned(&self.inner.state);
+        (st.version, f(&st.value))
     }
 
     /// Mutates the value in place and notifies receivers iff `f` returns `true`.
@@ -221,7 +274,9 @@ impl<T> Watch<T> {
         let modified = {
             let mut st = lock_unpoisoned(&self.inner.state);
             if f(&mut st.value) {
-                st.version = st.version.wrapping_add(1);
+                let next_ver = next_watch_version(st.version);
+                st.version = next_ver;
+                self.inner.version.store(next_ver, Ordering::Release);
                 true
             } else {
                 false
@@ -249,10 +304,22 @@ impl<T> Watch<T> {
     }
 }
 
+#[allow(dead_code)]
 impl<T: Clone> Watch<T> {
     /// Returns a clone of the current value.
     pub fn borrow_cloned(&self) -> T {
         lock_unpoisoned(&self.inner.state).value.clone()
+    }
+
+    /// Atomically creates a [`WatchReceiver`] positioned at the current version AND returns
+    /// the corresponding value from that exact version.
+    pub fn subscribe_with_value(&self) -> (WatchReceiver<T>, T) {
+        let st = lock_unpoisoned(&self.inner.state);
+        let rx = WatchReceiver {
+            inner: Arc::clone(&self.inner),
+            seen_version: st.version,
+        };
+        (rx, st.value.clone())
     }
 }
 
@@ -331,10 +398,47 @@ impl<T> WatchReceiver<T> {
     }
 }
 
+#[allow(dead_code)]
 impl<T: Clone> WatchReceiver<T> {
     /// Returns a clone of the current value.
     pub fn borrow_cloned(&self) -> T {
         lock_unpoisoned(&self.inner.state).value.clone()
+    }
+
+    /// Atomically reads the current value and advances this receiver's cursor to its version.
+    pub fn borrow_and_mark_seen(&mut self) -> T {
+        let st = lock_unpoisoned(&self.inner.state);
+        self.seen_version = st.version;
+        st.value.clone()
+    }
+
+    /// Waits for a newer version than last seen and atomically returns that version's value
+    /// while advancing the receiver's cursor, or `None` if all senders have been dropped.
+    pub async fn changed_value(&mut self) -> Option<T> {
+        loop {
+            {
+                let st = lock_unpoisoned(&self.inner.state);
+                if st.version != self.seen_version {
+                    self.seen_version = st.version;
+                    return Some(st.value.clone());
+                }
+                if st.senders == 0 {
+                    return None;
+                }
+            }
+            let listener = self.inner.event.listen();
+            {
+                let st = lock_unpoisoned(&self.inner.state);
+                if st.version != self.seen_version {
+                    self.seen_version = st.version;
+                    return Some(st.value.clone());
+                }
+                if st.senders == 0 {
+                    return None;
+                }
+            }
+            listener.await;
+        }
     }
 }
 
@@ -479,6 +583,42 @@ mod tests {
 
         drop(tx2);
         assert_eq!(spawner.try_block_on(rx.changed()), Some(false));
+    }
+
+    #[test]
+    fn watch_send_reentrant_drop_does_not_deadlock() {
+        struct ReentrantVal {
+            id: u32,
+            rx: Option<WatchReceiver<Arc<ReentrantVal>>>,
+            observed_on_drop: Arc<AtomicUsize>,
+        }
+        impl Drop for ReentrantVal {
+            fn drop(&mut self) {
+                if let Some(rx) = &self.rx {
+                    let cur = rx.borrow_with(|v| v.id);
+                    self.observed_on_drop.store(cur as usize, Ordering::SeqCst);
+                }
+            }
+        }
+
+        let observed = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = Watch::new(Arc::new(ReentrantVal {
+            id: 1,
+            rx: None,
+            observed_on_drop: Arc::clone(&observed),
+        }));
+        tx.send(Arc::new(ReentrantVal {
+            id: 2,
+            rx: Some(rx.clone()),
+            observed_on_drop: Arc::clone(&observed),
+        }));
+        // Replacing id=2 drops it OUTSIDE the Watch mutex -> reading `rx` inside Drop sees id=3!
+        tx.send(Arc::new(ReentrantVal {
+            id: 3,
+            rx: None,
+            observed_on_drop: Arc::clone(&observed),
+        }));
+        assert_eq!(observed.load(Ordering::SeqCst), 3);
     }
 
     #[test]

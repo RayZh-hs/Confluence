@@ -2,11 +2,11 @@
 
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Tag};
-use zeroize::{ZeroizeOnDrop, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::constants::{
-    DG_E2E_MIN_LEN, MAC_LEN, MAX_CONTROL, MIN_CONTROL, REPLAY_WINDOW_PACKETS, ST_MAX_BODY,
-    ST_OVERHEAD,
+    DG_E2E_MIN_LEN, E2E_DG_RENEW_OPCODE, E2E_ST_RENEW_OPCODE, MAC_LEN, MAX_CONTROL, MIN_CONTROL,
+    REPLAY_WINDOW_PACKETS, ST_MAX_BODY, ST_OVERHEAD,
 };
 use crate::crypto::noise::nonce_from_seq;
 use crate::error::CoreError;
@@ -125,10 +125,17 @@ impl ControlCipher {
         out.extend_from_slice(&seq.to_be_bytes());
         let ct_start = out.len();
         out.extend_from_slice(plaintext);
-        let tag = self
+        let tag = match self
             .tx
             .encrypt_in_place_detached(&nonce_from_seq(seq), &[kind], &mut out[ct_start..])
-            .map_err(|_| CoreError::Authentication)?;
+        {
+            Ok(tag) => tag,
+            Err(_) => {
+                out[ct_start..].zeroize();
+                out.clear();
+                return Err(CoreError::Authentication);
+            }
+        };
         out.extend_from_slice(tag.as_slice());
         Ok(())
     }
@@ -197,10 +204,16 @@ impl DatagramTx {
         let aad = seq.to_be_bytes();
 
         pkt.prepend_header(&[opcode])?;
-        let tag = self
+        let tag = match self
             .cipher
             .encrypt_in_place_detached(&nonce_from_seq(seq), &aad, pkt.payload_mut())
-            .map_err(|_| CoreError::Authentication)?;
+        {
+            Ok(tag) => tag,
+            Err(_) => {
+                pkt.zeroize_payload();
+                return Err(CoreError::Authentication);
+            }
+        };
         pkt.prepend_header(&aad)?;
         let tag_bytes: [u8; 16] = tag.into();
         pkt.append_tag(&tag_bytes)?;
@@ -266,7 +279,67 @@ impl DatagramRx {
         let opcode = pkt.payload()[8];
         pkt.strip_header(9)?;
         pkt.strip_tail(MAC_LEN)?;
+        if opcode == E2E_DG_RENEW_OPCODE {
+            // Spec §1.4 & §6.7: Track decrypted renewal credential range so reuse/drop
+            // automatically wipes plaintext in place with zero heap allocations.
+            pkt.mark_payload_sensitive();
+        }
         Ok((seq, opcode))
+    }
+}
+
+/// Borrowed guard over a decrypted Stream E2E record stored in place inside a receive buffer.
+///
+/// When the record carries a credential-bearing renewal opcode (`e2e_st::ST_RENEW`), dropping
+/// this guard automatically zeroizes the decrypted plaintext slice in place before the receive
+/// buffer can be reused or dropped (Spec §1.4 & §6.7).
+pub struct OpenedStreamRecord<'a> {
+    opcode: u8,
+    body_len: usize,
+    plaintext_region: &'a mut [u8],
+    wipe_on_drop: bool,
+}
+
+#[allow(dead_code)]
+impl OpenedStreamRecord<'_> {
+    /// Returns the authenticated E2E Stream opcode.
+    #[inline]
+    #[must_use]
+    pub const fn opcode(&self) -> u8 {
+        self.opcode
+    }
+
+    /// Returns the decrypted record body slice (`0..=ST_MAX_BODY` bytes).
+    #[inline]
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        &self.plaintext_region[1..1 + self.body_len]
+    }
+
+    /// Returns `true` when this record carries sensitive renewal credential bytes that will be
+    /// zeroized in place when the guard drops.
+    #[inline]
+    #[must_use]
+    pub const fn is_sensitive(&self) -> bool {
+        self.wipe_on_drop
+    }
+
+    /// Copies the decrypted body into a [`Zeroizing<Vec<u8>>`] and immediately drops `self`,
+    /// wiping the original receive buffer slice if sensitive.
+    #[must_use]
+    pub fn into_zeroizing_body(self) -> Zeroizing<Vec<u8>> {
+        let out = Zeroizing::new(self.body().to_vec());
+        drop(self);
+        out
+    }
+}
+
+impl Drop for OpenedStreamRecord<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.wipe_on_drop {
+            self.plaintext_region.zeroize();
+        }
     }
 }
 
@@ -310,10 +383,17 @@ impl StreamCipher {
         let pt_start = out.len();
         out.push(opcode);
         out.extend_from_slice(body);
-        let tag = self
+        let tag = match self
             .cipher
             .encrypt_in_place_detached(&nonce_from_seq(seq), &aad, &mut out[pt_start..])
-            .map_err(|_| CoreError::Authentication)?;
+        {
+            Ok(tag) => tag,
+            Err(_) => {
+                out[pt_start..].zeroize();
+                out.clear();
+                return Err(CoreError::Authentication);
+            }
+        };
         out.extend_from_slice(tag.as_slice());
         Ok(())
     }
@@ -321,6 +401,8 @@ impl StreamCipher {
     /// Authenticates and decrypts a complete Stream E2E record in place (`record.len() == body_len + 19`).
     ///
     /// On success, returns `(opcode, body_len)` with the decrypted body stored at `record[3..3 + body_len]`.
+    /// Callers processing credential-bearing renewal records (`e2e_st::ST_RENEW`) SHOULD prefer
+    /// [`Self::open_record`] so the decrypted plaintext region is zeroized automatically on drop.
     pub fn open_in_place(&mut self, record: &mut [u8]) -> Result<(u8, usize), CoreError> {
         if record.len() < ST_OVERHEAD {
             return Err(CoreError::Malformed);
@@ -345,6 +427,23 @@ impl StreamCipher {
             .map_err(|_| CoreError::Authentication)?;
 
         Ok((record[2], body_len))
+    }
+
+    /// Authenticates and decrypts a complete Stream E2E record in place, returning an
+    /// [`OpenedStreamRecord`] guard that automatically zeroizes the decrypted plaintext slice
+    /// in `record` on drop when the record is a credential-bearing `e2e_st::ST_RENEW` (Spec §1.4).
+    pub fn open_record<'a>(
+        &mut self,
+        record: &'a mut [u8],
+    ) -> Result<OpenedStreamRecord<'a>, CoreError> {
+        let (opcode, body_len) = self.open_in_place(record)?;
+        let pt_end = 2 + 1 + body_len;
+        Ok(OpenedStreamRecord {
+            opcode,
+            body_len,
+            plaintext_region: &mut record[2..pt_end],
+            wipe_on_drop: opcode == E2E_ST_RENEW_OPCODE,
+        })
     }
 
     #[cfg(test)]
@@ -455,5 +554,62 @@ mod tests {
             assert_eq!(len, payload.len());
             assert_eq!(&scratch[3..3 + len], payload);
         }
+    }
+
+    #[test]
+    fn datagram_and_stream_e2e_renewal_wipe_decrypted_credentials_in_place() {
+        let key = [0x91u8; 32];
+        let secret = b"very-secret-renewal-credential-9876543210";
+        let mut renew_body = Vec::new();
+        renew_body.extend_from_slice(&1u64.to_be_bytes());
+        renew_body.extend_from_slice(secret);
+
+        // 1. Datagram E2E DG_RENEW: open marks PacketBuf sensitive; both zeroize_payload()
+        //    and reset() wipe decrypted bytes in place in the original backing storage.
+        let mut dg_tx = DatagramTx::new(&key);
+        let mut dg_rx = DatagramRx::new(&key);
+
+        let mut pkt1 = PacketBuf::from_payload(&renew_body);
+        dg_tx.seal(E2E_DG_RENEW_OPCODE, &mut pkt1).unwrap();
+        let (_seq1, op1) = dg_rx.open(&mut pkt1).unwrap();
+        assert_eq!(op1, E2E_DG_RENEW_OPCODE);
+        assert!(pkt1.has_sensitive_range());
+        assert_eq!(&pkt1.payload()[8..], secret);
+        pkt1.zeroize_payload();
+        assert!(
+            !pkt1.raw_backing_bytes().windows(secret.len()).any(|w| w == secret),
+            "credential bytes must be wiped from PacketBuf after zeroize_payload()"
+        );
+
+        let mut pkt2 = PacketBuf::from_payload(&renew_body);
+        dg_tx.seal(E2E_DG_RENEW_OPCODE, &mut pkt2).unwrap();
+        let (_seq2, op2) = dg_rx.open(&mut pkt2).unwrap();
+        assert_eq!(op2, E2E_DG_RENEW_OPCODE);
+        assert!(pkt2.has_sensitive_range());
+        pkt2.reset();
+        assert!(
+            !pkt2.raw_backing_bytes().windows(secret.len()).any(|w| w == secret),
+            "credential bytes must be wiped from PacketBuf on reset()"
+        );
+
+        // 2. Stream E2E ST_RENEW: open_record guard wipes decrypted plaintext slice in place on drop!
+        let mut st_tx = StreamCipher::new(&key);
+        let mut st_rx = StreamCipher::new(&key);
+        let mut record = Vec::new();
+        st_tx
+            .seal_into(E2E_ST_RENEW_OPCODE, &renew_body, &mut record)
+            .unwrap();
+        {
+            let opened = st_rx.open_record(&mut record).unwrap();
+            assert_eq!(opened.opcode(), E2E_ST_RENEW_OPCODE);
+            assert!(opened.is_sensitive());
+            assert_eq!(&opened.body()[8..], secret);
+            let copied = opened.into_zeroizing_body();
+            assert_eq!(&copied[8..], secret);
+        }
+        assert!(
+            record[2..3 + renew_body.len()].iter().all(|&b| b == 0),
+            "StreamCipher::open_record must zeroize decrypted ST_RENEW plaintext in place on drop"
+        );
     }
 }

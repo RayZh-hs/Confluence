@@ -129,6 +129,10 @@ pub(crate) async fn serve_datagram_destination(
                     }
                     return Err(lease.remaining().err().unwrap_or(CoreError::Expired));
                 }
+                e2e_dg::DG_RENEW => {
+                    pkt.zeroize_payload();
+                    continue;
+                }
                 _ => continue,
             }
         }

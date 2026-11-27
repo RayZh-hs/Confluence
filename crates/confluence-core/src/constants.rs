@@ -132,6 +132,12 @@ pub const ST_HOP_HEADER: usize = 4;
 /// Minimum Datagram E2E record length after stripping the 5-byte hop header (`8` seq + `1` type + `16` tag).
 pub const DG_E2E_MIN_LEN: usize = 25;
 
+/// Credential-bearing Datagram E2E renewal opcode (`e2e_dg::DG_RENEW`, Spec §5.8.1).
+pub(crate) const E2E_DG_RENEW_OPCODE: u8 = 0x07;
+
+/// Credential-bearing Stream E2E renewal opcode (`e2e_st::ST_RENEW`, Spec §5.8.2).
+pub(crate) const E2E_ST_RENEW_OPCODE: u8 = 0x14;
+
 /// Minimum decrypted setup plaintext length (`8` ts + `1` name_len + `1` name + `2` cred_len).
 pub const SETUP_PLAINTEXT_MIN: usize = 12;
 

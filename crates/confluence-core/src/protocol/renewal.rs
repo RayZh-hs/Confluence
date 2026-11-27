@@ -235,6 +235,9 @@ impl RenewalDriver {
             return CredentialFetchOutcome::Fatal(CoreError::Malformed);
         };
         s.fetching = false;
+        if now >= s.expires_at {
+            return CredentialFetchOutcome::Fatal(Self::expiry_error(slot));
+        }
 
         match result {
             Ok(cred) => {
@@ -260,10 +263,15 @@ impl RenewalDriver {
         }
     }
 
-    /// Applies an incoming `RENEW_OK(renewal_id, ttl)` ONLY if `slot.in_flight` matches `renewal_id`.
+    /// Applies an incoming `RENEW_OK(renewal_id, ttl)` ONLY if `slot` has not already expired
+    /// (`now < slot.expires_at`) and `slot.in_flight` matches `renewal_id` (Spec §6.7 Steps 4 & 6).
     ///
-    /// Returns `true` when accepted (caller updates local endpoint lease and increments
-    /// `lease_renewals_total`), or `false` when stale/mismatched and ignored.
+    /// Returns:
+    /// - `Err(Self::expiry_error(slot))` if `now >= slot.expires_at` (never reviving an expired slot
+    ///   even if the receive event is polled before the expiration timer),
+    /// - `Ok(true)` when accepted (caller updates local endpoint lease and increments
+    ///   `lease_renewals_total`),
+    /// - `Ok(false)` when stale/mismatched and ignored.
     pub fn on_ack(
         &mut self,
         slot: RenewalSlot,
@@ -271,24 +279,27 @@ impl RenewalDriver {
         ttl: Duration,
         now: MonotonicTime,
         rng: &mut impl RngCore,
-    ) -> bool {
+    ) -> Result<bool, CoreError> {
         let Some(s) = self.slot_mut(slot) else {
-            return false;
+            return Ok(false);
         };
+        if now >= s.expires_at {
+            return Err(Self::expiry_error(slot));
+        }
         let matches = s
             .in_flight
             .as_ref()
             .is_some_and(|&(in_flight_id, _)| in_flight_id == renewal_id);
         if !matches {
-            return false;
+            return Ok(false);
         }
         if let Some((id, cred)) = s.in_flight.take() {
             s.acknowledged = id;
             s.credential = cred;
             s.apply_ttl(ttl, now, rng);
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
@@ -459,11 +470,11 @@ mod tests {
         );
 
         // Wrong/stale renewal_id ACK ignored.
-        assert!(!drv.on_ack(RenewalSlot::Endpoint, 2, ttl, retry_dl, &mut rng));
+        assert_eq!(drv.on_ack(RenewalSlot::Endpoint, 2, ttl, retry_dl, &mut rng), Ok(false));
         // Matching ACK accepted.
-        assert!(drv.on_ack(RenewalSlot::Endpoint, 1, ttl, retry_dl, &mut rng));
+        assert_eq!(drv.on_ack(RenewalSlot::Endpoint, 1, ttl, retry_dl, &mut rng), Ok(true));
         // Late duplicate ACK for id = 1 ignored once completed.
-        assert!(!drv.on_ack(RenewalSlot::Endpoint, 1, ttl, retry_dl, &mut rng));
+        assert_eq!(drv.on_ack(RenewalSlot::Endpoint, 1, ttl, retry_dl, &mut rng), Ok(false));
 
         // Non-retryable credential error fails immediately.
         let next_ep_dl = retry_dl.saturating_add(Duration::from_secs(8));
@@ -503,5 +514,90 @@ mod tests {
         v.complete(2, true);
         // Older id = 1 now silently ignored.
         assert_eq!(v.classify(1), VerifierRenewalAction::Ignore);
+    }
+
+    #[test]
+    fn late_renewal_ack_at_or_after_expiry_never_revives_hop_or_endpoint() {
+        let mut rng = DeterministicRng(42);
+        let t0 = MonotonicTime::ZERO;
+        let ep_ttl = Duration::from_secs(20);
+        let hop_ttl = Duration::from_secs(10);
+        let mut drv = RenewalDriver::new(
+            Plane::Datagram,
+            ep_ttl,
+            Credential::from_slice(b"ep0").unwrap(),
+            vec![(hop_ttl, Credential::from_slice(b"hop0").unwrap())],
+            t0,
+            &mut rng,
+        );
+
+        // Trigger hop 0 renewal before its 10 s expiry.
+        let refresh_t = t0.saturating_add(Duration::from_secs(8));
+        let actions = drv.poll_actions(refresh_t, &mut rng);
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            RenewalAction::FetchCredential {
+                slot: RenewalSlot::Hop(0),
+                ..
+            }
+        )));
+        let fetched = drv.on_credential_fetched(
+            RenewalSlot::Hop(0),
+            Ok(Credential::from_slice(b"hop1").unwrap()),
+            refresh_t,
+            &mut rng,
+        );
+        assert!(matches!(
+            fetched,
+            CredentialFetchOutcome::Send {
+                slot: RenewalSlot::Hop(0),
+                renewal_id: 1,
+                ..
+            }
+        ));
+
+        // Deliver matching authenticated ACK at EXACTLY expires_at (before timer poll runs!).
+        let hop_expiry = t0.saturating_add(hop_ttl);
+        assert_eq!(
+            drv.on_ack(RenewalSlot::Hop(0), 1, hop_ttl, hop_expiry, &mut rng),
+            Err(CoreError::hop_rejected(0, CoreError::Expired))
+        );
+        // Slot MUST remain expired on subsequent poll (NOT revived!).
+        assert_eq!(
+            drv.poll_actions(hop_expiry, &mut rng),
+            vec![RenewalAction::Expired(RenewalSlot::Hop(0))]
+        );
+
+        // Same guarantee for Endpoint slot after its expiry.
+        let mut drv2 = RenewalDriver::new(
+            Plane::Stream,
+            Duration::from_secs(10),
+            Credential::from_slice(b"ep0").unwrap(),
+            vec![],
+            t0,
+            &mut rng,
+        );
+        let _ = drv2.poll_actions(t0.saturating_add(Duration::from_secs(8)), &mut rng);
+        let _ = drv2.on_credential_fetched(
+            RenewalSlot::Endpoint,
+            Ok(Credential::from_slice(b"ep1").unwrap()),
+            t0.saturating_add(Duration::from_secs(8)),
+            &mut rng,
+        );
+        let after_ep_expiry = t0.saturating_add(Duration::from_secs(10) + Duration::from_millis(1));
+        assert_eq!(
+            drv2.on_ack(
+                RenewalSlot::Endpoint,
+                1,
+                Duration::from_secs(10),
+                after_ep_expiry,
+                &mut rng
+            ),
+            Err(CoreError::Expired)
+        );
+        assert_eq!(
+            drv2.poll_actions(after_ep_expiry, &mut rng),
+            vec![RenewalAction::Expired(RenewalSlot::Endpoint)]
+        );
     }
 }

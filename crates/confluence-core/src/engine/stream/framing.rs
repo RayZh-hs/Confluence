@@ -7,6 +7,8 @@ use core::task::Poll;
 use core::time::Duration;
 use std::sync::Arc;
 
+use zeroize::Zeroizing;
+
 use crate::constants::{
     CLOSE_SEND_TIMEOUT, COOKIE_SIZE, ERR_SIZE, FWD_HEADER, HOP_ACK_SIZE, MAX_CONTROL,
     MAX_SETUP_SEGMENT, OK_SIZE, ST_HOP_HEADER, ST_OVERHEAD, STREAM_CHUNK,
@@ -19,7 +21,7 @@ use crate::runtime::sync::{Watch, WatchReceiver};
 use crate::runtime::{Clock, MonotonicTime, TaskSpawner};
 use crate::seam::channel::{MtuWatch, StreamRead, StreamReadExt, StreamWrite, StreamWriteExt};
 use crate::types::ScopeKid;
-use crate::wire::opcodes::outer;
+use crate::wire::opcodes::{e2e_st, outer};
 use crate::wire::setup::{
     DispatchPrefix, ForwardHeader, MODE_DEST, MODE_HOP, SetupCookieFrame, SetupErrFrame,
 };
@@ -335,7 +337,10 @@ pub(crate) enum InboundStreamFrame {
         body: [u8; MAX_CONTROL],
         len: usize,
     },
-    /// Authenticated, decrypted Stream E2E record.
+    /// Authenticated, decrypted credential-bearing `e2e::ST_RENEW` body stored in zeroizing memory
+    /// (the underlying receive buffer slice has already been wiped in place).
+    E2eRenew(Zeroizing<Vec<u8>>),
+    /// Authenticated, decrypted Stream E2E record (non-credential-bearing).
     E2eRecord { opcode: u8, body: Vec<u8> },
 }
 
@@ -376,7 +381,7 @@ impl StreamFrameReader {
     fn try_pop_e2e(
         &mut self,
         rx_cipher: &mut StreamCipher,
-    ) -> Result<Option<(u8, Vec<u8>)>, CoreError> {
+    ) -> Result<Option<InboundStreamFrame>, CoreError> {
         let avail = self.buffered_len();
         if avail < 2 {
             return Ok(None);
@@ -390,14 +395,23 @@ impl StreamFrameReader {
         }
         let start = self.e2e_pos;
         let end = start + rec_len;
-        let (opcode, dec_len) = rx_cipher.open_in_place(&mut self.e2e_buf[start..end])?;
-        let body = self.e2e_buf[start + 3..start + 3 + dec_len].to_vec();
+        let opened = rx_cipher.open_record(&mut self.e2e_buf[start..end])?;
+        let opcode = opened.opcode();
+        let frame = if opcode == e2e_st::ST_RENEW {
+            // Extracts body into Zeroizing<Vec<u8>> and immediately drops `opened`,
+            // zeroizing `self.e2e_buf[start + 2..start + 3 + body_len]` in place (Spec §1.4).
+            InboundStreamFrame::E2eRenew(opened.into_zeroizing_body())
+        } else {
+            let body = opened.body().to_vec();
+            drop(opened);
+            InboundStreamFrame::E2eRecord { opcode, body }
+        };
         self.e2e_pos = end;
         if self.e2e_pos == self.e2e_buf.len() {
             self.e2e_buf.clear();
             self.e2e_pos = 0;
         }
-        Ok(Some((opcode, body)))
+        Ok(Some(frame))
     }
 
     /// Reads the next complete hop control frame, decrypted E2E record, or clean EOF.
@@ -407,8 +421,8 @@ impl StreamFrameReader {
         rx_cipher: &mut StreamCipher,
     ) -> Result<InboundStreamFrame, CoreError> {
         loop {
-            if let Some((opcode, body)) = self.try_pop_e2e(rx_cipher)? {
-                return Ok(InboundStreamFrame::E2eRecord { opcode, body });
+            if let Some(frame) = self.try_pop_e2e(rx_cipher)? {
+                return Ok(frame);
             }
             self.compact_if_needed();
 
@@ -786,5 +800,73 @@ pub(crate) async fn sleep_paced(
         }
         Either::Right(Either::Left(err)) => Err(err),
         Either::Right(Either::Right(mtu)) => Err(CoreError::MtuTooSmall(mtu)),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::testing::{MemoryStreamPair, TestRuntime};
+    use crate::seam::channel::IntoStreamHalves;
+
+    #[test]
+    fn stream_frame_reader_wipes_e2e_renew_plaintext_in_receive_buffer() {
+        let rt = TestRuntime::new();
+        let pair = MemoryStreamPair::pair(16_384);
+        let (mut r, mut w) = {
+            let (_ra, wa) = pair.a.into_halves();
+            let (rb, _wb) = pair.b.into_halves();
+            (rb, wa)
+        };
+
+        let key = [0x44u8; 32];
+        let mut tx = StreamCipher::new(&key);
+        let mut rx = StreamCipher::new(&key);
+        let secret = b"stream-renew-secret-credential-xyz";
+        let mut renew_body = Vec::new();
+        renew_body.extend_from_slice(&1u64.to_be_bytes());
+        renew_body.extend_from_slice(secret);
+
+        let mut rec1 = Vec::new();
+        tx.seal_into(e2e_st::ST_RENEW, &renew_body, &mut rec1).unwrap();
+        // Append a second record in the SAME ST_DATA chunk so `e2e_buf` is NOT cleared immediately!
+        let mut rec2 = Vec::new();
+        tx.seal_into(e2e_st::ST_DATA, b"trailing-app-data", &mut rec2).unwrap();
+        let mut combined = rec1;
+        combined.extend_from_slice(&rec2);
+
+        let mut frame_reader = StreamFrameReader::new();
+        let res = rt.spawner.try_block_on(async {
+            let mut scratch = Vec::new();
+            write_st_data_chunks(&mut w, &combined, 16_384, &*rt.clock, &mut scratch)
+                .await
+                .unwrap();
+            let frame1 = frame_reader.next_frame(&mut r, &mut rx).await.unwrap();
+            match frame1 {
+                InboundStreamFrame::E2eRenew(body) => {
+                    assert_eq!(&body[8..], secret);
+                }
+                _ => panic!("expected E2eRenew frame"),
+            }
+            // Even while trailing bytes remain in `e2e_buf`, the decrypted ST_RENEW plaintext
+            // in `frame_reader.e2e_buf` MUST ALREADY be zeroed in place!
+            assert!(
+                !frame_reader
+                    .e2e_buf
+                    .windows(secret.len())
+                    .any(|win| win == secret),
+                "decrypted ST_RENEW credential leaked in StreamFrameReader::e2e_buf"
+            );
+            let frame2 = frame_reader.next_frame(&mut r, &mut rx).await.unwrap();
+            match frame2 {
+                InboundStreamFrame::E2eRecord { opcode, body } => {
+                    assert_eq!(opcode, e2e_st::ST_DATA);
+                    assert_eq!(body, b"trailing-app-data");
+                }
+                _ => panic!("expected trailing ST_DATA"),
+            }
+        });
+        assert_eq!(res, Some(()));
     }
 }

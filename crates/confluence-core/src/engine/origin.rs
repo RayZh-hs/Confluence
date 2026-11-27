@@ -201,6 +201,7 @@ impl StagedStream {
                         Err(CoreError::Authentication)
                     }
                 }
+                InboundStreamFrame::E2eRenew(_) => Err(CoreError::Malformed),
                 InboundStreamFrame::E2eRecord { opcode, body } => {
                     if !body.is_empty() {
                         return Err(CoreError::Malformed);

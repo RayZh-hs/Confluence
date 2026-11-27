@@ -614,7 +614,7 @@ pub(crate) async fn wait_mtu_below_floor(
     watch: &mut crate::seam::channel::MtuWatch,
     floor: u16,
 ) -> u16 {
-    let cur = watch.current();
+    let cur = watch.sample();
     if cur < floor {
         return cur;
     }

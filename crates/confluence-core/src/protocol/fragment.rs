@@ -213,9 +213,7 @@ impl FragmentReassembler {
         let mut freed = 0usize;
         self.active.retain(|_, entry| {
             if entry.buf.is_some() && entry.expires <= now {
-                if let Some(ref b) = entry.buf {
-                    freed += b.len();
-                }
+                freed = freed.saturating_add(entry.total);
                 false
             } else {
                 true
@@ -286,7 +284,9 @@ impl FragmentReassembler {
             let full_mask = ((1u16 << u16::from(entry.count)) - 1) as u8;
             if entry.received_mask == full_mask {
                 if let Some(wire) = entry.buf.take() {
-                    self.allocated_bytes = self.allocated_bytes.saturating_sub(wire.len());
+                    // Keep `entry.total` charged against `allocated_bytes` (`MAX_SETUP`) while
+                    // the detached flight's `FragmentReceipt` is outstanding during authentication;
+                    // `acknowledge` or `abandon` releases `removed.total` exactly once.
                     return FeedOutcome::Complete { wire, key };
                 }
             }
@@ -352,13 +352,12 @@ impl FragmentReassembler {
         FeedOutcome::NeedMore
     }
 
-    /// Commits a post-authentication fragment receipt: frees active slot, inserts into the
-    /// bounded 32-entry FIFO `completed` cache, and returns the `SETUP_FRAG_ACK` to send.
+    /// Commits a post-authentication fragment receipt: frees active slot and its reserved byte
+    /// budget exactly once, inserts into the bounded 32-entry FIFO `completed` cache, and returns
+    /// the `SETUP_FRAG_ACK` to send.
     pub fn acknowledge(&mut self, key: FragmentKey, now: MonotonicTime) -> SetupFragAck {
         if let Some(removed) = self.active.remove(&key) {
-            if let Some(b) = removed.buf {
-                self.allocated_bytes = self.allocated_bytes.saturating_sub(b.len());
-            }
+            self.allocated_bytes = self.allocated_bytes.saturating_sub(removed.total);
         }
         self.expire(now);
         if self.completed.len() >= FRAG_MAX_COMPLETED {
@@ -373,12 +372,11 @@ impl FragmentReassembler {
     }
 
     /// Abandons a reassembled flight that failed cookie re-check or `Responder::authenticate`:
-    /// removes the reserved active slot WITHOUT adding to `completed` and WITHOUT emitting ACK.
+    /// removes the reserved active slot and releases its byte budget exactly once WITHOUT adding
+    /// to `completed` and WITHOUT emitting ACK.
     pub fn abandon(&mut self, key: FragmentKey) {
         if let Some(removed) = self.active.remove(&key) {
-            if let Some(b) = removed.buf {
-                self.allocated_bytes = self.allocated_bytes.saturating_sub(b.len());
-            }
+            self.allocated_bytes = self.allocated_bytes.saturating_sub(removed.total);
         }
     }
 
@@ -559,18 +557,20 @@ mod tests {
         }
         let (reassembled, key) = completed.unwrap();
         assert_eq!(reassembled, wire);
-        // Active slot remains reserved while authenticating, with 0 allocated bytes, and does NOT expire mid-auth!
+        // Active slot and byte budget remain reserved while authenticating and do NOT expire mid-auth!
         reasm
             .lock()
             .unwrap()
             .expire(t0.saturating_add(Duration::from_secs(10)));
         assert_eq!(reasm.lock().unwrap().active_count(), 1);
+        assert_eq!(reasm.lock().unwrap().allocated_bytes(), wire.len());
 
-        // Acknowledge receipt -> emits SETUP_FRAG_ACK and moves into completed cache.
+        // Acknowledge receipt -> emits SETUP_FRAG_ACK, releases byte budget, and moves into completed cache.
         let receipt = FragmentReceipt::new(Arc::clone(&reasm), key);
         let ack = receipt.acknowledge(t0).unwrap();
         assert!(burst.on_ack(&ack));
         assert_eq!(reasm.lock().unwrap().active_count(), 0);
+        assert_eq!(reasm.lock().unwrap().allocated_bytes(), 0);
         assert_eq!(reasm.lock().unwrap().completed_count(), 1);
 
         // Duplicate frag 0 triggers ReAck without re-running setup.
@@ -604,8 +604,107 @@ mod tests {
             }
         }
         let receipt = FragmentReceipt::new(Arc::clone(&reasm), key.unwrap());
-        drop(receipt); // Auth failed or cookie re-challenged -> no ACK, not in completed!
+        assert_eq!(reasm.lock().unwrap().allocated_bytes(), wire.len());
+        drop(receipt); // Auth failed or cookie re-challenged -> no ACK, not in completed, bytes released!
         assert_eq!(reasm.lock().unwrap().active_count(), 0);
+        assert_eq!(reasm.lock().unwrap().allocated_bytes(), 0);
         assert_eq!(reasm.lock().unwrap().completed_count(), 0);
+    }
+
+    #[test]
+    fn detached_authenticating_flights_stay_charged_against_max_setup() {
+        // Exact L03-09 scenario: link MTU = 1232 (stride = 1216, max 8 frags = 9728 B).
+        // Craft ~9000-byte flights that fit in 8 fragments so 15 flights exceed MAX_SETUP (131_086)
+        // even though active_count (14) < FRAG_MAX_ACTIVE (16).
+        let cid0 = Cid::from_parts(1, 1).unwrap();
+        let (_kp, sample_wire) = build_large_flight(29, cid0);
+        let stride = 1232usize - FRAG_HEADER;
+        assert!(
+            sample_wire.len() > 8_800 && sample_wire.len() <= stride * MAX_FRAGS,
+            "expected ~9000B flight fitting in <= 8 fragments, got {} bytes",
+            sample_wire.len()
+        );
+        let fit_count = MAX_SETUP / sample_wire.len();
+        assert!(
+            fit_count < FRAG_MAX_ACTIVE,
+            "byte cap must bind before 16-active cap (fit_count = {fit_count}, wire = {})",
+            sample_wire.len()
+        );
+
+        let reasm = Arc::new(Mutex::new(FragmentReassembler::new()));
+        let t0 = MonotonicTime::ZERO;
+        let mut receipts = Vec::with_capacity(fit_count);
+
+        for i in 0..fit_count {
+            let cid = Cid::from_parts(1, (i + 1) as u32).unwrap();
+            let mut wire = sample_wire.clone();
+            wire[4..8].copy_from_slice(&cid.raw().to_be_bytes());
+            let burst = match FragmentBurst::prepare_with_id(&wire, 1232, cid, i as u64 + 1).unwrap() {
+                PreparedFlight::Fragmented(b) => b,
+                PreparedFlight::Single(_) => panic!("expected fragmented flight"),
+            };
+            let mut key = None;
+            for f in burst.frames() {
+                if let FeedOutcome::Complete { key: k, .. } =
+                    reasm.lock().unwrap().feed(f.payload(), t0, |_, _, _| OpeningVerdict::Verified)
+                {
+                    key = Some(k);
+                }
+            }
+            receipts.push(FragmentReceipt::new(Arc::clone(&reasm), key.unwrap()));
+        }
+
+        // All detached in-authentication flights MUST stay charged against MAX_SETUP!
+        assert_eq!(reasm.lock().unwrap().active_count(), fit_count);
+        assert_eq!(
+            reasm.lock().unwrap().allocated_bytes(),
+            fit_count * sample_wire.len()
+        );
+
+        // Next flight pushes total > MAX_SETUP -> MUST be rejected while receipts remain live!
+        let extra_cid = Cid::from_parts(1, 99).unwrap();
+        let mut extra_wire = sample_wire.clone();
+        extra_wire[4..8].copy_from_slice(&extra_cid.raw().to_be_bytes());
+        let extra_burst =
+            match FragmentBurst::prepare_with_id(&extra_wire, 1232, extra_cid, 999).unwrap() {
+                PreparedFlight::Fragmented(b) => b,
+                PreparedFlight::Single(_) => panic!("expected fragmented flight"),
+            };
+        assert_eq!(
+            reasm
+                .lock()
+                .unwrap()
+                .feed(extra_burst.frames()[0].payload(), t0, |_, _, _| OpeningVerdict::Verified),
+            FeedOutcome::Ignore
+        );
+        assert_eq!(reasm.lock().unwrap().active_count(), fit_count);
+
+        // Acknowledging one receipt releases its exact byte budget once -> extra flight now admitted!
+        let first = receipts.remove(0);
+        assert!(first.acknowledge(t0).is_some());
+        assert_eq!(
+            reasm.lock().unwrap().allocated_bytes(),
+            (fit_count - 1) * sample_wire.len()
+        );
+        assert_eq!(
+            reasm
+                .lock()
+                .unwrap()
+                .feed(extra_burst.frames()[0].payload(), t0, |_, _, _| OpeningVerdict::Verified),
+            FeedOutcome::NeedMore
+        );
+        assert_eq!(
+            reasm.lock().unwrap().allocated_bytes(),
+            fit_count * sample_wire.len()
+        );
+
+        // Dropping all remaining receipts (abandon) + expiring the incomplete flight returns budget to exact 0.
+        drop(receipts);
+        reasm
+            .lock()
+            .unwrap()
+            .expire(t0.saturating_add(SETUP_TIMEOUT));
+        assert_eq!(reasm.lock().unwrap().active_count(), 0);
+        assert_eq!(reasm.lock().unwrap().allocated_bytes(), 0);
     }
 }

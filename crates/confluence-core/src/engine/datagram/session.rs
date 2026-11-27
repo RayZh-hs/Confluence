@@ -304,7 +304,7 @@ async fn run_datagram_session(
     // Startup live MtuWatch sample catching link shifts between SETUP_OK and confirm (Spec §6.6).
     let startup_err: Option<CoreError> = {
         let now = clock.now();
-        let live_local = mtu_watch.current();
+        let live_local = mtu_watch.sample();
         match &mut role {
             DatagramSessionRole::Origin(orig) => match orig.path_mtu.update_local(live_local) {
                 MtuChange::BelowFloor(m) => Some(CoreError::MtuTooSmall(m)),
@@ -603,52 +603,69 @@ async fn run_datagram_session(
                                 }
                             }
                             e2e_dg::DG_RENEW => {
-                                let DatagramSessionRole::Destination(dest) = &role else {
-                                    continue;
-                                };
-                                let Ok((id, cred)) = decode_renew_payload(pkt.payload()) else {
-                                    continue;
-                                };
-                                match dest_verifier.classify(id) {
-                                    VerifierRenewalAction::Malformed
-                                    | VerifierRenewalAction::Ignore => {}
-                                    VerifierRenewalAction::ReplyIdempotent(ack_id) => {
-                                        let rem = match lease.remaining() {
-                                            Ok(d) => d,
-                                            Err(err) => break err,
-                                        };
-                                        let rem_ms = u64::try_from(rem.as_millis())
-                                            .unwrap_or(u64::MAX)
-                                            .max(1);
-                                        let _ = send_e2e_control(
-                                            &binding,
-                                            remote_cid,
-                                            &mut tx,
-                                            e2e_dg::DG_RENEW_OK,
-                                            &encode_renew_ok_payload(ack_id, rem_ms),
-                                        );
-                                    }
-                                    VerifierRenewalAction::AuthorizeNew(new_id) => {
-                                        let Ok(cred_owned) = Credential::from_slice(cred) else {
-                                            continue;
-                                        };
-                                        let scope_c = Arc::clone(&scope);
-                                        let ep_name = dest.endpoint.clone();
-                                        dest_auth_fut = Some(Box::pin(async move {
-                                            let res = scope_c
-                                                .auth_gate
-                                                .authorize(AuthRequest {
-                                                    peer,
-                                                    target: TargetRef::Endpoint {
-                                                        name: &ep_name,
-                                                        plane: Plane::Datagram,
-                                                    },
-                                                    credential: cred_owned.as_bytes(),
-                                                    is_renewal: true,
+                                let renew_plan = if let DatagramSessionRole::Destination(dest) =
+                                    &role
+                                {
+                                    match decode_renew_payload(pkt.payload()) {
+                                        Ok((id, cred)) => match dest_verifier.classify(id) {
+                                            VerifierRenewalAction::AuthorizeNew(new_id) => {
+                                                Credential::from_slice(cred).ok().map(|c| {
+                                                    (
+                                                        VerifierRenewalAction::AuthorizeNew(new_id),
+                                                        Some((c, dest.endpoint.clone())),
+                                                    )
                                                 })
-                                                .await;
-                                            (new_id, res)
-                                        }));
+                                            }
+                                            other => Some((other, None)),
+                                        },
+                                        Err(_) => None,
+                                    }
+                                } else {
+                                    None
+                                };
+                                // Wipe decrypted renewal credential bytes in place immediately
+                                // before reuse or drop (Spec §1.4 & §6.7).
+                                pkt.zeroize_payload();
+                                if let Some((action, auth_args)) = renew_plan {
+                                    match action {
+                                        VerifierRenewalAction::Malformed
+                                        | VerifierRenewalAction::Ignore => {}
+                                        VerifierRenewalAction::ReplyIdempotent(ack_id) => {
+                                            let rem = match lease.remaining() {
+                                                Ok(d) => d,
+                                                Err(err) => break err,
+                                            };
+                                            let rem_ms = u64::try_from(rem.as_millis())
+                                                .unwrap_or(u64::MAX)
+                                                .max(1);
+                                            let _ = send_e2e_control(
+                                                &binding,
+                                                remote_cid,
+                                                &mut tx,
+                                                e2e_dg::DG_RENEW_OK,
+                                                &encode_renew_ok_payload(ack_id, rem_ms),
+                                            );
+                                        }
+                                        VerifierRenewalAction::AuthorizeNew(new_id) => {
+                                            if let Some((cred_owned, ep_name)) = auth_args {
+                                                let scope_c = Arc::clone(&scope);
+                                                dest_auth_fut = Some(Box::pin(async move {
+                                                    let res = scope_c
+                                                        .auth_gate
+                                                        .authorize(AuthRequest {
+                                                            peer,
+                                                            target: TargetRef::Endpoint {
+                                                                name: &ep_name,
+                                                                plane: Plane::Datagram,
+                                                            },
+                                                            credential: cred_owned.as_bytes(),
+                                                            is_renewal: true,
+                                                        })
+                                                        .await;
+                                                    (new_id, res)
+                                                }));
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -660,22 +677,34 @@ async fn run_datagram_session(
                                     Ok(v) => v,
                                     Err(err) => break err,
                                 };
-                                if orig.renewals.on_ack(
+                                match orig.renewals.on_ack(
                                     RenewalSlot::Endpoint,
                                     id,
                                     ttl,
                                     clock.now(),
                                     &mut OsRng,
                                 ) {
-                                    if let Err(err) = lease.renew_ttl_only(ttl, MAX_WIRE_LEASE_TTL)
-                                    {
+                                    Ok(true) => {
+                                        if let Err(err) =
+                                            lease.renew_ttl_only(ttl, MAX_WIRE_LEASE_TTL)
+                                        {
+                                            break err;
+                                        }
+                                        scope
+                                            .metrics
+                                            .auth_endpoint
+                                            .renewed
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Ok(false) => {}
+                                    Err(err) => {
+                                        scope
+                                            .metrics
+                                            .auth_endpoint
+                                            .renewal_failures
+                                            .fetch_add(1, Ordering::Relaxed);
                                         break err;
                                     }
-                                    scope
-                                        .metrics
-                                        .auth_endpoint
-                                        .renewed
-                                        .fetch_add(1, Ordering::Relaxed);
                                 }
                             }
                             _ => {
@@ -757,18 +786,29 @@ async fn run_datagram_session(
                                     Ok(v) => v,
                                     Err(err) => break err,
                                 };
-                                if orig.renewals.on_ack(
+                                match orig.renewals.on_ack(
                                     RenewalSlot::Hop(dist),
                                     id,
                                     ttl,
                                     clock.now(),
                                     &mut OsRng,
                                 ) {
-                                    scope
-                                        .metrics
-                                        .auth_transit
-                                        .renewed
-                                        .fetch_add(1, Ordering::Relaxed);
+                                    Ok(true) => {
+                                        scope
+                                            .metrics
+                                            .auth_transit
+                                            .renewed
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Ok(false) => {}
+                                    Err(err) => {
+                                        scope
+                                            .metrics
+                                            .auth_transit
+                                            .renewal_failures
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        break err;
+                                    }
                                 }
                             }
                             _ => {}
@@ -1172,7 +1212,10 @@ pub(crate) fn build_e2e_packet(
     remote_cid: Cid,
 ) -> Result<PacketBuf, CoreError> {
     let mut pkt = PacketBuf::from_payload(body);
-    tx.seal(opcode, &mut pkt)?;
+    if let Err(err) = tx.seal(opcode, &mut pkt) {
+        pkt.zeroize_payload();
+        return Err(err);
+    }
     prepend_dg_data_header(&mut pkt, remote_cid)?;
     Ok(pkt)
 }

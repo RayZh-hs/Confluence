@@ -226,6 +226,32 @@ fn zero_alloc_datagram_hot_path_all_sizes_and_stable_pointer() {
 }
 
 #[test]
+fn zero_alloc_datagram_renewal_open_and_in_place_wipe() {
+    let key = [0x4Au8; 32];
+    let mut tx = DatagramTx::new(&key);
+    let mut rx = DatagramRx::new(&key);
+    let mut body = Vec::with_capacity(8 + 64);
+    body.extend_from_slice(&1u64.to_be_bytes());
+    body.extend_from_slice(&[0x5A; 64]);
+    let mut pkt = PacketBuf::from_payload(&body);
+    let orig_ptr = pkt.payload().as_ptr();
+
+    let (allocs, deallocs, (seq, op)) = measure_allocs(|| {
+        tx.seal(e2e_dg::DG_RENEW, &mut pkt).unwrap();
+        let opened = rx.open(&mut pkt).unwrap();
+        pkt.zeroize_range(8..24);
+        pkt.zeroize_payload();
+        pkt.reset();
+        opened
+    });
+    assert_eq!((allocs, deallocs), (0, 0));
+    assert_eq!(seq, 0);
+    assert_eq!(op, e2e_dg::DG_RENEW);
+    assert_eq!(pkt.payload().as_ptr(), orig_ptr);
+    assert!(pkt.is_empty());
+}
+
+#[test]
 fn zero_alloc_invalid_mac1_and_unknown_scope_kid_rejection() {
     let origin = ScopeKeypair::generate();
     let dest = ScopeKeypair::generate();
@@ -947,7 +973,10 @@ fn mtu_reporter_renewal_driver_and_trust_enforcement_conformance() {
     assert_eq!(verifier.classify(1), VerifierRenewalAction::AuthorizeNew(1));
     verifier.complete(1, true);
     assert_eq!(verifier.classify(1), VerifierRenewalAction::ReplyIdempotent(1));
-    assert!(drv.on_ack(first_slot, 1, Duration::from_secs(10), rt.clock.now(), &mut rng));
+    assert_eq!(
+        drv.on_ack(first_slot, 1, Duration::from_secs(10), rt.clock.now(), &mut rng),
+        Ok(true)
+    );
 
     // AuthGate + LeaseHandle + IntersectAuthorizer + PublishRegistry + AuthEpochTable overflow.
     let metrics = Arc::new(ScopeMetrics::new());

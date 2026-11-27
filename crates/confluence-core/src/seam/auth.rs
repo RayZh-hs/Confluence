@@ -18,7 +18,7 @@ use crate::types::{Credential, Direction, PublicKey, TargetRef};
 // ---------------------------------------------------------------------------
 
 /// Context supplied to [`CredentialProvider::credential`] during setup or in-band lease renewal.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct CredentialRequest<'a> {
     /// Public key of the verifier (Destination or intermediate Transit hop) receiving the credential.
     pub verifier: PublicKey,
@@ -34,6 +34,20 @@ pub struct CredentialRequest<'a> {
     pub is_refresh: bool,
     /// Last acknowledged credential bytes for this verifier (`&[]` on initial setup).
     pub prior: &'a [u8],
+}
+
+impl fmt::Debug for CredentialRequest<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CredentialRequest")
+            .field("verifier", &self.verifier)
+            .field("target", &self.target)
+            .field("destination", &self.destination)
+            .field("endpoint", &self.endpoint)
+            .field("path_id", &self.path_id)
+            .field("is_refresh", &self.is_refresh)
+            .field("prior_len", &self.prior.len())
+            .finish()
+    }
 }
 
 /// Out-of-core credential acquisition hook (Seam 3A).
@@ -382,24 +396,36 @@ impl fmt::Debug for Lease {
     }
 }
 
+/// Atomically committed lease data-plane gate and verified application claims snapshot (Spec §6.7 & §7.3).
+///
+/// Published as a single versioned unit inside `Watch<Arc<LeaseSnapshot>>` so `TrafficGateCache`
+/// and `SessionAuth` can never observe a split renewal state across gate and claims.
+pub(crate) struct LeaseSnapshot {
+    pub(crate) gate: Option<Arc<dyn TrafficGate>>,
+    pub(crate) extensions: AuthExtensions,
+}
+
 /// Live verified identity and claims handle passed to Endpoint and Transit handlers (Seam 4).
 ///
 /// Automatically reflects updated [`AuthExtensions`] whenever an in-band lease renewal succeeds.
 #[derive(Clone)]
 pub struct SessionAuth {
     peer: PublicKey,
-    rx: WatchReceiver<AuthExtensions>,
+    rx: WatchReceiver<Arc<LeaseSnapshot>>,
 }
 
 impl SessionAuth {
     /// Creates a static `SessionAuth` snapshot (useful for testing or standalone handlers).
     #[must_use]
     pub fn new(peer: PublicKey, extensions: AuthExtensions) -> Self {
-        let (_tx, rx) = Watch::new(extensions);
+        let (_tx, rx) = Watch::new(Arc::new(LeaseSnapshot {
+            gate: None,
+            extensions,
+        }));
         Self { peer, rx }
     }
 
-    pub(crate) fn from_watch(peer: PublicKey, rx: WatchReceiver<AuthExtensions>) -> Self {
+    pub(crate) fn from_watch(peer: PublicKey, rx: WatchReceiver<Arc<LeaseSnapshot>>) -> Self {
         Self { peer, rx }
     }
 
@@ -412,13 +438,13 @@ impl SessionAuth {
     /// Returns the latest verified [`AuthExtensions`] snapshot in $O(1)$.
     #[must_use]
     pub fn extensions(&self) -> AuthExtensions {
-        self.rx.borrow_cloned()
+        self.rx.borrow_with(|snap| snap.extensions.clone())
     }
 
     /// Looks up a typed claim `T` from the latest verified [`AuthExtensions`].
     #[must_use]
     pub fn context<T: Send + Sync + 'static>(&self) -> Option<Arc<T>> {
-        self.rx.borrow_with(|ext| ext.get::<T>())
+        self.rx.borrow_with(|snap| snap.extensions.get::<T>())
     }
 
     /// Waits for the next live [`AuthExtensions`] update published by an in-band lease renewal.
@@ -458,5 +484,43 @@ pub struct DenyAllAuthorizer;
 impl Authorizer for DenyAllAuthorizer {
     fn authorize<'a>(&'a self, _req: AuthRequest<'a>) -> BoxFuture<'a, Result<Lease, AuthDenied>> {
         Box::pin(async { Err(AuthDenied::Denied) })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::types::Plane;
+
+    #[test]
+    fn credential_request_debug_redacts_prior_bytes() {
+        let secret = b"super-secret-prior-token";
+        let req = CredentialRequest {
+            verifier: PublicKey::from_bytes([1u8; 32]),
+            target: TargetRef::Endpoint {
+                name: "echo",
+                plane: Plane::Stream,
+            },
+            destination: PublicKey::from_bytes([2u8; 32]),
+            endpoint: "echo",
+            path_id: 7,
+            is_refresh: true,
+            prior: secret,
+        };
+        let rendered = format!("{req:?}");
+        assert!(
+            rendered.contains(&format!("prior_len: {}", secret.len())),
+            "Debug output must include prior_len, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("super-secret"),
+            "Debug output must not leak raw prior bytes: {rendered}"
+        );
+        // Ensure raw byte slice values (e.g. `115, 117, 112`) are not formatted either.
+        assert!(
+            !rendered.contains("115, 117, 112"),
+            "Debug output must not emit raw prior byte values: {rendered}"
+        );
     }
 }

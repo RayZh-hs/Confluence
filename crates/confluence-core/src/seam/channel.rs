@@ -38,8 +38,7 @@ impl MtuSender {
     /// Subscribes a new [`MtuWatch`] starting at the current MTU value.
     #[must_use]
     pub fn subscribe(&self) -> MtuWatch {
-        let rx = self.tx.subscribe();
-        let current = rx.borrow_cloned();
+        let (rx, current) = self.tx.subscribe_with_value();
         MtuWatch {
             source: MtuSource::Dynamic(rx),
             overhead: 0,
@@ -115,10 +114,30 @@ impl MtuWatch {
         if reduced < cap { reduced } else { cap }
     }
 
-    /// Returns the current transformed effective MTU without blocking.
+    /// Returns the current transformed effective MTU without blocking or advancing this watch's
+    /// observation cursor.
+    ///
+    /// Workers that read an initial MTU before awaiting [`Self::changed`] SHOULD use
+    /// [`Self::sample`] so the watch cursor and baseline stay synchronized.
     #[must_use]
     pub fn current(&self) -> u16 {
         Self::apply(self.raw_current(), self.overhead, self.cap)
+    }
+
+    /// Atomically samples the current transformed effective MTU AND synchronizes this watch's
+    /// observation baseline and underlying watch cursor.
+    ///
+    /// Subsequent updates away from the returned value (including drops back to an earlier value
+    /// that was present before sampling) are guaranteed to wake [`Self::changed`].
+    #[must_use]
+    pub fn sample(&mut self) -> u16 {
+        let raw = match &mut self.source {
+            MtuSource::Fixed(v) => *v,
+            MtuSource::Dynamic(rx) => rx.borrow_and_mark_seen(),
+        };
+        let effective = Self::apply(raw, self.overhead, self.cap);
+        self.seen = effective;
+        effective
     }
 
     /// Returns a derived `MtuWatch` subtracting `extra` wrapper framing bytes (saturating at `0`).
@@ -129,9 +148,16 @@ impl MtuWatch {
     pub fn with_overhead(&self, extra: u16) -> Self {
         let overhead = self.overhead.saturating_add(extra);
         let cap = self.cap.saturating_sub(extra);
-        let seen = Self::apply(self.raw_current(), overhead, cap);
+        let (source, seen) = match &self.source {
+            MtuSource::Fixed(v) => (MtuSource::Fixed(*v), Self::apply(*v, overhead, cap)),
+            MtuSource::Dynamic(rx) => {
+                let mut cloned = rx.clone();
+                let raw = cloned.borrow_and_mark_seen();
+                (MtuSource::Dynamic(cloned), Self::apply(raw, overhead, cap))
+            }
+        };
         Self {
-            source: self.source.clone(),
+            source,
             overhead,
             cap,
             seen,
@@ -142,9 +168,19 @@ impl MtuWatch {
     #[must_use]
     pub fn with_cap(&self, max: u16) -> Self {
         let cap = self.cap.min(max);
-        let seen = Self::apply(self.raw_current(), self.overhead, cap);
+        let (source, seen) = match &self.source {
+            MtuSource::Fixed(v) => (MtuSource::Fixed(*v), Self::apply(*v, self.overhead, cap)),
+            MtuSource::Dynamic(rx) => {
+                let mut cloned = rx.clone();
+                let raw = cloned.borrow_and_mark_seen();
+                (
+                    MtuSource::Dynamic(cloned),
+                    Self::apply(raw, self.overhead, cap),
+                )
+            }
+        };
         Self {
-            source: self.source.clone(),
+            source,
             overhead: self.overhead,
             cap,
             seen,
@@ -159,17 +195,17 @@ impl MtuWatch {
 
     /// Waits for the transformed effective MTU to change from the last observed value.
     ///
-    /// Returns `None` for fixed watches or once all [`MtuSender`] handles have been dropped.
+    /// Reads the watch value and consumes its version atomically so concurrent rapid updates
+    /// cannot be missed. Returns `None` for fixed watches or once all [`MtuSender`] handles have
+    /// been dropped.
     pub async fn changed(&mut self) -> Option<u16> {
         let rx = match &mut self.source {
             MtuSource::Fixed(_) => return None,
             MtuSource::Dynamic(rx) => rx,
         };
         loop {
-            if !rx.changed().await {
-                return None;
-            }
-            let next = Self::apply(rx.borrow_cloned(), self.overhead, self.cap);
+            let raw = rx.changed_value().await?;
+            let next = Self::apply(raw, self.overhead, self.cap);
             if next != self.seen {
                 self.seen = next;
                 return Some(next);
@@ -876,6 +912,29 @@ mod tests {
         // Fixed watch returns None immediately.
         let mut fixed = MtuWatch::fixed(1232);
         assert_eq!(spawner.try_block_on(fixed.changed()), Some(None));
+    }
+
+    #[test]
+    fn mtu_watch_sample_synchronizes_baseline_on_1100_1400_1100_drop() {
+        let spawner = TestSpawner::new();
+
+        // Exact L03-08 scenario: create at 1100, publish 1400, sample 1400 at startup
+        // (against floor 1152), then drop back to 1100 before polling changed().
+        let (tx, mut watch) = MtuWatch::channel(1100);
+        tx.set(1400);
+        assert_eq!(watch.sample(), 1400);
+
+        // Drop back to original 1100 BEFORE changed() is polled -> MUST NOT be suppressed!
+        tx.set(1100);
+        assert_eq!(spawner.try_block_on(watch.changed()), Some(Some(1100)));
+
+        // Verify with composed overhead/cap wrapper too.
+        let (tx2, base2) = MtuWatch::channel(1120);
+        tx2.set(1420);
+        let mut wrapped = base2.with_overhead(20); // initialized at 1400
+        assert_eq!(wrapped.sample(), 1400);
+        tx2.set(1120); // effective 1100
+        assert_eq!(spawner.try_block_on(wrapped.changed()), Some(Some(1100)));
     }
 
     #[test]

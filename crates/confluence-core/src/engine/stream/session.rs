@@ -12,6 +12,7 @@ use std::sync::atomic::Ordering;
 use futures_core::Stream as FuturesStream;
 use futures_util::stream::FuturesUnordered;
 use rand_core::OsRng;
+use zeroize::Zeroizing;
 
 use crate::constants::{
     CREDENTIAL_MAX, MAX_WIRE_LEASE_TTL, ST_OVERHEAD, STREAM_CHUNK,
@@ -542,7 +543,7 @@ enum InboundCtrlMsg {
         body: [u8; crate::constants::MAX_CONTROL],
         len: usize,
     },
-    E2eRenew(Vec<u8>),
+    E2eRenew(Zeroizing<Vec<u8>>),
     E2eRenewOk(Vec<u8>),
     ReadError(CoreError),
 }
@@ -666,6 +667,11 @@ async fn run_stream_session(
                             break;
                         }
                     }
+                    Ok(InboundStreamFrame::E2eRenew(body)) => {
+                        if ctrl_tx.send(InboundCtrlMsg::E2eRenew(body)).await.is_err() {
+                            break;
+                        }
+                    }
                     Ok(InboundStreamFrame::E2eRecord { opcode, body }) => match opcode {
                         e2e_st::ST_DATA => {
                             if data_tx.send(InboundDataMsg::Data(body)).await.is_err() {
@@ -684,7 +690,11 @@ async fn run_stream_session(
                             }
                         }
                         e2e_st::ST_RENEW => {
-                            if ctrl_tx.send(InboundCtrlMsg::E2eRenew(body)).await.is_err() {
+                            if ctrl_tx
+                                .send(InboundCtrlMsg::E2eRenew(Zeroizing::new(body)))
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -734,8 +744,8 @@ async fn run_stream_session(
     let mut pending_app_read: Option<Pin<Box<dyn Future<Output = ()> + Send>>> = None;
     let mut pending_app_writes: VecDeque<AppWriteMsg> = VecDeque::new();
 
-    // Check live MTU immediately at startup.
-    let initial_mtu = mtu_watch.current();
+    // Check live MTU immediately at startup and synchronize watch baseline.
+    let initial_mtu = mtu_watch.sample();
     let terminal_reason: CoreError = if initial_mtu < floor {
         CoreError::MtuTooSmall(initial_mtu)
     } else {
@@ -945,18 +955,29 @@ async fn run_stream_session(
                                         Ok(v) => v,
                                         Err(err) => break err,
                                     };
-                                    if orig.renewals.on_ack(
+                                    match orig.renewals.on_ack(
                                         RenewalSlot::Hop(dist),
                                         id,
                                         ttl,
                                         clock.now(),
                                         &mut OsRng,
                                     ) {
-                                        scope
-                                            .metrics
-                                            .auth_transit
-                                            .renewed
-                                            .fetch_add(1, Ordering::Relaxed);
+                                        Ok(true) => {
+                                            scope
+                                                .metrics
+                                                .auth_transit
+                                                .renewed
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        Ok(false) => {}
+                                        Err(err) => {
+                                            scope
+                                                .metrics
+                                                .auth_transit
+                                                .renewal_failures
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            break err;
+                                        }
                                     }
                                 }
                                 _ => break CoreError::Malformed,
@@ -1053,21 +1074,32 @@ async fn run_stream_session(
                         Ok(v) => v,
                         Err(err) => break err,
                     };
-                    if orig.renewals.on_ack(
+                    match orig.renewals.on_ack(
                         RenewalSlot::Endpoint,
                         id,
                         ttl,
                         clock.now(),
                         &mut OsRng,
                     ) {
-                        if let Err(err) = lease.renew_ttl_only(ttl, MAX_WIRE_LEASE_TTL) {
+                        Ok(true) => {
+                            if let Err(err) = lease.renew_ttl_only(ttl, MAX_WIRE_LEASE_TTL) {
+                                break err;
+                            }
+                            scope
+                                .metrics
+                                .auth_endpoint
+                                .renewed
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(false) => {}
+                        Err(err) => {
+                            scope
+                                .metrics
+                                .auth_endpoint
+                                .renewal_failures
+                                .fetch_add(1, Ordering::Relaxed);
                             break err;
                         }
-                        scope
-                            .metrics
-                            .auth_endpoint
-                            .renewed
-                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 StepEvent::DestAuthDone(id, res) => match res {

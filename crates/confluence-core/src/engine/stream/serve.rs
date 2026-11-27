@@ -125,6 +125,10 @@ pub(crate) async fn serve_stream_destination(
                 }
                 Err(CoreError::Authentication)
             }
+            InboundStreamFrame::E2eRenew(_) => {
+                // Spec §6.3 Step 1: First E2E record MUST be ST_DATA (Zeroizing body wipes on drop).
+                Err(CoreError::Authentication)
+            }
             InboundStreamFrame::E2eRecord { opcode, body } => {
                 // Spec §6.3 Step 1: First E2E record MUST be ST_DATA (any other fails Authentication).
                 if opcode != e2e_st::ST_DATA {

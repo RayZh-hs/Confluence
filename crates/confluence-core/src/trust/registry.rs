@@ -514,21 +514,22 @@ impl PublishRegistry {
     }
 
     /// Host-sovereign `ScopeInstance::revoke_peer`: adds `peer` to local permanent veto set,
-    /// bumps peer epoch, and revokes all active inbound/outbound sessions with `Revoked`.
+    /// bumps peer epoch, detaches indexed leases atomically under the write lock, and notifies
+    /// all detached leases with `Revoked` strictly after releasing all locks.
     pub fn veto_peer(&self, peer: PublicKey) {
-        {
+        let detached = {
             let mut st = self
                 .state
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             st.vetoed.insert(peer);
             st.epochs.bump_peer(peer);
-        }
+            self.revocations.detach_key(&RevocationKey::Peer(peer))
+        };
         self.metrics
             .revocations_peer_total
             .fetch_add(1, Ordering::Relaxed);
-        self.revocations
-            .revoke_key(&RevocationKey::Peer(peer), &CoreError::Revoked);
+        RevocationIndex::notify_revoked(detached, &CoreError::Revoked);
     }
 
     /// Removes `peer` from the local hard veto set.
@@ -542,69 +543,74 @@ impl PublishRegistry {
 
     /// Authorizer `Revocation::Peer`: revokes active sessions (`Revoked`) WITHOUT adding to local `vetoed`.
     pub fn revoke_peer_sessions_only(&self, peer: PublicKey) {
-        {
+        let detached = {
             let mut st = self
                 .state
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             st.epochs.bump_peer(peer);
-        }
+            self.revocations.detach_key(&RevocationKey::Peer(peer))
+        };
         self.metrics
             .revocations_peer_total
             .fetch_add(1, Ordering::Relaxed);
-        self.revocations
-            .revoke_key(&RevocationKey::Peer(peer), &CoreError::Revoked);
+        RevocationIndex::notify_revoked(detached, &CoreError::Revoked);
     }
 
     /// Authorizer `Revocation::Endpoint`: bumps endpoint epoch and revokes sessions with `Unpublished`.
     pub fn revoke_endpoint(&self, name: &str) {
-        {
+        let detached = {
             let mut st = self
                 .state
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             st.epochs.bump_endpoint(name);
-        }
+            self.revocations
+                .detach_key(&RevocationKey::Endpoint(name.to_owned()))
+        };
         self.metrics
             .revocations_endpoint_total
             .fetch_add(1, Ordering::Relaxed);
-        self.revocations.revoke_key(
-            &RevocationKey::Endpoint(name.to_owned()),
-            &CoreError::Unpublished,
-        );
+        RevocationIndex::notify_revoked(detached, &CoreError::Unpublished);
     }
 
     /// Host `Scope::revoke_transit` / Authorizer `Revocation::Transit`: revokes across BOTH planes (`Revoked`).
     pub fn revoke_transit(&self, name: &str) {
-        {
+        let (detached_st, detached_dg) = {
             let mut st = self
                 .state
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             st.epochs.bump_transit_both_planes(name);
-        }
+            let st_weaks = self
+                .revocations
+                .detach_key(&RevocationKey::Transit(Plane::Stream, name.to_owned()));
+            let dg_weaks = self
+                .revocations
+                .detach_key(&RevocationKey::Transit(Plane::Datagram, name.to_owned()));
+            (st_weaks, dg_weaks)
+        };
         self.metrics
             .revocations_transit_total
             .fetch_add(1, Ordering::Relaxed);
-        self.revocations.revoke_key(
-            &RevocationKey::Transit(Plane::Stream, name.to_owned()),
-            &CoreError::Revoked,
-        );
-        self.revocations.revoke_key(
-            &RevocationKey::Transit(Plane::Datagram, name.to_owned()),
-            &CoreError::Revoked,
-        );
+        RevocationIndex::notify_revoked(detached_st, &CoreError::Revoked);
+        RevocationIndex::notify_revoked(detached_dg, &CoreError::Revoked);
     }
 
     /// Authorizer `Revocation::All` or fail-closed broadcast lag invalidation.
+    ///
+    /// Establishes a single atomic admission cutoff by bumping `global_epoch` and detaching all
+    /// indexed leases inside the same `TrustState` write lock (Level 3 -> Level 4), then
+    /// notifying detached leases strictly after releasing all locks.
     pub fn revoke_all(&self, is_lag: bool) {
-        {
+        let detached = {
             let mut st = self
                 .state
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             st.epochs.bump_all();
-        }
+            self.revocations.detach_all()
+        };
         if is_lag {
             self.metrics
                 .revocation_lag_invalidations_total
@@ -614,7 +620,7 @@ impl PublishRegistry {
                 .revocations_scope_total
                 .fetch_add(1, Ordering::Relaxed);
         }
-        self.revocations.revoke_all(&CoreError::Revoked);
+        RevocationIndex::notify_revoked(detached, &CoreError::Revoked);
     }
 
     #[must_use]
@@ -718,33 +724,53 @@ impl PublishRegistry {
     }
 
     fn unpublish_guard(&self, pub_id: PublicationId, active: &AtomicBool, kind: &GuardKind) {
-        active.store(false, Ordering::Release);
-        {
+        #[allow(dead_code)]
+        enum RetiredEntry {
+            Endpoint(EndpointEntry),
+            StreamTransit(TransitEntry<Arc<dyn StreamTransitHandler>>),
+            DatagramTransit(TransitEntry<Arc<dyn DatagramTransitHandler>>),
+        }
+
+        let (retired, detached) = {
             let mut st = self
                 .state
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match kind {
+            active.store(false, Ordering::Release);
+            let retired = match kind {
                 GuardKind::Endpoint(name) => {
-                    if st.endpoints.get(name).is_some_and(|e| e.pub_id == pub_id) {
-                        st.endpoints.remove(name);
-                    }
+                    let removed = if st.endpoints.get(name).is_some_and(|e| e.pub_id == pub_id) {
+                        st.endpoints.remove(name).map(RetiredEntry::Endpoint)
+                    } else {
+                        None
+                    };
                     st.epochs.bump_endpoint(name);
+                    removed
                 }
                 GuardKind::Transit {
                     plane,
                     is_prefix,
                     key,
                 } => {
+                    // Spec §7.4: Guard drop is strictly scoped to its `PublicationId` (`active`
+                    // flag + `RevocationKey::Publication(pub_id)`). Do NOT bump the name-wide
+                    // `(plane, key)` transit epoch, which would falsely abort overlapping exact
+                    // or prefix setups sharing the same key string.
                     match (plane, is_prefix) {
                         (Plane::Stream, false) => {
                             if st.stream_exact.get(key).is_some_and(|e| e.pub_id == pub_id) {
-                                st.stream_exact.remove(key);
+                                st.stream_exact.remove(key).map(RetiredEntry::StreamTransit)
+                            } else {
+                                None
                             }
                         }
                         (Plane::Stream, true) => {
                             if st.stream_prefix.get(key).is_some_and(|e| e.pub_id == pub_id) {
-                                st.stream_prefix.remove(key);
+                                st.stream_prefix
+                                    .remove(key)
+                                    .map(RetiredEntry::StreamTransit)
+                            } else {
+                                None
                             }
                         }
                         (Plane::Datagram, false) => {
@@ -753,7 +779,11 @@ impl PublishRegistry {
                                 .get(key)
                                 .is_some_and(|e| e.pub_id == pub_id)
                             {
-                                st.datagram_exact.remove(key);
+                                st.datagram_exact
+                                    .remove(key)
+                                    .map(RetiredEntry::DatagramTransit)
+                            } else {
+                                None
                             }
                         }
                         (Plane::Datagram, true) => {
@@ -762,14 +792,23 @@ impl PublishRegistry {
                                 .get(key)
                                 .is_some_and(|e| e.pub_id == pub_id)
                             {
-                                st.datagram_prefix.remove(key);
+                                st.datagram_prefix
+                                    .remove(key)
+                                    .map(RetiredEntry::DatagramTransit)
+                            } else {
+                                None
                             }
                         }
                     }
-                    st.epochs.bump_transit_plane(*plane, key);
                 }
-            }
-        }
+            };
+            // Detach strictly by PublicationId inside the same write transaction so overlapping
+            // and replacement publications are unaffected.
+            let detached = self
+                .revocations
+                .detach_key(&RevocationKey::Publication(pub_id));
+            (retired, detached)
+        };
         match kind {
             GuardKind::Endpoint(_) => {
                 self.metrics
@@ -782,26 +821,29 @@ impl PublishRegistry {
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
-        // Revoke strictly by PublicationId so overlapping/replacement publications are unaffected!
-        self.revocations
-            .revoke_key(&RevocationKey::Publication(pub_id), &CoreError::Unpublished);
+        RevocationIndex::notify_revoked(detached, &CoreError::Unpublished);
+        // Drop the retired handler strictly AFTER releasing all registry locks and completing
+        // scoped revocation so a handler owning another `PublishGuard` in this scope cannot deadlock.
+        drop(retired);
     }
 
     fn revoke_publication_target(&self, pub_id: PublicationId, subtarget: &str) {
-        {
+        let detached = {
             let mut st = self
                 .state
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             st.epochs.bump_publication_target(pub_id, subtarget);
-        }
+            self.revocations
+                .detach_key(&RevocationKey::PublicationTarget(
+                    pub_id,
+                    subtarget.to_owned(),
+                ))
+        };
         self.metrics
             .revocations_transit_total
             .fetch_add(1, Ordering::Relaxed);
-        self.revocations.revoke_key(
-            &RevocationKey::PublicationTarget(pub_id, subtarget.to_owned()),
-            &CoreError::Revoked,
-        );
+        RevocationIndex::notify_revoked(detached, &CoreError::Revoked);
     }
 }
 
@@ -1109,5 +1151,259 @@ mod tests {
             reg.track_endpoint(&snap, peer, Some(("api", g_ep.publication_id())), &lease),
             Err(CoreError::Revoked)
         );
+    }
+
+    #[test]
+    fn unpublish_guard_reentrant_handler_drop_does_not_deadlock() {
+        use std::sync::Mutex as StdMutex;
+
+        struct ChainedEndpoint {
+            _inner_guard: StdMutex<Option<PublishGuard>>,
+        }
+        impl StreamEndpointHandler for ChainedEndpoint {
+            fn open(&self, _auth: SessionAuth) -> BoxFuture<'_, Result<BoxedStream, CoreError>> {
+                Box::pin(async { Err(CoreError::Closed) })
+            }
+        }
+        struct ChainedTransit {
+            _inner_guard: StdMutex<Option<PublishGuard>>,
+        }
+        impl StreamTransitHandler for ChainedTransit {
+            fn caps(&self) -> ChannelCaps {
+                ChannelCaps::fixed(16_384, true)
+            }
+            fn open<'a>(
+                &'a self,
+                _t: &'a str,
+                _a: SessionAuth,
+            ) -> BoxFuture<'a, Result<BoxedStream, CoreError>> {
+                Box::pin(async { Err(CoreError::Closed) })
+            }
+        }
+
+        let metrics = Arc::new(ScopeMetrics::new());
+        let reg = Arc::new(PublishRegistry::new(metrics));
+
+        // Registry holds the sole Arc to outer handlers whose Drop drops an inner PublishGuard
+        // in the exact same registry -> MUST NOT deadlock!
+        let inner_ep = reg.publish_stream_endpoint("inner-ep", Arc::new(DummyStEp)).unwrap();
+        let outer_ep = reg
+            .publish_stream_endpoint(
+                "outer-ep",
+                Arc::new(ChainedEndpoint {
+                    _inner_guard: StdMutex::new(Some(inner_ep)),
+                }),
+            )
+            .unwrap();
+        drop(outer_ep);
+        assert!(matches!(
+            reg.resolve_endpoint("outer-ep", Plane::Stream),
+            Err(CoreError::Unpublished)
+        ));
+        assert!(matches!(
+            reg.resolve_endpoint("inner-ep", Plane::Stream),
+            Err(CoreError::Unpublished)
+        ));
+
+        let inner_tr = reg
+            .publish_stream_transit_prefix("inner/", Arc::new(DummyStTr))
+            .unwrap();
+        let outer_tr = reg
+            .publish_stream_transit(
+                "outer-tr",
+                Arc::new(ChainedTransit {
+                    _inner_guard: StdMutex::new(Some(inner_tr)),
+                }),
+            )
+            .unwrap();
+        drop(outer_tr);
+        assert!(matches!(
+            reg.resolve_transit("outer-tr", Plane::Stream),
+            Err(CoreError::Unpublished)
+        ));
+        assert!(matches!(
+            reg.resolve_transit("inner/x", Plane::Stream),
+            Err(CoreError::Unpublished)
+        ));
+    }
+
+    #[test]
+    fn transit_guard_drop_does_not_abort_overlapping_exact_or_prefix_setup() {
+        let clock = VirtualClock::new();
+        let metrics = Arc::new(ScopeMetrics::new());
+        let reg = Arc::new(PublishRegistry::new(metrics));
+        let peer = PublicKey::from_bytes([0x42; 32]);
+
+        // Publish BOTH an exact Stream transit "relay/" AND a prefix Stream transit "relay/".
+        let g_exact = reg.publish_stream_transit("relay/", Arc::new(DummyStTr)).unwrap();
+        let g_prefix = reg
+            .publish_stream_transit_prefix("relay/", Arc::new(DummyStTr))
+            .unwrap();
+
+        // Setup for "relay/alice" resolves through the prefix and captures its epoch snapshot.
+        let res_prefix = reg.resolve_transit("relay/alice", Plane::Stream).unwrap();
+        assert_eq!(res_prefix.pub_id, g_prefix.publication_id());
+        assert_eq!(res_prefix.matched_prefix.as_deref(), Some("relay/"));
+        let target_prefix = TransitEpochTarget {
+            peer,
+            plane: Plane::Stream,
+            full_name: "relay/alice",
+            matched_prefix: res_prefix.matched_prefix.as_deref(),
+            pub_id: res_prefix.pub_id,
+            subtarget: &res_prefix.subtarget,
+        };
+        let snap_prefix = reg.epoch_for_transit(&target_prefix);
+
+        // Concurrently, an exact setup for "relay/" also starts in flight.
+        let res_exact = reg.resolve_transit("relay/", Plane::Stream).unwrap();
+        assert_eq!(res_exact.pub_id, g_exact.publication_id());
+        let target_exact = TransitEpochTarget {
+            peer,
+            plane: Plane::Stream,
+            full_name: "relay/",
+            matched_prefix: None,
+            pub_id: res_exact.pub_id,
+            subtarget: &res_exact.subtarget,
+        };
+        let snap_exact = reg.epoch_for_transit(&target_exact);
+
+        // Drop the EXACT guard while BOTH setups are awaiting authorization!
+        drop(g_exact);
+
+        let lease_exact =
+            LeaseHandle::from_ttl(peer, Duration::from_secs(30), Duration::from_secs(60), clock.clone())
+                .unwrap();
+        let lease_prefix =
+            LeaseHandle::from_ttl(peer, Duration::from_secs(30), Duration::from_secs(60), clock.clone())
+                .unwrap();
+
+        // The dropped exact setup MUST fail with Unpublished (via `active == false`).
+        assert_eq!(
+            reg.track_transit(&snap_exact, &target_exact, &res_exact.active, &lease_exact),
+            Err(CoreError::Unpublished)
+        );
+        // The overlapping prefix setup MUST SUCCEED because its own publication is still active!
+        assert_eq!(
+            reg.track_transit(&snap_prefix, &target_prefix, &res_prefix.active, &lease_prefix),
+            Ok(())
+        );
+        assert!(lease_prefix.is_active());
+
+        // Symmetric check: re-publish exact "relay/", start exact setup, drop prefix guard.
+        let g_exact2 = reg.publish_stream_transit("relay/", Arc::new(DummyStTr)).unwrap();
+        let res_exact2 = reg.resolve_transit("relay/", Plane::Stream).unwrap();
+        let target_exact2 = TransitEpochTarget {
+            peer,
+            plane: Plane::Stream,
+            full_name: "relay/",
+            matched_prefix: None,
+            pub_id: res_exact2.pub_id,
+            subtarget: &res_exact2.subtarget,
+        };
+        let snap_exact2 = reg.epoch_for_transit(&target_exact2);
+
+        drop(g_prefix);
+        assert_eq!(lease_prefix.remaining(), Err(CoreError::Unpublished));
+
+        let lease_exact2 =
+            LeaseHandle::from_ttl(peer, Duration::from_secs(30), Duration::from_secs(60), clock.clone())
+                .unwrap();
+        assert_eq!(
+            reg.track_transit(&snap_exact2, &target_exact2, &res_exact2.active, &lease_exact2),
+            Ok(())
+        );
+        assert!(lease_exact2.is_active());
+
+        // Explicit name-wide revoke_transit("relay/") MUST still bump epoch & abort in-flight setups.
+        let snap_before_revoke = reg.epoch_for_transit(&target_exact2);
+        reg.revoke_transit("relay/");
+        assert_eq!(lease_exact2.remaining(), Err(CoreError::Revoked));
+        let lease_exact3 =
+            LeaseHandle::from_ttl(peer, Duration::from_secs(30), Duration::from_secs(60), clock)
+                .unwrap();
+        assert_eq!(
+            reg.track_transit(&snap_before_revoke, &target_exact2, &res_exact2.active, &lease_exact3),
+            Err(CoreError::Revoked)
+        );
+        drop(g_exact2);
+    }
+
+    #[test]
+    fn revoke_all_establishes_consistent_admission_cutoff_across_shards() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let clock = VirtualClock::new();
+        let metrics = Arc::new(ScopeMetrics::new());
+        let reg = Arc::new(PublishRegistry::new(metrics));
+
+        // Stress 40 rounds with 6 concurrent admitter threads spanning distinct peers across all 16
+        // shards racing against one `revoke_all` per round. Every post-cutoff admission (epoch ==
+        // round + 1) MUST survive regardless of shard index, and every pre-cutoff admission
+        // (epoch == round) MUST either fail `track_endpoint` with `Revoked` or be revoked.
+        for round in 0..40u64 {
+            let expected_after = round + 1;
+            let barrier = Arc::new(Barrier::new(7));
+            let mut handles = Vec::with_capacity(6);
+
+            for tid in 0..6u64 {
+                let reg_c = Arc::clone(&reg);
+                let clock_c = clock.clone();
+                let bar_c = Arc::clone(&barrier);
+                handles.push(thread::spawn(move || {
+                    let mut results = Vec::with_capacity(64);
+                    bar_c.wait();
+                    for i in 0..64u64 {
+                        let mut pk = [0u8; 32];
+                        pk[0..8].copy_from_slice(&round.to_be_bytes());
+                        pk[8..16].copy_from_slice(&tid.to_be_bytes());
+                        pk[16..24].copy_from_slice(&i.to_be_bytes());
+                        let peer = PublicKey::from_bytes(pk);
+                        let snap = reg_c.epoch_for_endpoint(peer, None);
+                        let lease = LeaseHandle::from_ttl(
+                            peer,
+                            Duration::from_secs(60),
+                            Duration::from_secs(60),
+                            clock_c.clone(),
+                        )
+                        .unwrap();
+                        let tracked = reg_c.track_endpoint(&snap, peer, None, &lease);
+                        results.push((snap.global, tracked, lease));
+                    }
+                    results
+                }));
+            }
+
+            let reg_r = Arc::clone(&reg);
+            let bar_r = Arc::clone(&barrier);
+            let revoker = thread::spawn(move || {
+                bar_r.wait();
+                thread::yield_now();
+                reg_r.revoke_all(false);
+            });
+
+            revoker.join().unwrap();
+            for h in handles {
+                for (snap_epoch, tracked, lease) in h.join().unwrap() {
+                    if snap_epoch == expected_after {
+                        assert_eq!(
+                            tracked,
+                            Ok(()),
+                            "post-cutoff admission must succeed"
+                        );
+                        assert!(
+                            lease.is_active(),
+                            "post-cutoff admission must NOT be revoked by earlier revoke_all"
+                        );
+                    } else {
+                        assert!(
+                            tracked == Err(CoreError::Revoked)
+                                || lease.remaining() == Err(CoreError::Revoked),
+                            "pre-cutoff admission must fail track or be revoked"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

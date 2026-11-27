@@ -3,6 +3,7 @@
 use core::hash::{Hash, Hasher};
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::constants::MAX_EPOCHS;
@@ -11,6 +12,12 @@ use crate::trust::lease::LeaseHandle;
 use crate::types::{Plane, PublicationId, PublicKey};
 
 const SHARDS: usize = 16;
+/// Minimum insertions into a shard before triggering an amortized full-shard dead-entry sweep.
+const SHARD_SWEEP_MIN_INSERTS: usize = 32;
+/// Global insert cadence for crediting the next shard in round-robin cross-shard sweeping.
+const RR_SWEEP_INTERVAL: usize = 32;
+/// Work credits granted per round-robin visit (guarantees $O(1)$ amortized work per insert).
+const RR_SWEEP_CREDITS: usize = 64;
 
 /// Key indexing active leases inside [`RevocationIndex`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -22,12 +29,55 @@ pub enum RevocationKey {
     PublicationTarget(PublicationId, String),
 }
 
+struct RevocationShard {
+    map: HashMap<RevocationKey, Vec<Weak<LeaseHandle>>>,
+    inserts_since_sweep: usize,
+    next_sweep_threshold: usize,
+    rr_work_budget: usize,
+}
+
+impl RevocationShard {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            inserts_since_sweep: 0,
+            next_sweep_threshold: SHARD_SWEEP_MIN_INSERTS,
+            rr_work_budget: 0,
+        }
+    }
+
+    fn sweep(&mut self) {
+        self.map.retain(|_, list| {
+            list.retain(|w| w.strong_count() > 0);
+            if list.is_empty() {
+                false
+            } else {
+                if list.capacity() > list.len().saturating_mul(4).max(8) {
+                    list.shrink_to(list.len().saturating_mul(2).max(4));
+                }
+                true
+            }
+        });
+        if self.map.capacity() > self.map.len().saturating_mul(4).max(64) {
+            self.map.shrink_to(self.map.len().saturating_mul(2).max(32));
+        }
+        self.inserts_since_sweep = 0;
+        self.rr_work_budget = 0;
+        self.next_sweep_threshold = self.map.len().max(SHARD_SWEEP_MIN_INSERTS);
+    }
+}
+
 /// 16-way sharded weak-reference lease index for instant $O(1)$ scoped revocation (Spec §7.5).
 ///
-/// Lock Level 4: never acquires higher locks and ALWAYS releases its shard lock before calling
-/// [`LeaseHandle::revoke`].
+/// Lock Level 4: never acquires higher locks, holds at most ONE shard lock at a time, and
+/// ALWAYS releases its shard lock before calling [`LeaseHandle::revoke`].
+///
+/// Incrementally sweeps stale weak references and removes empty keys both per-shard and
+/// round-robin across idle shards so historical sessions with distinct peers or transit
+/// suffixes cannot grow the index unboundedly.
 pub struct RevocationIndex {
-    shards: [Mutex<HashMap<RevocationKey, Vec<Weak<LeaseHandle>>>>; SHARDS],
+    shards: [Mutex<RevocationShard>; SHARDS],
+    rr_ops: AtomicUsize,
 }
 
 impl Default for RevocationIndex {
@@ -41,7 +91,8 @@ impl RevocationIndex {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            shards: core::array::from_fn(|_| Mutex::new(HashMap::new())),
+            shards: core::array::from_fn(|_| Mutex::new(RevocationShard::new())),
+            rr_ops: AtomicUsize::new(0),
         }
     }
 
@@ -51,31 +102,86 @@ impl RevocationIndex {
         (hasher.finish() as usize) & (SHARDS - 1)
     }
 
-    /// Registers a weak reference to `lease` under `key`, lazily pruning dead weak entries.
+    /// Registers a weak reference to `lease` under `key`, lazily pruning dead weak entries
+    /// and running $O(1)$-amortized shard sweeps so empty keys never accumulate indefinitely.
     pub fn insert(&self, key: RevocationKey, lease: &Arc<LeaseHandle>) {
-        let shard = &self.shards[Self::shard_for(&key)];
-        let mut map = shard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let list = map.entry(key).or_default();
-        list.retain(|w| w.strong_count() > 0);
-        list.push(Arc::downgrade(lease));
-    }
-
-    /// Removes `key` and immediately revokes every live lease indexed under it with `reason`.
-    ///
-    /// Returns the number of live leases notified.
-    pub fn revoke_key(&self, key: &RevocationKey, reason: &CoreError) -> usize {
-        let shard = &self.shards[Self::shard_for(key)];
-        let weaks = {
-            let mut map = shard
+        let shard_idx = Self::shard_for(&key);
+        {
+            let mut shard = self.shards[shard_idx]
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            map.remove(key)
-        };
-        let Some(weaks) = weaks else {
-            return 0;
-        };
+            let list = shard.map.entry(key).or_default();
+            list.retain(|w| w.strong_count() > 0);
+            list.push(Arc::downgrade(lease));
+            shard.inserts_since_sweep = shard.inserts_since_sweep.saturating_add(1);
+            if shard.inserts_since_sweep >= shard.next_sweep_threshold {
+                shard.sweep();
+            }
+        }
+
+        // Cross-shard round-robin sweep strictly AFTER releasing `shard_idx` (at most one
+        // Level-4 shard lock held at any time) so idle shards with dead historical keys are
+        // also reclaimed in O(1) amortized time.
+        let op = self.rr_ops.fetch_add(1, Ordering::Relaxed);
+        if op % RR_SWEEP_INTERVAL == (RR_SWEEP_INTERVAL - 1) {
+            let rr_idx = (op / RR_SWEEP_INTERVAL) & (SHARDS - 1);
+            let mut shard = self.shards[rr_idx]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !shard.map.is_empty() {
+                shard.rr_work_budget = shard.rr_work_budget.saturating_add(RR_SWEEP_CREDITS);
+                if shard.rr_work_budget >= shard.map.len() {
+                    shard.sweep();
+                }
+            }
+        }
+    }
+
+    /// Detaches all weak lease references indexed under `key` WITHOUT notifying them.
+    ///
+    /// Callers holding a Level-3 registry write lock invoke this inside the same transaction
+    /// as epoch bumps, then pass the returned vector to [`Self::notify_revoked`] strictly
+    /// after releasing all locks.
+    pub fn detach_key(&self, key: &RevocationKey) -> Vec<Weak<LeaseHandle>> {
+        let mut shard = self.shards[Self::shard_for(key)]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let removed = shard.map.remove(key).unwrap_or_default();
+        if shard.map.is_empty() {
+            shard.inserts_since_sweep = 0;
+            shard.rr_work_budget = 0;
+            shard.next_sweep_threshold = SHARD_SWEEP_MIN_INSERTS;
+            if shard.map.capacity() > 64 {
+                shard.map.shrink_to(32);
+            }
+        }
+        removed
+    }
+
+    /// Detaches all weak lease references across all 16 shards WITHOUT notifying them.
+    ///
+    /// Locks shards one at a time in ascending order (never holding two shard locks at once).
+    pub fn detach_all(&self) -> Vec<Weak<LeaseHandle>> {
+        let mut out = Vec::new();
+        for shard_lock in &self.shards {
+            let mut shard = shard_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (_, mut weaks) in shard.map.drain() {
+                out.append(&mut weaks);
+            }
+            shard.inserts_since_sweep = 0;
+            shard.rr_work_budget = 0;
+            shard.next_sweep_threshold = SHARD_SWEEP_MIN_INSERTS;
+            if shard.map.capacity() > 64 {
+                shard.map.shrink_to(32);
+            }
+        }
+        out
+    }
+
+    /// Notifies every live lease in `weaks` with `reason`. MUST be called with no Level-3/4 locks held.
+    pub fn notify_revoked(weaks: Vec<Weak<LeaseHandle>>, reason: &CoreError) -> usize {
         let mut count = 0usize;
         for w in weaks {
             if let Some(lease) = w.upgrade() {
@@ -86,26 +192,48 @@ impl RevocationIndex {
         count
     }
 
+    /// Removes `key` and immediately revokes every live lease indexed under it with `reason`.
+    ///
+    /// Returns the number of live leases notified.
+    pub fn revoke_key(&self, key: &RevocationKey, reason: &CoreError) -> usize {
+        let weaks = self.detach_key(key);
+        Self::notify_revoked(weaks, reason)
+    }
+
     /// Drains all 16 shards and revokes every live lease in the scope fail-closed.
     pub fn revoke_all(&self, reason: &CoreError) -> usize {
-        let mut total = 0usize;
-        for shard in &self.shards {
-            let drained: Vec<Vec<Weak<LeaseHandle>>> = {
-                let mut map = shard
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                map.drain().map(|(_, v)| v).collect()
-            };
-            for weaks in drained {
-                for w in weaks {
-                    if let Some(lease) = w.upgrade() {
-                        lease.revoke(reason.clone());
-                        total += 1;
-                    }
-                }
-            }
-        }
-        total
+        let weaks = self.detach_all();
+        Self::notify_revoked(weaks, reason)
+    }
+
+    /// Returns the total number of indexed keys currently stored across all 16 shards.
+    #[must_use]
+    pub fn key_count(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| {
+                s.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .map
+                    .len()
+            })
+            .sum()
+    }
+
+    /// Returns the total number of weak lease entries currently stored across all 16 shards.
+    #[must_use]
+    pub fn weak_count(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| {
+                s.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .map
+                    .values()
+                    .map(Vec::len)
+                    .sum::<usize>()
+            })
+            .sum()
     }
 }
 
@@ -387,5 +515,80 @@ mod tests {
         assert_eq!(count, 1);
         assert!(!live.is_active());
         assert_eq!(live.remaining(), Err(CoreError::Revoked));
+    }
+
+    #[test]
+    fn revocation_index_bounds_keys_across_distinct_historical_peers_and_idle_shards() {
+        let clock = VirtualClock::new();
+        let idx = RevocationIndex::new();
+        let pub_id = PublicationId::next();
+
+        // Phase 1: 4,000 closed historical sessions with distinct peers AND distinct transit suffixes.
+        for i in 0..4_000u64 {
+            let mut pk = [0u8; 32];
+            pk[0..8].copy_from_slice(&i.to_be_bytes());
+            let peer = PublicKey::from_bytes(pk);
+            let lease = LeaseHandle::from_ttl(
+                peer,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                clock.clone(),
+            )
+            .unwrap();
+            idx.insert(RevocationKey::Peer(peer), &lease);
+            idx.insert(
+                RevocationKey::PublicationTarget(pub_id, format!("suffix-{i}")),
+                &lease,
+            );
+            drop(lease);
+        }
+        // Incremental per-shard sweeps MUST keep keys strictly bounded (far below 8,000).
+        assert!(
+            idx.key_count() <= SHARDS * SHARD_SWEEP_MIN_INSERTS,
+            "key_count grew unboundedly: {}",
+            idx.key_count()
+        );
+        assert!(
+            idx.weak_count() <= SHARDS * SHARD_SWEEP_MIN_INSERTS,
+            "weak_count grew unboundedly: {}",
+            idx.weak_count()
+        );
+
+        // Phase 2: Burst of 512 concurrent distinct-peer leases across all 16 shards, then all close,
+        // followed by steady single-peer insertions into ONE shard. Round-robin cross-shard sweeping
+        // MUST reclaim the 15 idle shards back down to the 1 active key!
+        let mut burst = Vec::with_capacity(512);
+        for i in 10_000..10_512u64 {
+            let mut pk = [0u8; 32];
+            pk[0..8].copy_from_slice(&i.to_be_bytes());
+            let peer = PublicKey::from_bytes(pk);
+            let lease = LeaseHandle::from_ttl(
+                peer,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                clock.clone(),
+            )
+            .unwrap();
+            idx.insert(RevocationKey::Peer(peer), &lease);
+            burst.push(lease);
+        }
+        drop(burst);
+
+        let steady_peer = PublicKey::from_bytes([0xEE; 32]);
+        let mut last_live = None;
+        for _ in 0..(SHARDS * RR_SWEEP_INTERVAL * 2) {
+            let lease = LeaseHandle::from_ttl(
+                steady_peer,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                clock.clone(),
+            )
+            .unwrap();
+            last_live = Some(Arc::clone(&lease));
+            idx.insert(RevocationKey::Peer(steady_peer), &lease);
+        }
+        assert!(last_live.as_ref().unwrap().is_active());
+        assert_eq!(idx.key_count(), 1, "idle shards must be reclaimed to 1 live key");
+        assert_eq!(idx.weak_count(), 1);
     }
 }

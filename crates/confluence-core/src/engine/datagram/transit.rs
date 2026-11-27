@@ -65,19 +65,21 @@ pub(crate) async fn run_datagram_transit(params: DatagramTransitParams) {
 
     let mut left_mtu_watch = left.mtu_watch();
     let mut right_mtu_watch = right.mtu_watch();
-    let mut path_mtu = TransitPathMtu::new(left_mtu_watch.current(), right_mtu_watch.current(), floor);
+    let initial_left = left_mtu_watch.sample();
+    let initial_right = right_mtu_watch.sample();
+    let mut path_mtu = TransitPathMtu::new(initial_physical_mtu, initial_physical_mtu, floor);
     let mut mtu_reporter = MtuReporter::with_initial(initial_physical_mtu);
     let mut gate_cache = TrafficGateCache::new();
     let mut verifier = RenewalVerifierState::new();
     let mut auth_fut: Option<RenewalAuthFut> = None;
     let mut shutdown_rx = scope.subscribe_shutdown();
 
-    // Startup check catching live MTU shifts right after SETUP_OK.
+    // Startup check catching live MTU shifts right after SETUP_OK while synchronizing watch baselines.
     {
         let now = clock.now();
-        let ev1 = path_mtu.update_left(left_mtu_watch.current(), now);
+        let ev1 = path_mtu.update_left(initial_left, now);
         handle_transit_mtu_event(ev1, &mut mtu_reporter, &mut ctrl, &left, caller_cid, now);
-        let ev2 = path_mtu.update_right(right_mtu_watch.current(), now);
+        let ev2 = path_mtu.update_right(initial_right, now);
         handle_transit_mtu_event(ev2, &mut mtu_reporter, &mut ctrl, &left, caller_cid, now);
     }
 

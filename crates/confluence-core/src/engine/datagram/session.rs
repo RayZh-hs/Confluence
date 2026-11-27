@@ -62,7 +62,7 @@ pub struct E2eDatagram {
     current_mtu: Arc<AtomicU16>,
     max_payload: Arc<AtomicUsize>,
     closed_rx: WatchReceiver<Option<CoreError>>,
-    close_req: Watch<bool>,
+    close_req: Watch<Option<CoreError>>,
     peer: PublicKey,
 }
 
@@ -146,8 +146,23 @@ impl E2eDatagram {
 
     /// Cleanly initiates session teardown with [`CoreError::Closed`].
     pub fn close(&self) {
+        self.close_with_error(CoreError::Closed);
+    }
+
+    /// Initiates session teardown carrying a specific terminal error (e.g. fatal Destination
+    /// app-link failure propagated via authenticated `e2e::DG_CLOSE(err)`, R2-DG-07).
+    ///
+    /// Preserves the first close reason if called multiple times.
+    pub(crate) fn close_with_error(&self, err: CoreError) {
         self.tx_sem.close();
-        self.close_req.send(true);
+        let _ = self.close_req.send_if_modified(|slot| {
+            if slot.is_none() {
+                *slot = Some(err);
+                true
+            } else {
+                false
+            }
+        });
     }
 
     pub(crate) fn subscribe_closed(&self) -> WatchReceiver<Option<CoreError>> {
@@ -216,7 +231,7 @@ pub(crate) fn spawn_datagram_session(params: DatagramSessionParams) -> E2eDatagr
     let current_mtu = Arc::new(AtomicU16::new(initial_mtu));
     let max_payload = Arc::new(AtomicUsize::new(initial_max_payload));
     let (closed_tx, closed_rx) = Watch::new(None::<CoreError>);
-    let (close_req, close_req_rx) = Watch::new(false);
+    let (close_req, close_req_rx) = Watch::new(None::<CoreError>);
 
     let peer = params.peer;
     let spawner = Arc::clone(&params.scope.runtime.spawner);
@@ -257,7 +272,7 @@ async fn run_datagram_session(
     current_mtu: Arc<AtomicU16>,
     max_payload: Arc<AtomicUsize>,
     closed_tx: Watch<Option<CoreError>>,
-    mut close_req_rx: WatchReceiver<bool>,
+    mut close_req_rx: WatchReceiver<Option<CoreError>>,
 ) {
     let DatagramSessionParams {
         scope,
@@ -400,7 +415,7 @@ async fn run_datagram_session(
             enum Ev {
                 LeaseCancelled(CoreError),
                 Shutdown,
-                LocalClose,
+                LocalClose(CoreError),
                 MtuChanged(u16),
                 Inbound(Result<PacketBuf, CoreError>),
                 Outbound(Result<QueuedOutbound, async_channel::RecvError>),
@@ -412,7 +427,7 @@ async fn run_datagram_session(
             let ev = {
                 let mut l_fut = Box::pin(lease.cancelled());
                 let mut sh_fut = Box::pin(wait_shutdown(&mut shutdown_rx));
-                let mut cl_fut = Box::pin(wait_shutdown(&mut close_req_rx));
+                let mut cl_fut = Box::pin(wait_close_req(&mut close_req_rx));
                 let mut mtu_fut = Box::pin(wait_mtu_change(&mut mtu_watch));
                 let mut in_fut = Box::pin(binding.recv());
                 let mut out_fut = Box::pin(tx_rx.recv());
@@ -425,8 +440,8 @@ async fn run_datagram_session(
                     if let Poll::Ready(()) = sh_fut.as_mut().poll(cx) {
                         return Poll::Ready(Ev::Shutdown);
                     }
-                    if let Poll::Ready(()) = cl_fut.as_mut().poll(cx) {
-                        return Poll::Ready(Ev::LocalClose);
+                    if let Poll::Ready(err) = cl_fut.as_mut().poll(cx) {
+                        return Poll::Ready(Ev::LocalClose(err));
                     }
                     if let Poll::Ready((id, res)) = poll_optional(&mut dest_auth_fut, cx) {
                         return Poll::Ready(Ev::DestAuthDone(id, res));
@@ -474,7 +489,8 @@ async fn run_datagram_session(
 
             match ev {
                 Ev::LeaseCancelled(err) => break err,
-                Ev::Shutdown | Ev::LocalClose => break CoreError::Closed,
+                Ev::Shutdown => break CoreError::Closed,
+                Ev::LocalClose(err) => break err,
                 Ev::MtuChanged(new_local_mtu) => {
                     let now = clock.now();
                     match &mut role {
@@ -1242,6 +1258,20 @@ async fn run_datagram_session(
             PathOutcome::Failed(terminal_reason)
         };
         scope.path_source.report_outcome(orig.path_id, outcome);
+    }
+}
+
+async fn wait_close_req(rx: &mut WatchReceiver<Option<CoreError>>) -> CoreError {
+    loop {
+        if let Some(err) = rx.borrow_cloned() {
+            return err;
+        }
+        if !rx.changed().await {
+            if let Some(err) = rx.borrow_cloned() {
+                return err;
+            }
+            core::future::pending::<()>().await;
+        }
     }
 }
 

@@ -8,7 +8,6 @@
 use core::future::{Future, poll_fn};
 use core::pin::Pin;
 use core::task::Poll;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -86,23 +85,28 @@ pub(crate) async fn handle_stream_transit(
     );
     let pre_ok: Result<Option<EstablishedDownstream>, CoreError> = async {
         // Step 1: Open downstream stream racing lease.cancelled(), SETUP_TIMEOUT, and left MTU floor.
+        lease.remaining()?;
+        let cur_left_mtu = left_mtu_watch.sample();
+        if cur_left_mtu < floor {
+            return Err(CoreError::MtuTooSmall(cur_left_mtu));
+        }
         let right_stream = match with_deadline_val(
             &*clock,
             setup_deadline,
             race2(
-                handler.open(&subtarget, lease.session_auth()),
                 race2(
                     lease.cancelled(),
                     wait_mtu_below_floor(&mut left_mtu_watch, floor),
                 ),
+                handler.open(&subtarget, lease.session_auth()),
             ),
         )
         .await
         {
-            Ok(Either::Left(Ok(stream))) => stream,
-            Ok(Either::Left(Err(err))) => return Err(err),
-            Ok(Either::Right(Either::Left(err))) => return Err(err),
-            Ok(Either::Right(Either::Right(mtu))) => return Err(CoreError::MtuTooSmall(mtu)),
+            Ok(Either::Right(Ok(stream))) => stream,
+            Ok(Either::Right(Err(err))) => return Err(err),
+            Ok(Either::Left(Either::Left(err))) => return Err(err),
+            Ok(Either::Left(Either::Right(mtu))) => return Err(CoreError::MtuTooSmall(mtu)),
             Err(err) => return Err(err),
         };
 
@@ -131,18 +135,18 @@ pub(crate) async fn handle_stream_transit(
             &*clock,
             setup_deadline,
             race2(
+                lease.cancelled(),
                 async {
                     write_frame(&mut *right_w, &fwd, &*clock).await?;
                     read_setup_reply(&mut *right_r, &*clock, setup_deadline).await
                 },
-                lease.cancelled(),
             ),
         )
         .await
         {
-            Ok(Either::Left(Ok(reply))) => reply,
-            Ok(Either::Left(Err(err))) => return Err(err),
-            Ok(Either::Right(err)) => return Err(err),
+            Ok(Either::Right(Ok(reply))) => reply,
+            Ok(Either::Right(Err(err))) => return Err(err),
+            Ok(Either::Left(err)) => return Err(err),
             Err(err) => return Err(err),
         };
 
@@ -568,33 +572,15 @@ async fn run_stream_splice(
     type UnitResultFut = Pin<Box<dyn Future<Output = Result<(), CoreError>> + Send>>;
 
     // Coordinator loop: single owner of `ControlCipher`, `RenewalVerifierState`, MTU floor monitors,
-    // lease cancellation, non-blocking control reply sends, and shutdown signal.
+    // lease cancellation, bounded coalesced renewal-ACK sends (R2-ST-02), and shutdown signal.
     let mut shutdown_rx = scope.subscribe_shutdown();
     let mut verifier = RenewalVerifierState::new();
     let mut auth_fut: Option<RenewalAuthFut> = None;
     let mut fwd_ctrl_closed = false;
-    let mut pending_ctrl_frames: VecDeque<PriorityCtrlFrame> = VecDeque::new();
+    // Coalesced pre-seal renewal ACK slot so duplicate renewal floods on a stalled carrier can
+    // never grow an unbounded reply queue (at most 1 in-flight send + 1 coalesced ACK id, R2-ST-02).
+    let mut pending_renew_ack: Option<u64> = None;
     let mut pending_ctrl_send: Option<UnitResultFut> = None;
-
-    let queue_ctrl = |frame: PriorityCtrlFrame,
-                      pending_frames: &mut VecDeque<PriorityCtrlFrame>,
-                      in_flight: &mut Option<UnitResultFut>|
-     -> Result<(), CoreError> {
-        if in_flight.is_none() && pending_frames.is_empty() {
-            match left_writer.try_send_hop_control(frame) {
-                TryWriterSend::Sent => Ok(()),
-                TryWriterSend::Full(frame) => {
-                    let wh = left_writer.clone();
-                    *in_flight = Some(Box::pin(async move { wh.send_hop_control(frame).await }));
-                    Ok(())
-                }
-                TryWriterSend::Closed(err) => Err(err),
-            }
-        } else {
-            pending_frames.push_back(frame);
-            Ok(())
-        }
-    };
 
     let exit_result: Result<(), CoreError> = loop {
         enum Ev {
@@ -662,30 +648,7 @@ async fn run_stream_splice(
             Ev::LeftFloor(mtu) | Ev::RightFloor(mtu) => break Err(CoreError::MtuTooSmall(mtu)),
             Ev::LeftWriteFail(err) => break Err(err),
             Ev::Shutdown => break Err(CoreError::Closed),
-            Ev::CtrlSent(Ok(())) => {
-                let mut err_out = None;
-                while pending_ctrl_send.is_none() {
-                    let Some(frame) = pending_ctrl_frames.pop_front() else {
-                        break;
-                    };
-                    match left_writer.try_send_hop_control(frame) {
-                        TryWriterSend::Sent => {}
-                        TryWriterSend::Full(frame) => {
-                            let wh = left_writer.clone();
-                            pending_ctrl_send =
-                                Some(Box::pin(async move { wh.send_hop_control(frame).await }));
-                            break;
-                        }
-                        TryWriterSend::Closed(err) => {
-                            err_out = Some(err);
-                            break;
-                        }
-                    }
-                }
-                if let Some(err) = err_out {
-                    break Err(err);
-                }
-            }
+            Ev::CtrlSent(Ok(())) => {}
             Ev::CtrlSent(Err(err)) => break Err(err),
             Ev::FwdCtrl(Err(_)) => {
                 fwd_ctrl_closed = true;
@@ -717,28 +680,11 @@ async fn run_stream_splice(
                             VerifierRenewalAction::Malformed => break Err(CoreError::Malformed),
                             VerifierRenewalAction::Ignore => {}
                             VerifierRenewalAction::ReplyIdempotent(ack_id) => {
-                                let rem = match lease.remaining() {
-                                    Ok(d) => d,
-                                    Err(err) => break Err(err),
-                                };
-                                let rem_ms =
-                                    u64::try_from(rem.as_millis()).unwrap_or(u64::MAX).max(1);
-                                let payload = encode_renew_ok_payload(ack_id, rem_ms);
-                                let sealed = match ctrl.seal(outer::ST_RENEW_OK, &payload) {
-                                    Ok(s) => s,
-                                    Err(err) => break Err(err),
-                                };
-                                if let Ok(frame) =
-                                    PriorityCtrlFrame::from_slice(outer::ST_RENEW_OK, 0, &sealed)
-                                {
-                                    if let Err(err) = queue_ctrl(
-                                        frame,
-                                        &mut pending_ctrl_frames,
-                                        &mut pending_ctrl_send,
-                                    ) {
-                                        break Err(err);
-                                    }
+                                if let Err(err) = lease.remaining() {
+                                    break Err(err);
                                 }
+                                // Coalesce duplicate renewal ACK before sealing (R2-ST-02).
+                                pending_renew_ack = Some(ack_id);
                             }
                             VerifierRenewalAction::AuthorizeNew(new_id) => {
                                 let cred = match Credential::from_slice(cred_slice) {
@@ -789,26 +735,11 @@ async fn run_stream_splice(
                         .auth_transit
                         .renewed
                         .fetch_add(1, Ordering::Relaxed);
-                    let rem = match lease.remaining() {
-                        Ok(d) => d,
-                        Err(err) => break Err(err),
-                    };
-                    let rem_ms = u64::try_from(rem.as_millis()).unwrap_or(u64::MAX).max(1);
-                    let payload = encode_renew_ok_payload(id, rem_ms);
-                    let sealed = match ctrl.seal(outer::ST_RENEW_OK, &payload) {
-                        Ok(s) => s,
-                        Err(err) => break Err(err),
-                    };
-                    if let Ok(frame) = PriorityCtrlFrame::from_slice(outer::ST_RENEW_OK, 0, &sealed)
-                    {
-                        if let Err(err) = queue_ctrl(
-                            frame,
-                            &mut pending_ctrl_frames,
-                            &mut pending_ctrl_send,
-                        ) {
-                            break Err(err);
-                        }
+                    if let Err(err) = lease.remaining() {
+                        break Err(err);
                     }
+                    // Coalesce renewal ACK before sealing (R2-ST-02).
+                    pending_renew_ack = Some(id);
                 }
                 Err(err) if err.is_retryable() => {
                     verifier.complete(id, false);
@@ -826,6 +757,33 @@ async fn run_stream_splice(
             Ev::Subtask(Ok(SpliceCtrlEvent::CloseClean)) | Ev::Subtask(Err(_)) => break Ok(()),
             Ev::Subtask(Ok(SpliceCtrlEvent::Fatal(err))) => break Err(err),
         }
+
+        // Flush at most one coalesced renewal ACK whenever `left_writer` has no in-flight ctrl send.
+        if pending_ctrl_send.is_none() {
+            if let Some(ack_id) = pending_renew_ack.take() {
+                let rem = match lease.remaining() {
+                    Ok(d) => d,
+                    Err(err) => break Err(err),
+                };
+                let rem_ms = u64::try_from(rem.as_millis()).unwrap_or(u64::MAX).max(1);
+                let payload = encode_renew_ok_payload(ack_id, rem_ms);
+                let sealed = match ctrl.seal(outer::ST_RENEW_OK, &payload) {
+                    Ok(s) => s,
+                    Err(err) => break Err(err),
+                };
+                if let Ok(frame) = PriorityCtrlFrame::from_slice(outer::ST_RENEW_OK, 0, &sealed) {
+                    match left_writer.try_send_hop_control(frame) {
+                        TryWriterSend::Sent => {}
+                        TryWriterSend::Full(frame) => {
+                            let wh = left_writer.clone();
+                            pending_ctrl_send =
+                                Some(Box::pin(async move { wh.send_hop_control(frame).await }));
+                        }
+                        TryWriterSend::Closed(err) => break Err(err),
+                    }
+                }
+            }
+        }
     };
 
     // 1. Cancel both forwarding tasks immediately (interrupting mid-body reads/writes, ST-07).
@@ -834,7 +792,6 @@ async fn run_stream_splice(
     fwd_ctrl_rx.close();
     ev_rx.close();
     drop(pending_ctrl_send);
-    pending_ctrl_frames.clear();
 
     // 2. On Err(e) emit best-effort upstream hop::ST_CLOSE(e) and tear down left_writer.
     let mut close_frames = Vec::new();

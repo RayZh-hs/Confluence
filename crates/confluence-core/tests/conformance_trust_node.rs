@@ -1793,3 +1793,158 @@ fn regression_dg06_unmounting_last_attached_scope_frees_node_port_capacity() {
         .expect("DG-06: freed port slot MUST accept new link");
     assert_eq!(node_b.stats().active_datagram_ports, 1);
 }
+
+// ===========================================================================
+// Codex Round 2 Regression Test (`R2-DG-02`)
+// ===========================================================================
+
+/// R2-DG-02: Unmounting a scope via `Node::remove_scope` (or dropping `Node`) while a live
+/// `DatagramPort` for `LinkId` remains alive (due to `node_wide`, another mounted scope, or
+/// an active circuit's `Binding`) MUST NEVER allow a second receive pump or second `SlabTable`
+/// to be spawned for that `LinkId`. Once the live port retires, reattaching MUST succeed cleanly.
+#[test]
+fn regression_r2_dg02_unmount_prevents_duplicate_receive_pumps_for_same_link_id() {
+    let tr = TestRuntime::new();
+    let origin = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone()).build();
+    let scope_a = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone())
+        .with_authorizer(Arc::new(AllowAll(Duration::from_secs(60))))
+        .build();
+    let scope_b = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone())
+        .with_authorizer(Arc::new(AllowAll(Duration::from_secs(60))))
+        .build();
+    let _ea = scope_a
+        .publish_datagram_endpoint("echo", 1_200, Arc::new(DatagramEcho { rt: tr.clone() }))
+        .unwrap();
+    let _eb = scope_b
+        .publish_datagram_endpoint("echo", 1_200, Arc::new(DatagramEcho { rt: tr.clone() }))
+        .unwrap();
+
+    // Part A: Node-wide port kept alive across `remove_scope`!
+    let (dg_c1, _l1, _a1, dg_b1, _, _) = dg_pair_channel(1_500);
+    origin.register_datagram_carrier("dg1", dg_c1).unwrap();
+
+    let node = Node::builder(tr.runtime.clone()).build();
+    node.add_scope(Arc::clone(&scope_a)).unwrap();
+    node.add_scope(Arc::clone(&scope_b)).unwrap();
+    let _node_ing = node.attach_datagram(Arc::clone(&dg_b1)).unwrap();
+    tr.drive_until_idle();
+
+    // Unmount `scope_a` while `node` still owns `dg_b1` node-wide!
+    assert!(node.remove_scope(scope_a.scope_kid()).is_some());
+
+    // Immediately attempting to reattach the SAME `LinkId` on standalone `scope_a` MUST fail with
+    // `CoreError::Busy` instead of spawning a competing second receive pump!
+    assert_eq!(
+        scope_a.attach_datagram(Arc::clone(&dg_b1)).err(),
+        Some(CoreError::Busy),
+        "R2-DG-02: removed scope MUST NOT spawn a second receive pump while Node still holds live LinkId"
+    );
+    assert_eq!(scope_a.stats().active_datagram_ports, 0);
+
+    // Verify `node`'s single receive pump continues serving `scope_b` with zero stolen packets!
+    let ok_b = tr.spawner.try_block_on(async {
+        let dg = origin
+            .dial_datagram_via(
+                scope_b.public_key(),
+                "echo",
+                1_200,
+                ExplicitPath::direct(201, "dg1", b"b".to_vec()),
+            )
+            .await?;
+        for i in 0..8u8 {
+            dg.send(PacketBuf::from_payload(&[0xB0 + i; 16]))?;
+            assert_eq!(dg.recv().await?.payload(), &[0xB0 + i; 16]);
+        }
+        Ok::<(), CoreError>(())
+    });
+    assert_eq!(ok_b, Some(Ok(())));
+
+    // Dropping `node` retires `dg_b1`; NOW standalone `scope_a` MUST reattach `dg_b1` cleanly!
+    drop(node);
+    tr.drive_until_idle();
+    let _standalone_ing = scope_a
+        .attach_datagram(Arc::clone(&dg_b1))
+        .expect("R2-DG-02: reattach MUST succeed once prior Node port retires");
+    assert_eq!(scope_a.stats().active_datagram_ports, 1);
+
+    let ok_a = tr.spawner.try_block_on(async {
+        let dg = origin
+            .dial_datagram_via(
+                scope_a.public_key(),
+                "echo",
+                1_200,
+                ExplicitPath::direct(202, "dg1", b"b".to_vec()),
+            )
+            .await?;
+        dg.send(PacketBuf::from_payload(b"post-retire-ok"))?;
+        assert_eq!(dg.recv().await?.payload(), b"post-retire-ok");
+        Ok::<(), CoreError>(())
+    });
+    assert_eq!(ok_a, Some(Ok(())));
+    drop(scope_a);
+    tr.drive_until_idle();
+
+    // Part B: Adopted port kept alive strictly by an active circuit (`outbound_refs > 0`) across
+    // BOTH `Node::remove_scope` AND `Node::drop`!
+    let scope_c = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone())
+        .with_authorizer(Arc::new(AllowAll(Duration::from_secs(60))))
+        .build();
+    let _ec = scope_c
+        .publish_datagram_endpoint("echo", 1_200, Arc::new(DatagramEcho { rt: tr.clone() }))
+        .unwrap();
+    let (dg_c2, _l2, _a2, dg_b2, _, _) = dg_pair_channel(1_500);
+    origin.register_datagram_carrier("dg2", dg_c2).unwrap();
+
+    let node_b = Node::builder(tr.runtime.clone()).build();
+    let _ic = scope_c.attach_datagram(Arc::clone(&dg_b2)).unwrap();
+    node_b.add_scope(Arc::clone(&scope_c)).unwrap();
+    tr.drive_until_idle();
+
+    let active_dg = tr
+        .spawner
+        .try_block_on(origin.dial_datagram_via(
+            scope_c.public_key(),
+            "echo",
+            1_200,
+            ExplicitPath::direct(203, "dg2", b"b".to_vec()),
+        ))
+        .unwrap()
+        .unwrap();
+    tr.drive_until_idle();
+
+    // Unmount `scope_c` while `active_dg` keeps the port alive on `node_b`!
+    assert!(node_b.remove_scope(scope_c.scope_kid()).is_some());
+    assert_eq!(
+        scope_c.attach_datagram(Arc::clone(&dg_b2)).err(),
+        Some(CoreError::Busy),
+        "R2-DG-02: MUST reject reattach while active circuit keeps port alive in Node"
+    );
+
+    // Even after dropping `node_b` while `active_dg` is STILL live (`outbound_refs > 0`),
+    // reattaching `dg_b2` MUST STILL be rejected until `active_dg` closes and the pump retires!
+    drop(node_b);
+    tr.drive_until_idle();
+    assert_eq!(
+        scope_c.attach_datagram(Arc::clone(&dg_b2)).err(),
+        Some(CoreError::Busy),
+        "R2-DG-02: MUST reject reattach after Node drop while active circuit still owns live port"
+    );
+
+    // Active circuit MUST continue delivering 10/10 packets with zero competing pump interference!
+    let ok_active = tr.spawner.try_block_on(async {
+        for i in 0..10u8 {
+            active_dg.send(PacketBuf::from_payload(&[0xC0 + i; 24]))?;
+            assert_eq!(active_dg.recv().await?.payload(), &[0xC0 + i; 24]);
+        }
+        Ok::<(), CoreError>(())
+    });
+    assert_eq!(ok_active, Some(Ok(())));
+
+    // Close `active_dg` -> port retires cleanly -> reattach on standalone `scope_c` now SUCCEEDS!
+    drop(active_dg);
+    tr.drive_until_idle();
+    let _reattached = scope_c
+        .attach_datagram(Arc::clone(&dg_b2))
+        .expect("R2-DG-02: reattach MUST succeed after last active circuit retires port");
+    assert_eq!(scope_c.stats().active_datagram_ports, 1);
+}

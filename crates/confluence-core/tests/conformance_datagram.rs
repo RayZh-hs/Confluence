@@ -2607,3 +2607,676 @@ fn regression_dg16_fatal_carrier_read_error_reports_path_failure() {
         assert!(!snap.contains(&(42, PathOutcome::Closed)));
     }
 }
+
+// ===========================================================================
+// Codex Round 2 Regression Tests (`R2-ST-03` Datagram, `R2-DG-04`..`R2-DG-07`)
+// ===========================================================================
+
+/// R2-ST-03 (Datagram): Revoking, expiring, or shutting down a staged Datagram session BEFORE
+/// calling `StagedDatagram::confirm()` while the link is immediately writable MUST fail BEFORE
+/// transmitting confirmation so Destination's `DatagramEndpointHandler::open` is NEVER invoked.
+#[test]
+fn regression_r2_st03_revoked_staged_datagram_confirm_never_triggers_destination() {
+    let tr = TestRuntime::new();
+    let outcomes = RecordingPathSource::new();
+    let origin = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone())
+        .with_path_source(outcomes.clone())
+        .build();
+    let dest = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone())
+        .with_authorizer(Arc::new(AllowAll(Duration::from_secs(5))))
+        .build();
+
+    let chan = shared_datagram_channel(1_500);
+    origin.register_datagram_carrier("mem", chan.carrier).unwrap();
+    let (echo, opens, _) = DatagramEchoEndpoint::new(&tr);
+    let _ep = dest.publish_datagram_endpoint("echo", 1_200, echo).unwrap();
+    let _ing = dest.attach_datagram(Arc::clone(&chan.b_link)).unwrap();
+    tr.drive_until_idle();
+
+    // Part A: Local peer revocation BEFORE `confirm()` while link is immediately writable!
+    let staged = tr
+        .spawner
+        .try_block_on(origin.dial_datagram_staged_via(
+            dest.public_key(),
+            "echo",
+            1_200,
+            ExplicitPath::direct(311, "mem", b"b".to_vec()),
+        ))
+        .unwrap()
+        .unwrap();
+    tr.drive_until_idle();
+    assert_eq!(opens.load(Ordering::SeqCst), 0);
+
+    origin.revoke_peer(dest.public_key());
+
+    let err = tr
+        .spawner
+        .try_block_on(staged.confirm())
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(err, CoreError::Revoked);
+    tr.advance_and_drive(Duration::from_millis(100));
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        0,
+        "R2-ST-03: revoked StagedDatagram::confirm() MUST NOT transmit confirmation or open Destination"
+    );
+    assert!(outcomes
+        .snapshot()
+        .contains(&(311, PathOutcome::Failed(CoreError::Revoked))));
+    assert!(origin.is_drained());
+    assert!(dest.is_drained());
+
+    // Part B: Lease expiry BEFORE `confirm()` while link is immediately writable!
+    origin.unrevoke_peer(dest.public_key());
+    let staged2 = tr
+        .spawner
+        .try_block_on(origin.dial_datagram_staged_via(
+            dest.public_key(),
+            "echo",
+            1_200,
+            ExplicitPath::direct(312, "mem", b"b".to_vec()),
+        ))
+        .unwrap()
+        .unwrap();
+    tr.advance_and_drive(Duration::from_secs(6));
+    let err2 = tr
+        .spawner
+        .try_block_on(staged2.confirm())
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(err2, CoreError::Expired);
+    tr.advance_and_drive(Duration::from_millis(100));
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        0,
+        "R2-ST-03: expired StagedDatagram::confirm() MUST NOT open Destination"
+    );
+    assert!(outcomes
+        .snapshot()
+        .contains(&(312, PathOutcome::Failed(CoreError::Expired))));
+}
+
+/// R2-DG-04: Two concurrent dials from the SAME peer through the SAME 2-hop transit publications
+/// (`Origin -> Hop0 -> Hop1 -> Dest`) where every `handler.open()` mints a distinct outbound link
+/// and `source_tag`, with BOTH `Hop1` and `Dest` challenging simultaneously and replies reordered,
+/// MUST correlate retry state by `(ingress_link_id, upstream_cid, peer, plane, pub_id, target)`
+/// AND preserve each hop's outbound `Binding` (`right.cid()`) so BOTH dials succeed cleanly!
+#[test]
+fn regression_r2_dg04_concurrent_cookie_retries_preserve_per_dial_links_and_multihop_cids() {
+    struct FreshSourceTagTransit {
+        open_calls: Arc<AtomicUsize>,
+        next_scope: Arc<ScopeInstance>,
+        tag_prefix: u8,
+    }
+    impl DatagramTransitHandler for FreshSourceTagTransit {
+        fn caps(&self) -> ChannelCaps {
+            ChannelCaps::fixed(1_500, false)
+        }
+        fn open(
+            &self,
+            _subtarget: &str,
+            _auth: SessionAuth,
+        ) -> BoxFuture<'_, Result<Arc<dyn DatagramLink>, CoreError>> {
+            let n = self.open_calls.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+            let next_scope = Arc::clone(&self.next_scope);
+            let prefix = self.tag_prefix;
+            Box::pin(async move {
+                let mut tag = [0u8; 16];
+                tag[0] = prefix;
+                tag[8..16].copy_from_slice(&n.to_be_bytes());
+                let pair = MemoryDatagramPair::with_source_tags(1_500, tag, tag);
+                let _ = next_scope.attach_datagram(Arc::clone(&pair.b))?;
+                Ok(pair.a as Arc<dyn DatagramLink>)
+            })
+        }
+    }
+
+    let tr = TestRuntime::new();
+    let origin = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone()).build();
+    let hop0 = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone())
+        .with_authorizer(Arc::new(AllowAll(Duration::from_secs(60))))
+        .build();
+    let hop1 = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone())
+        .with_authorizer(Arc::new(AllowAll(Duration::from_secs(60))))
+        .build();
+    let dest = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone())
+        .with_authorizer(Arc::new(AllowAll(Duration::from_secs(60))))
+        .build();
+
+    let h0_opens = Arc::new(AtomicUsize::new(0));
+    let h1_opens = Arc::new(AtomicUsize::new(0));
+    let _t0 = hop0
+        .publish_datagram_transit(
+            "to-h1",
+            Arc::new(FreshSourceTagTransit {
+                open_calls: Arc::clone(&h0_opens),
+                next_scope: Arc::clone(&hop1),
+                tag_prefix: 0xA0,
+            }),
+        )
+        .unwrap();
+    let _t1 = hop1
+        .publish_datagram_transit(
+            "to-dest",
+            Arc::new(FreshSourceTagTransit {
+                open_calls: Arc::clone(&h1_opens),
+                next_scope: Arc::clone(&dest),
+                tag_prefix: 0xB0,
+            }),
+        )
+        .unwrap();
+    let (echo, _, _) = DatagramEchoEndpoint::new(&tr);
+    let _ep = dest.publish_datagram_endpoint("echo", 1_200, echo).unwrap();
+
+    let a_h0 = shared_datagram_channel(1_500);
+    origin.register_datagram_carrier("h0", a_h0.carrier).unwrap();
+    let _i0 = hop0.attach_datagram(Arc::clone(&a_h0.b_link)).unwrap();
+    tr.drive_until_idle();
+
+    // Put BOTH Hop1 AND Destination under load so BOTH dials traverse TWO rounds of cookie
+    // challenges across BOTH hops!
+    hop1.set_under_load(Some(true));
+    dest.set_under_load(Some(true));
+
+    // Reorder the first pair of SETUP_COOKIE replies returning from Hop0 -> Origin so BOTH
+    // concurrent dials write their entries to Hop0's cache BEFORE either retry arrives!
+    a_h0.b_faults.reorder_next_pair();
+
+    let make_path = |id: u64| {
+        let mut path = ExplicitPath::direct(id, "h0", b"h0".to_vec());
+        path.hops = vec![
+            HopSpec {
+                peer: hop0.public_key(),
+                target: "to-h1".into(),
+            },
+            HopSpec {
+                peer: hop1.public_key(),
+                target: "to-dest".into(),
+            },
+        ];
+        path
+    };
+
+    let res1: Arc<Mutex<Option<Result<confluence_core::E2eDatagram, CoreError>>>> =
+        Arc::new(Mutex::new(None));
+    let res2: Arc<Mutex<Option<Result<confluence_core::E2eDatagram, CoreError>>>> =
+        Arc::new(Mutex::new(None));
+
+    {
+        let o = Arc::clone(&origin);
+        let dpk = dest.public_key();
+        let r = Arc::clone(&res1);
+        let p = make_path(401);
+        tr.runtime.spawner.spawn(Box::pin(async move {
+            let out = o.dial_datagram_via(dpk, "echo", 1_200, p).await;
+            *r.lock().unwrap() = Some(out);
+        }));
+    }
+    {
+        let o = Arc::clone(&origin);
+        let dpk = dest.public_key();
+        let r = Arc::clone(&res2);
+        let p = make_path(402);
+        tr.runtime.spawner.spawn(Box::pin(async move {
+            let out = o.dial_datagram_via(dpk, "echo", 1_200, p).await;
+            *r.lock().unwrap() = Some(out);
+        }));
+    }
+
+    tr.drive_until_idle();
+
+    let dg1 = res1
+        .lock()
+        .unwrap()
+        .take()
+        .expect("dial 1 must complete")
+        .expect("R2-DG-04: concurrent dial 1 MUST succeed across 2-hop cookie retries");
+    let dg2 = res2
+        .lock()
+        .unwrap()
+        .take()
+        .expect("dial 2 must complete")
+        .expect("R2-DG-04: concurrent dial 2 MUST succeed across 2-hop cookie retries");
+
+    assert_eq!(
+        h0_opens.load(Ordering::SeqCst),
+        2,
+        "R2-DG-04: Hop0 MUST open exactly 1 outbound link per concurrent dial and reuse across retries"
+    );
+    assert_eq!(
+        h1_opens.load(Ordering::SeqCst),
+        2,
+        "R2-DG-04: Hop1 MUST correlate both concurrent dials via Hop0's preserved right.cid()"
+    );
+    assert_eq!(hop1.stats().mac2_challenges_total, 2);
+    assert_eq!(dest.stats().mac2_challenges_total, 2);
+
+    let exchanged = tr.spawner.try_block_on(async {
+        dg1.send(PacketBuf::from_payload(b"dial-1-ok"))?;
+        dg2.send(PacketBuf::from_payload(b"dial-2-ok"))?;
+        assert_eq!(dg1.recv().await?.payload(), b"dial-1-ok");
+        assert_eq!(dg2.recv().await?.payload(), b"dial-2-ok");
+        Ok::<(), CoreError>(())
+    });
+    assert_eq!(exchanged, Some(Ok(())));
+}
+
+/// R2-DG-05: An always-ready Destination app link continuously yielding oversized packets
+/// (`> max_payload`) MUST yield back to the bridge supervisor instead of spinning infinitely
+/// inside one poll, preserving reverse delivery (`Origin -> app_link`) AND prompt shutdown!
+#[test]
+fn regression_r2_dg05_oversized_app_packet_flood_does_not_starve_bridge_or_shutdown() {
+    struct AlwaysOversizedAppLink {
+        id: LinkId,
+        dest: Arc<ScopeInstance>,
+        oversized_emitted: Arc<AtomicUsize>,
+        received_from_origin: Arc<Mutex<Vec<Vec<u8>>>>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for AlwaysOversizedAppLink {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    impl DatagramLink for AlwaysOversizedAppLink {
+        fn caps(&self) -> ChannelCaps {
+            ChannelCaps::fixed(2_400, false)
+        }
+        fn poll_send_ready(&self, _cx: &mut Context<'_>) -> Poll<Result<(), CoreError>> {
+            Poll::Ready(Ok(()))
+        }
+        fn try_send(&self, packet: PacketBuf) -> Result<(), CoreError> {
+            self.received_from_origin
+                .lock()
+                .unwrap()
+                .push(packet.payload().to_vec());
+            // Once reverse traffic proved it wasn't starved, trigger graceful shutdown while
+            // `poll_recv` is STILL unconditionally always-ready with oversized packets!
+            self.dest.begin_shutdown();
+            Ok(())
+        }
+        fn poll_recv(&self, _cx: &mut Context<'_>) -> Poll<Result<PacketBuf, CoreError>> {
+            // Unconditionally ALWAYS ready with an oversized 2000-byte payload (> 1470 max_payload)!
+            self.oversized_emitted.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Ok(PacketBuf::from_payload(&[0xEE; 2_000])))
+        }
+        fn link_id(&self) -> LinkId {
+            self.id
+        }
+    }
+
+    struct FloodEndpoint {
+        dest: Arc<ScopeInstance>,
+        oversized_emitted: Arc<AtomicUsize>,
+        received_from_origin: Arc<Mutex<Vec<Vec<u8>>>>,
+        dropped: Arc<AtomicBool>,
+    }
+    impl DatagramEndpointHandler for FloodEndpoint {
+        fn open(&self, _auth: SessionAuth) -> BoxFuture<'_, Result<Arc<dyn DatagramLink>, CoreError>> {
+            let link: Arc<dyn DatagramLink> = Arc::new(AlwaysOversizedAppLink {
+                id: LinkId::allocate(),
+                dest: Arc::clone(&self.dest),
+                oversized_emitted: Arc::clone(&self.oversized_emitted),
+                received_from_origin: Arc::clone(&self.received_from_origin),
+                dropped: Arc::clone(&self.dropped),
+            });
+            Box::pin(async move { Ok(link) })
+        }
+    }
+
+    let tr = TestRuntime::new();
+    let origin = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone()).build();
+    let dest = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone())
+        .with_authorizer(Arc::new(AllowAll(Duration::from_secs(60))))
+        .build();
+
+    let oversized_emitted = Arc::new(AtomicUsize::new(0));
+    let received_from_origin = Arc::new(Mutex::new(Vec::new()));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let chan = shared_datagram_channel(1_500);
+    origin.register_datagram_carrier("mem", chan.carrier).unwrap();
+    let _ep = dest
+        .publish_datagram_endpoint(
+            "flood",
+            1_200,
+            Arc::new(FloodEndpoint {
+                dest: Arc::clone(&dest),
+                oversized_emitted: Arc::clone(&oversized_emitted),
+                received_from_origin: Arc::clone(&received_from_origin),
+                dropped: Arc::clone(&dropped),
+            }),
+        )
+        .unwrap();
+    let _ing = dest.attach_datagram(Arc::clone(&chan.b_link)).unwrap();
+    tr.drive_until_idle();
+
+    // Dial, immediately send a reverse-direction packet, and drive until idle:
+    // - On the buggy bridge, `dir2` spun forever in ONE poll on the always-ready oversized link,
+    //   preventing `dir1` from ever delivering `b"must-not-starve"` AND preventing shutdown!
+    // - With bounded per-poll yields, `dir1` delivers `b"must-not-starve"` -> `try_send` calls
+    //   `dest.begin_shutdown()` -> supervisor immediately observes shutdown, drops `app_link`,
+    //   and drains cleanly!
+    let res = tr.spawner.try_block_on(async {
+        let dg = origin
+            .dial_datagram_via(
+                dest.public_key(),
+                "flood",
+                1_200,
+                ExplicitPath::direct(501, "mem", b"b".to_vec()),
+            )
+            .await?;
+        dg.send(PacketBuf::from_payload(b"must-not-starve"))?;
+        Ok::<_, CoreError>(dg)
+    });
+    let _dg = res.expect("dial + send must complete without spinning").unwrap();
+    tr.drive_until_idle();
+
+    assert_eq!(
+        received_from_origin.lock().unwrap().as_slice(),
+        &[b"must-not-starve".to_vec()],
+        "R2-DG-05: oversized app packet flood MUST NOT starve Origin->Dest bridge direction"
+    );
+    assert!(oversized_emitted.load(Ordering::Relaxed) >= 1);
+    assert!(
+        dest.is_drained(),
+        "R2-DG-05: dest MUST drain promptly despite unconditionally always-ready oversized app link"
+    );
+    assert!(
+        dropped.load(Ordering::Acquire),
+        "R2-DG-05: destination app_link MUST be dropped on shutdown"
+    );
+}
+
+/// R2-DG-06: During concurrent shutdown right as Destination's `DatagramEndpointHandler::open()`
+/// returns `app_link`, `ScopeInstance::is_drained()` MUST NEVER transiently observe `true` while
+/// `serve_datagram_destination` or the bridge task still owns `app_link`.
+#[test]
+fn regression_r2_dg06_concurrent_shutdown_never_reports_drained_while_app_link_held() {
+    use core::future::Future;
+    use std::sync::Barrier;
+    use std::thread;
+
+    use confluence_core::runtime::{Clock, Runtime, TaskSpawner};
+
+    struct ThreadWaker(thread::Thread);
+    impl std::task::Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    fn thread_block_on<F: Future>(fut: F) -> F::Output {
+        let mut fut = core::pin::pin!(fut);
+        let waker = std::task::Waker::from(Arc::new(ThreadWaker(thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(out) => return out,
+                Poll::Pending => thread::park(),
+            }
+        }
+    }
+
+    /// Real OS-thread spawner so the Datagram session worker and `serve_datagram_destination`
+    /// genuinely execute in parallel across CPU cores!
+    struct OsThreadSpawner;
+    impl TaskSpawner for OsThreadSpawner {
+        fn spawn(&self, fut: BoxFuture<'static, ()>) {
+            thread::spawn(move || {
+                thread_block_on(fut);
+            });
+        }
+    }
+
+    struct TrackedAppLink {
+        inner: Arc<MemoryDatagramLink>,
+        alive: Arc<AtomicBool>,
+    }
+    impl Drop for TrackedAppLink {
+        fn drop(&mut self) {
+            self.alive.store(false, Ordering::Release);
+        }
+    }
+    impl DatagramLink for TrackedAppLink {
+        fn caps(&self) -> ChannelCaps {
+            self.inner.caps()
+        }
+        fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), CoreError>> {
+            self.inner.poll_send_ready(cx)
+        }
+        fn try_send(&self, packet: PacketBuf) -> Result<(), CoreError> {
+            self.inner.try_send(packet)
+        }
+        fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Result<PacketBuf, CoreError>> {
+            self.inner.poll_recv(cx)
+        }
+        fn link_id(&self) -> LinkId {
+            self.inner.link_id()
+        }
+    }
+
+    struct RacingOpenEndpoint {
+        opened_barrier: Arc<Barrier>,
+        alive: Arc<AtomicBool>,
+    }
+    impl DatagramEndpointHandler for RacingOpenEndpoint {
+        fn open(&self, _auth: SessionAuth) -> BoxFuture<'_, Result<Arc<dyn DatagramLink>, CoreError>> {
+            let barrier = Arc::clone(&self.opened_barrier);
+            let alive = Arc::clone(&self.alive);
+            Box::pin(async move {
+                let pair = MemoryDatagramPair::pair(1_500);
+                alive.store(true, Ordering::Release);
+                let link: Arc<dyn DatagramLink> = Arc::new(TrackedAppLink {
+                    inner: pair.a,
+                    alive,
+                });
+                // Release the shutdown observer thread at the exact moment `open()` returns `app_link`!
+                barrier.wait();
+                Ok(link)
+            })
+        }
+    }
+
+    for _ in 0..40 {
+        let clock: Arc<dyn Clock> = confluence_core::testing::VirtualClock::new();
+        let wall = confluence_core::testing::FixedWallClock::new(1_700_000_000_000);
+        let rt = Runtime::new(Arc::clone(&clock), Arc::new(OsThreadSpawner)).with_wall_clock(wall);
+        let origin = ScopeInstance::builder(ScopeKeypair::generate(), rt.clone()).build();
+        let dest = ScopeInstance::builder(ScopeKeypair::generate(), rt.clone())
+            .with_authorizer(Arc::new(AllowAll(Duration::from_secs(60))))
+            .build();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let alive = Arc::new(AtomicBool::new(false));
+        let chan = shared_datagram_channel(1_500);
+        origin.register_datagram_carrier("mem", chan.carrier).unwrap();
+        let _ep = dest
+            .publish_datagram_endpoint(
+                "race",
+                1_200,
+                Arc::new(RacingOpenEndpoint {
+                    opened_barrier: Arc::clone(&barrier),
+                    alive: Arc::clone(&alive),
+                }),
+            )
+            .unwrap();
+        let _ing = dest.attach_datagram(Arc::clone(&chan.b_link)).unwrap();
+
+        let b_shut = Arc::clone(&barrier);
+        let d_shut = Arc::clone(&dest);
+        let a_shut = Arc::clone(&alive);
+        let t_shut = thread::spawn(move || {
+            b_shut.wait();
+            d_shut.begin_shutdown();
+            loop {
+                let drained = d_shut.is_drained();
+                let still_alive = a_shut.load(Ordering::Acquire);
+                assert!(
+                    !(drained && still_alive),
+                    "R2-DG-06: is_drained() reported true while Destination still owned app_link!"
+                );
+                if drained {
+                    break;
+                }
+                thread::yield_now();
+            }
+        });
+
+        let _ = thread_block_on(origin.dial_datagram_via(
+            dest.public_key(),
+            "race",
+            1_200,
+            ExplicitPath::direct(601, "mem", b"b".to_vec()),
+        ));
+
+        t_shut.join().unwrap();
+        assert!(dest.is_drained());
+        assert!(!alive.load(Ordering::Acquire));
+    }
+}
+
+/// R2-DG-07: Fatal Destination app-link errors (in BOTH `poll_recv` and `try_send`, e.g.
+/// `TargetUnreachable` and `TargetRefused`) MUST propagate through the worker's close request
+/// into authenticated `e2e::DG_CLOSE(err)` so Origin observes the real error and reports
+/// `PathOutcome::Failed(err)` (NOT `PathOutcome::Closed`)!
+#[test]
+fn regression_r2_dg07_fatal_dest_app_link_errors_propagate_via_dg_close_to_origin() {
+    struct ControllableAppLink {
+        inner: Arc<MemoryDatagramLink>,
+        send_err: Mutex<Option<CoreError>>,
+    }
+    impl DatagramLink for ControllableAppLink {
+        fn caps(&self) -> ChannelCaps {
+            self.inner.caps()
+        }
+        fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), CoreError>> {
+            self.inner.poll_send_ready(cx)
+        }
+        fn try_send(&self, packet: PacketBuf) -> Result<(), CoreError> {
+            if let Some(err) = self.send_err.lock().unwrap().clone() {
+                return Err(err);
+            }
+            self.inner.try_send(packet)
+        }
+        fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Result<PacketBuf, CoreError>> {
+            self.inner.poll_recv(cx)
+        }
+        fn link_id(&self) -> LinkId {
+            self.inner.link_id()
+        }
+    }
+
+    struct ControllableAppEndpoint {
+        last_faults: Mutex<Option<DatagramFaults>>,
+        last_link: Mutex<Option<Arc<ControllableAppLink>>>,
+    }
+    impl DatagramEndpointHandler for ControllableAppEndpoint {
+        fn open(&self, _auth: SessionAuth) -> BoxFuture<'_, Result<Arc<dyn DatagramLink>, CoreError>> {
+            let pair = MemoryDatagramPair::pair(1_500);
+            let link = Arc::new(ControllableAppLink {
+                inner: pair.a,
+                send_err: Mutex::new(None),
+            });
+            // `pair.b_faults` controls pipe B -> A, i.e. Destination bridge's `app_link.poll_recv`!
+            *self.last_faults.lock().unwrap() = Some(pair.b_faults);
+            *self.last_link.lock().unwrap() = Some(Arc::clone(&link));
+            Box::pin(async move { Ok(link as Arc<dyn DatagramLink>) })
+        }
+    }
+
+    let tr = TestRuntime::new();
+    let outcomes = RecordingPathSource::new();
+    let origin = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone())
+        .with_path_source(outcomes.clone())
+        .build();
+    let dest = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone())
+        .with_authorizer(Arc::new(AllowAll(Duration::from_secs(60))))
+        .build();
+
+    let chan = shared_datagram_channel(1_500);
+    origin.register_datagram_carrier("mem", chan.carrier).unwrap();
+    let ep = Arc::new(ControllableAppEndpoint {
+        last_faults: Mutex::new(None),
+        last_link: Mutex::new(None),
+    });
+    let _g = dest
+        .publish_datagram_endpoint("app", 1_200, Arc::clone(&ep) as Arc<dyn DatagramEndpointHandler>)
+        .unwrap();
+    let _ing = dest.attach_datagram(Arc::clone(&chan.b_link)).unwrap();
+    tr.drive_until_idle();
+
+    // Part A: Fatal `app_link.recv()` error (`TargetUnreachable`) -> Origin sees `TargetUnreachable`
+    // and reports `PathOutcome::Failed(TargetUnreachable)`!
+    let dg1 = tr
+        .spawner
+        .try_block_on(origin.dial_datagram_via(
+            dest.public_key(),
+            "app",
+            1_200,
+            ExplicitPath::direct(701, "mem", b"b".to_vec()),
+        ))
+        .unwrap()
+        .unwrap();
+    tr.drive_until_idle();
+
+    let faults1 = ep.last_faults.lock().unwrap().take().unwrap();
+    faults1.inject_fatal_error(CoreError::TargetUnreachable);
+    tr.drive_until_idle();
+
+    assert_eq!(
+        tr.spawner.try_block_on(dg1.recv()),
+        Some(Err(CoreError::TargetUnreachable)),
+        "R2-DG-07 (recv): fatal app_link error MUST arrive at Origin via authenticated DG_CLOSE"
+    );
+    let snap = outcomes.snapshot();
+    assert!(
+        snap.contains(&(701, PathOutcome::Failed(CoreError::TargetUnreachable))),
+        "R2-DG-07 (recv): Origin MUST report PathOutcome::Failed(TargetUnreachable), got {:?}",
+        snap
+    );
+    assert!(!snap.contains(&(701, PathOutcome::Closed)));
+    drop(dg1);
+    tr.drive_until_idle();
+
+    // Part B: Fatal `app_link.send()` error (`TargetRefused`) -> Origin sees `TargetRefused`
+    // and reports `PathOutcome::Failed(TargetRefused)`!
+    let dg2 = tr
+        .spawner
+        .try_block_on(origin.dial_datagram_via(
+            dest.public_key(),
+            "app",
+            1_200,
+            ExplicitPath::direct(702, "mem", b"b".to_vec()),
+        ))
+        .unwrap()
+        .unwrap();
+    tr.drive_until_idle();
+
+    let link2 = ep.last_link.lock().unwrap().take().unwrap();
+    *link2.send_err.lock().unwrap() = Some(CoreError::TargetRefused);
+    dg2.send(PacketBuf::from_payload(b"trigger-send-err")).unwrap();
+    tr.drive_until_idle();
+
+    assert_eq!(
+        tr.spawner.try_block_on(dg2.recv()),
+        Some(Err(CoreError::TargetRefused)),
+        "R2-DG-07 (send): fatal app_link send error MUST arrive at Origin via authenticated DG_CLOSE"
+    );
+    let snap2 = outcomes.snapshot();
+    assert!(
+        snap2.contains(&(702, PathOutcome::Failed(CoreError::TargetRefused))),
+        "R2-DG-07 (send): Origin MUST report PathOutcome::Failed(TargetRefused), got {:?}",
+        snap2
+    );
+    assert!(!snap2.contains(&(702, PathOutcome::Closed)));
+    drop(dg2);
+    tr.drive_until_idle();
+    assert!(dest.is_drained());
+    assert!(origin.is_drained());
+}

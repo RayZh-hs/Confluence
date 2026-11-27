@@ -662,6 +662,10 @@ impl OutboundWriterQueue {
         &self.writer
     }
 
+    fn is_ctrl_idle(&self) -> bool {
+        self.in_flight_ctrl.is_none() && self.pending_ctrl.is_empty()
+    }
+
     fn is_data_idle(&self) -> bool {
         self.in_flight_data.is_none() && self.pending_data.is_empty()
     }
@@ -1009,6 +1013,13 @@ async fn run_stream_session(
     let mut cred_futs: FuturesUnordered<CredFetchFut> = FuturesUnordered::new();
     let mut dest_verifier = RenewalVerifierState::new();
     let mut dest_auth_fut: Option<RenewalAuthFut> = None;
+    // Coalesced pre-seal renewal replies/requests so stalled carriers never grow unbounded queues (R2-ST-02).
+    let mut pending_dest_renew_ack: Option<u64> = None;
+    let mut pending_origin_e2e_renew: Option<(u64, Credential)> = None;
+    let mut pending_origin_hop_renews: Vec<Option<(u64, Credential)>> = match &role {
+        StreamSessionRole::Origin(orig) => vec![None; orig.hops.len()],
+        StreamSessionRole::Destination(_) => Vec::new(),
+    };
 
     let mut fin_queued = false;
     let mut sent_fin = false;
@@ -1267,20 +1278,12 @@ async fn run_stream_session(
                 }
                 StepEvent::ScopeShutdown => {
                     shutdown_initiated = true;
+                    // Immediately reject NEW app writes, then drain ALL already-accepted writes
+                    // (`app_write_rx`, `pending_app_writes`, `delayed_egress`) in exact FIFO order
+                    // BEFORE enqueuing `e2e::ST_FIN` (R2-ST-01).
                     data_sem.close();
                     if !fin_queued {
-                        if delayed_egress.is_some() {
-                            deferred_shutdown_fin = true;
-                        } else if let Err(err) = initiate_fin(
-                            &data_sem,
-                            &mut fin_queued,
-                            &mut tx_cipher,
-                            &mut e2e_scratch,
-                            &mut outbound,
-                            &mut pending_fin_ack,
-                        ) {
-                            break err;
-                        }
+                        deferred_shutdown_fin = true;
                     }
                 }
                 StepEvent::CtrlIn(Err(_)) => {
@@ -1451,22 +1454,11 @@ async fn run_stream_session(
                         VerifierRenewalAction::Malformed => break CoreError::Malformed,
                         VerifierRenewalAction::Ignore => {}
                         VerifierRenewalAction::ReplyIdempotent(ack_id) => {
-                            let rem = match lease.remaining() {
-                                Ok(d) => d,
-                                Err(err) => break err,
-                            };
-                            let rem_ms = u64::try_from(rem.as_millis()).unwrap_or(u64::MAX).max(1);
-                            let payload = encode_renew_ok_payload(ack_id, rem_ms);
-                            if let Err(err) = seal_and_queue_e2e(
-                                &mut tx_cipher,
-                                e2e_st::ST_RENEW_OK,
-                                &payload,
-                                &mut e2e_scratch,
-                                &mut outbound,
-                                None,
-                            ) {
+                            if let Err(err) = lease.remaining() {
                                 break err;
                             }
+                            // Coalesce duplicate renewal ACKs before sealing (R2-ST-02).
+                            pending_dest_renew_ack = Some(ack_id);
                         }
                         VerifierRenewalAction::AuthorizeNew(new_id) => {
                             let scope_c = Arc::clone(&scope);
@@ -1548,22 +1540,11 @@ async fn run_stream_session(
                             .auth_endpoint
                             .renewed
                             .fetch_add(1, Ordering::Relaxed);
-                        let rem = match lease.remaining() {
-                            Ok(d) => d,
-                            Err(err) => break err,
-                        };
-                        let rem_ms = u64::try_from(rem.as_millis()).unwrap_or(u64::MAX).max(1);
-                        let payload = encode_renew_ok_payload(id, rem_ms);
-                        if let Err(err) = seal_and_queue_e2e(
-                            &mut tx_cipher,
-                            e2e_st::ST_RENEW_OK,
-                            &payload,
-                            &mut e2e_scratch,
-                            &mut outbound,
-                            None,
-                        ) {
+                        if let Err(err) = lease.remaining() {
                             break err;
                         }
+                        // Coalesce renewal ACK before sealing (R2-ST-02).
+                        pending_dest_renew_ack = Some(id);
                     }
                     Err(err) if err.is_retryable() => {
                         dest_verifier.complete(id, false);
@@ -1591,17 +1572,13 @@ async fn run_stream_session(
                             renewal_id,
                             credential,
                         } => {
-                            if let Err(err) = queue_origin_stream_renewal(
+                            stage_origin_stream_renewal(
                                 slot,
                                 renewal_id,
-                                &credential,
-                                &mut tx_cipher,
-                                &mut orig.hops,
-                                &mut e2e_scratch,
-                                &mut outbound,
-                            ) {
-                                break err;
-                            }
+                                credential,
+                                &mut pending_origin_e2e_renew,
+                                &mut pending_origin_hop_renews,
+                            );
                         }
                         CredentialFetchOutcome::RetryScheduled => {}
                         CredentialFetchOutcome::Fatal(err) => {
@@ -1650,20 +1627,6 @@ async fn run_stream_session(
                                     break err;
                                 }
                                 scope.metrics.record_tx(Plane::Stream, len as u64, false);
-
-                                if deferred_shutdown_fin && !fin_queued {
-                                    deferred_shutdown_fin = false;
-                                    if let Err(err) = initiate_fin(
-                                        &data_sem,
-                                        &mut fin_queued,
-                                        &mut tx_cipher,
-                                        &mut e2e_scratch,
-                                        &mut outbound,
-                                        &mut pending_fin_ack,
-                                    ) {
-                                        break err;
-                                    }
-                                }
                             }
                         }
                     }
@@ -1755,18 +1718,13 @@ async fn run_stream_session(
                                             .renewal_retries
                                             .fetch_add(1, Ordering::Relaxed);
                                     }
-                                    if let Err(err) = queue_origin_stream_renewal(
+                                    stage_origin_stream_renewal(
                                         slot,
                                         renewal_id,
-                                        &credential,
-                                        &mut tx_cipher,
-                                        &mut orig.hops,
-                                        &mut e2e_scratch,
-                                        &mut outbound,
-                                    ) {
-                                        fatal_err = Some(err);
-                                        break;
-                                    }
+                                        credential,
+                                        &mut pending_origin_e2e_renew,
+                                        &mut pending_origin_hop_renews,
+                                    );
                                 }
                             }
                         }
@@ -1857,28 +1815,102 @@ async fn run_stream_session(
                 }
             }
 
-            // Drain pending app writes non-blockingly (ST-01, ST-06):
-            // - Once `fin_queued` is true, immediately discard any stray Data and service Flush/Shutdown.
-            // - Otherwise, drain while neither egress-delayed nor waiting on writer backpressure.
+            // Flush coalesced renewal controls BEFORE app writes (bounded queues, R2-ST-02):
+            // 1. Origin hop::ST_RENEW controls (independent ControlCiphers, only while ctrl queue idle).
+            if let StreamSessionRole::Origin(orig) = &mut role {
+                let mut fatal_hop_ctrl: Option<CoreError> = None;
+                while outbound.is_ctrl_idle() {
+                    let Some((idx, (renewal_id, cred))) = pending_origin_hop_renews
+                        .iter_mut()
+                        .enumerate()
+                        .find_map(|(i, slot)| slot.take().map(|v| (i, v)))
+                    else {
+                        break;
+                    };
+                    if let Err(err) = queue_origin_hop_renewal(
+                        idx,
+                        renewal_id,
+                        &cred,
+                        &mut orig.hops,
+                        &mut outbound,
+                    ) {
+                        fatal_hop_ctrl = Some(err);
+                        break;
+                    }
+                }
+                if let Some(err) = fatal_hop_ctrl {
+                    break err;
+                }
+            }
+            // 2. Destination coalesced e2e::ST_RENEW_OK (only when E2E writer queue is idle).
+            if outbound.is_data_idle() {
+                if let Some(ack_id) = pending_dest_renew_ack.take() {
+                    let rem = match lease.remaining() {
+                        Ok(d) => d,
+                        Err(err) => break err,
+                    };
+                    let rem_ms = u64::try_from(rem.as_millis()).unwrap_or(u64::MAX).max(1);
+                    let payload = encode_renew_ok_payload(ack_id, rem_ms);
+                    if let Err(err) = seal_and_queue_e2e(
+                        &mut tx_cipher,
+                        e2e_st::ST_RENEW_OK,
+                        &payload,
+                        &mut e2e_scratch,
+                        &mut outbound,
+                        None,
+                    ) {
+                        break err;
+                    }
+                }
+            }
+            // 3. Origin coalesced e2e::ST_RENEW (only when E2E writer queue is idle).
+            if outbound.is_data_idle() {
+                if let Some((renewal_id, cred)) = pending_origin_e2e_renew.take() {
+                    let payload = match encode_renew_payload(renewal_id, cred.as_bytes()) {
+                        Ok(p) => p,
+                        Err(err) => break err,
+                    };
+                    if let Err(err) = seal_and_queue_e2e(
+                        &mut tx_cipher,
+                        e2e_st::ST_RENEW,
+                        &payload,
+                        &mut e2e_scratch,
+                        &mut outbound,
+                        None,
+                    ) {
+                        break err;
+                    }
+                }
+            }
+
+            // Drain pending app writes non-blockingly in exact FIFO order (ST-01, ST-06, R2-ST-01):
+            // - While `deferred_shutdown_fin && !fin_queued`, pull any already-accepted writes from
+            //   `app_write_rx`, drain ALL accepted Data/Flush/Shutdown in exact FIFO order (including
+            //   any TrafficGate `delayed_egress`), and ONLY THEN enqueue `e2e::ST_FIN` once every
+            //   accepted write has been handed off (`data_sem.in_use() == 0`).
+            // - Once `fin_queued` is true, service trailing Flush/Shutdown waiters without growing queues.
             let mut fatal_write: Option<CoreError> = None;
             loop {
+                if deferred_shutdown_fin && !fin_queued && !app_write_closed {
+                    loop {
+                        match app_write_rx.try_recv() {
+                            Ok(msg) => pending_app_writes.push_back(msg),
+                            Err(async_channel::TryRecvError::Empty) => break,
+                            Err(async_channel::TryRecvError::Closed) => {
+                                app_write_closed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 if fin_queued {
                     let Some(msg) = pending_app_writes.pop_front() else {
                         break;
                     };
                     match msg {
                         AppWriteMsg::Data(_, _permit) => {}
-                        AppWriteMsg::Flush(ack_tx) => {
-                            if sent_fin {
-                                let _ = ack_tx.try_send(Ok(()));
-                            } else if let Err(err) =
-                                outbound.enqueue_data(WriterDataCmd::FlushAck(ack_tx), None)
-                            {
-                                fatal_write = Some(err);
-                                break;
-                            }
-                        }
-                        AppWriteMsg::Shutdown(ack_tx) => {
+                        AppWriteMsg::Flush(ack_tx) | AppWriteMsg::Shutdown(ack_tx) => {
                             if sent_fin {
                                 let _ = ack_tx.try_send(Ok(()));
                             } else {
@@ -1892,53 +1924,92 @@ async fn run_stream_session(
                 if delayed_egress.is_some() || !outbound.is_data_idle() {
                     break;
                 }
-                let Some(msg) = pending_app_writes.pop_front() else {
-                    break;
-                };
-                match msg {
-                    AppWriteMsg::Data(data, permit) => {
-                        if deferred_shutdown_fin {
-                            continue;
-                        }
-                        if matches!(role, StreamSessionRole::Destination(_)) {
-                            if let Some(gate) = gate_cache.get(&lease) {
-                                match gate.charge_stream(Direction::Egress, data.len()) {
-                                    StreamAction::Allow => {}
-                                    StreamAction::Delay(d) => {
-                                        let dl = clock.now().saturating_add(d);
-                                        delayed_egress = Some((data, permit, dl));
-                                        break;
-                                    }
-                                    StreamAction::Close(err) => {
-                                        fatal_write = Some(err);
-                                        break;
+                if let Some(msg) = pending_app_writes.pop_front() {
+                    match msg {
+                        AppWriteMsg::Data(data, permit) => {
+                            if matches!(role, StreamSessionRole::Destination(_)) {
+                                if let Some(gate) = gate_cache.get(&lease) {
+                                    match gate.charge_stream(Direction::Egress, data.len()) {
+                                        StreamAction::Allow => {}
+                                        StreamAction::Delay(d) => {
+                                            let dl = clock.now().saturating_add(d);
+                                            delayed_egress = Some((data, permit, dl));
+                                            break;
+                                        }
+                                        StreamAction::Close(err) => {
+                                            fatal_write = Some(err);
+                                            break;
+                                        }
                                     }
                                 }
                             }
+                            let len = data.len();
+                            if let Err(err) = seal_and_queue_e2e(
+                                &mut tx_cipher,
+                                e2e_st::ST_DATA,
+                                &data,
+                                &mut e2e_scratch,
+                                &mut outbound,
+                                Some(permit),
+                            ) {
+                                fatal_write = Some(err);
+                                break;
+                            }
+                            scope.metrics.record_tx(Plane::Stream, len as u64, false);
                         }
-                        let len = data.len();
-                        if let Err(err) = seal_and_queue_e2e(
-                            &mut tx_cipher,
-                            e2e_st::ST_DATA,
-                            &data,
-                            &mut e2e_scratch,
-                            &mut outbound,
-                            Some(permit),
-                        ) {
-                            fatal_write = Some(err);
-                            break;
+                        AppWriteMsg::Flush(ack_tx) => {
+                            if let Err(err) =
+                                outbound.enqueue_data(WriterDataCmd::FlushAck(ack_tx), None)
+                            {
+                                fatal_write = Some(err);
+                                break;
+                            }
                         }
-                        scope.metrics.record_tx(Plane::Stream, len as u64, false);
+                        AppWriteMsg::Shutdown(ack_tx) => {
+                            deferred_shutdown_fin = false;
+                            if let Err(err) = initiate_fin(
+                                &data_sem,
+                                &mut fin_queued,
+                                &mut tx_cipher,
+                                &mut e2e_scratch,
+                                &mut outbound,
+                                &mut pending_fin_ack,
+                            ) {
+                                let _ = ack_tx.try_send(Err(err.clone()));
+                                fatal_write = Some(err);
+                                break;
+                            }
+                            pending_shutdown_waiters.push(ack_tx);
+                        }
                     }
-                    AppWriteMsg::Flush(ack_tx) => {
-                        if let Err(err) =
-                            outbound.enqueue_data(WriterDataCmd::FlushAck(ack_tx), None)
-                        {
-                            fatal_write = Some(err);
-                            break;
+                    continue;
+                }
+
+                // `pending_app_writes` is empty, `delayed_egress` is None, and `outbound` is idle.
+                if deferred_shutdown_fin {
+                    // Re-check `app_write_rx` once more in case a concurrent pre-close `poll_write`
+                    // just committed its already-permitted chunk before we check `in_use() == 0`.
+                    let mut pulled = false;
+                    if !app_write_closed {
+                        loop {
+                            match app_write_rx.try_recv() {
+                                Ok(msg) => {
+                                    pending_app_writes.push_back(msg);
+                                    pulled = true;
+                                }
+                                Err(async_channel::TryRecvError::Empty) => break,
+                                Err(async_channel::TryRecvError::Closed) => {
+                                    app_write_closed = true;
+                                    break;
+                                }
+                            }
                         }
                     }
-                    AppWriteMsg::Shutdown(ack_tx) => {
+                    if pulled {
+                        continue;
+                    }
+                    if data_sem.in_use() == 0 {
+                        deferred_shutdown_fin = false;
                         if let Err(err) = initiate_fin(
                             &data_sem,
                             &mut fin_queued,
@@ -1947,13 +2018,12 @@ async fn run_stream_session(
                             &mut outbound,
                             &mut pending_fin_ack,
                         ) {
-                            let _ = ack_tx.try_send(Err(err.clone()));
                             fatal_write = Some(err);
                             break;
                         }
-                        pending_shutdown_waiters.push(ack_tx);
                     }
                 }
+                break;
             }
             if let Some(err) = fatal_write {
                 break err;
@@ -1992,6 +2062,8 @@ async fn run_stream_session(
     drop(pending_fin_ack);
     drop(pending_app_read);
     drop(delayed_egress);
+    drop(pending_origin_e2e_renew);
+    drop(pending_origin_hop_renews);
 
     // 2. Cancel carrier reader task immediately (ST-08).
     reader_cancel_tx.send(true);
@@ -2130,31 +2202,41 @@ fn initiate_fin(
     Ok(())
 }
 
-fn queue_origin_stream_renewal(
+fn stage_origin_stream_renewal(
     slot: RenewalSlot,
     renewal_id: u64,
+    credential: Credential,
+    pending_e2e: &mut Option<(u64, Credential)>,
+    pending_hops: &mut [Option<(u64, Credential)>],
+) {
+    match slot {
+        RenewalSlot::Endpoint => {
+            *pending_e2e = Some((renewal_id, credential));
+        }
+        RenewalSlot::Hop(i) => {
+            if let Some(entry) = pending_hops.get_mut(i) {
+                *entry = Some((renewal_id, credential));
+            }
+        }
+    }
+}
+
+fn queue_origin_hop_renewal(
+    hop_index: usize,
+    renewal_id: u64,
     credential: &Credential,
-    tx_cipher: &mut StreamCipher,
     hops: &mut [(PublicKey, String, ControlCipher)],
-    scratch: &mut Vec<u8>,
     outbound: &mut OutboundWriterQueue,
 ) -> Result<(), CoreError> {
     let payload = encode_renew_payload(renewal_id, credential.as_bytes())?;
-    match slot {
-        RenewalSlot::Endpoint => {
-            seal_and_queue_e2e(tx_cipher, e2e_st::ST_RENEW, &payload, scratch, outbound, None)
-        }
-        RenewalSlot::Hop(i) => {
-            let ttl = u8::try_from(i).map_err(|_| CoreError::Malformed)?;
-            let sealed = hops
-                .get_mut(i)
-                .ok_or(CoreError::Malformed)?
-                .2
-                .seal(outer::ST_RENEW, &payload)?;
-            let frame = PriorityCtrlFrame::from_slice(outer::ST_RENEW, ttl, &sealed)?;
-            outbound.enqueue_ctrl(frame)
-        }
-    }
+    let ttl = u8::try_from(hop_index).map_err(|_| CoreError::Malformed)?;
+    let sealed = hops
+        .get_mut(hop_index)
+        .ok_or(CoreError::Malformed)?
+        .2
+        .seal(outer::ST_RENEW, &payload)?;
+    let frame = PriorityCtrlFrame::from_slice(outer::ST_RENEW, ttl, &sealed)?;
+    outbound.enqueue_ctrl(frame)
 }
 
 /// Helper used by `StagedStream` drop-abort to send reverse hop `ST_CLOSE(Closed)` best-effort.
@@ -2186,7 +2268,8 @@ pub(crate) async fn abort_stream_hops(
     let _ = with_deadline(&*clock, deadline, writer.shutdown()).await;
 }
 
-/// Races a future against lease cancellation and live MTU floor drops (used in confirm/serve).
+/// Races a future against lease cancellation and live MTU floor drops (used in confirm/serve),
+/// verifying guards up front and prioritizing cancellation ahead of `fut` (R2-ST-03).
 pub(crate) async fn race_session_guards<F, T>(
     fut: F,
     lease: &LeaseHandle,
@@ -2196,14 +2279,19 @@ pub(crate) async fn race_session_guards<F, T>(
 where
     F: Future<Output = Result<T, CoreError>>,
 {
+    lease.remaining()?;
+    let cur_mtu = mtu_watch.sample();
+    if cur_mtu < floor {
+        return Err(CoreError::MtuTooSmall(cur_mtu));
+    }
     match race2(
-        fut,
         race2(lease.cancelled(), wait_mtu_below_floor(mtu_watch, floor)),
+        fut,
     )
     .await
     {
-        Either::Left(res) => res,
-        Either::Right(Either::Left(err)) => Err(err),
-        Either::Right(Either::Right(mtu)) => Err(CoreError::MtuTooSmall(mtu)),
+        Either::Left(Either::Left(err)) => Err(err),
+        Either::Left(Either::Right(mtu)) => Err(CoreError::MtuTooSmall(mtu)),
+        Either::Right(res) => res,
     }
 }

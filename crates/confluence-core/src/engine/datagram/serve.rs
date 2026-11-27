@@ -255,6 +255,11 @@ pub(crate) async fn serve_datagram_destination(
     let mtu_watch = binding.mtu_watch();
     let path_mtu = DestPathMtu::new(forwarded_mtu, inbound_mtu, floor);
 
+    // Acquire BridgeGuard BEFORE spawning the Datagram session worker so `is_drained()` can NEVER
+    // transiently observe `true` during concurrent shutdown if the worker exits and releases
+    // `session_permit` before the bridge task takes ownership of `app_link` (R2-DG-06).
+    let bridge_guard = BridgeGuard::acquire(Arc::clone(&scope));
+
     let e2e = spawn_datagram_session(DatagramSessionParams {
         scope: Arc::clone(&scope),
         peer,
@@ -273,7 +278,7 @@ pub(crate) async fn serve_datagram_destination(
         }),
     });
 
-    spawn_datagram_bridge(scope, e2e, app_link);
+    spawn_datagram_bridge(scope, e2e, app_link, bridge_guard);
     Ok(())
 }
 
@@ -300,14 +305,31 @@ async fn wait_session_closed(rx: &mut WatchReceiver<Option<CoreError>>) -> CoreE
     }
 }
 
+async fn yield_once() {
+    let mut yielded = false;
+    poll_fn(|cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await;
+}
+
+/// Maximum consecutive packets forwarded in one bridge direction per poll before yielding
+/// back to the supervisor (preventing always-ready app links from starving reverse traffic,
+/// session closure, or scope shutdown, R2-DG-05).
+const BRIDGE_POLL_BURST: usize = 16;
+
 fn spawn_datagram_bridge(
     scope: Arc<ScopeCore>,
     e2e: E2eDatagram,
     app_link: Arc<dyn DatagramLink>,
+    guard: BridgeGuard,
 ) {
-    // Acquire BridgeGuard BEFORE spawning so `is_drained()` never returns `true` while the
-    // destination bridge task is alive or still owns `app_link` (DG-08).
-    let guard = BridgeGuard::acquire(Arc::clone(&scope));
     let mut session_closed = e2e.subscribe_closed();
     let mut shutdown_rx = scope.subscribe_shutdown();
     let spawner = Arc::clone(&scope.runtime.spawner);
@@ -318,13 +340,25 @@ fn spawn_datagram_bridge(
             let e2e_in = e2e.clone();
             let app_out = Arc::clone(&app_link);
             let dir1 = async move {
+                let mut burst = 0usize;
                 while let Ok(pkt) = e2e_in.recv().await {
                     match app_out.send(pkt).await {
-                        Ok(()) => {}
+                        Ok(()) => {
+                            burst += 1;
+                            if burst >= BRIDGE_POLL_BURST {
+                                burst = 0;
+                                yield_once().await;
+                            }
+                        }
                         Err(err)
-                            if err.is_retryable() || matches!(err, CoreError::MtuTooSmall(_)) => {}
-                        Err(_) => {
-                            e2e_in.close();
+                            if err.is_retryable() || matches!(err, CoreError::MtuTooSmall(_)) =>
+                        {
+                            burst = 0;
+                            yield_once().await;
+                        }
+                        Err(err) => {
+                            // Propagate fatal app-link failure through authenticated e2e::DG_CLOSE (R2-DG-07).
+                            e2e_in.close_with_error(err);
                             break;
                         }
                     }
@@ -334,16 +368,30 @@ fn spawn_datagram_bridge(
             let e2e_out = e2e.clone();
             let app_in = Arc::clone(&app_link);
             let dir2 = async move {
+                let mut burst = 0usize;
                 loop {
                     let pkt = match app_in.recv().await {
                         Ok(p) => p,
-                        Err(_) => {
-                            e2e_out.close();
+                        Err(err) => {
+                            // Propagate fatal app-link failure through authenticated e2e::DG_CLOSE (R2-DG-07).
+                            e2e_out.close_with_error(err);
                             break;
                         }
                     };
                     match e2e_out.send_wait(pkt).await {
-                        Ok(()) | Err(CoreError::MessageTooLarge(_)) => {}
+                        Ok(()) => {
+                            burst += 1;
+                            if burst >= BRIDGE_POLL_BURST {
+                                burst = 0;
+                                yield_once().await;
+                            }
+                        }
+                        Err(CoreError::MessageTooLarge(_)) => {
+                            // Yield after dropping an oversized app packet so an always-ready app
+                            // link cannot spin inside a single poll and starve `dir1` or shutdown (R2-DG-05).
+                            burst = 0;
+                            yield_once().await;
+                        }
                         Err(_) => break,
                     }
                 }
@@ -353,12 +401,13 @@ fn spawn_datagram_bridge(
             let mut d2 = core::pin::pin!(dir2);
             let mut closed_fut = core::pin::pin!(wait_session_closed(&mut session_closed));
             let mut shutdown_fut = core::pin::pin!(wait_shutdown(&mut shutdown_rx));
+            let mut prefer_d2 = false;
 
-            // Supervise BOTH directions against session closure and scope shutdown (DG-08):
+            // Supervise BOTH directions against session closure and scope shutdown (DG-08, R2-DG-05):
             // - Scope shutdown or non-clean revocation/error aborts immediately.
-            // - Clean peer close lets `dir1` drain any immediately deliverable queued packets,
-            //   then aborts idle `dir2` / stalled `dir1` immediately so `app_link` and `_guard`
-            //   always drop promptly!
+            // - Clean peer close lets `dir1` drain any immediately deliverable queued packets
+            //   (bounded by `BRIDGE_POLL_BURST`), then aborts idle `dir2` / stalled `dir1`
+            //   immediately so `app_link` and `_guard` always drop promptly!
             poll_fn(|cx| {
                 if shutdown_fut.as_mut().poll(cx).is_ready() {
                     return Poll::Ready(());
@@ -367,17 +416,25 @@ fn spawn_datagram_bridge(
                     if reason != CoreError::Closed {
                         return Poll::Ready(());
                     }
-                    // On clean close, give `d1` one non-blocking poll to flush any immediately
-                    // deliverable queued packet before exiting.
                     let _ = d1.as_mut().poll(cx);
                     return Poll::Ready(());
                 }
-                if d1.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(());
+                if prefer_d2 {
+                    if d2.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(());
+                    }
+                    if d1.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(());
+                    }
+                } else {
+                    if d1.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(());
+                    }
+                    if d2.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(());
+                    }
                 }
-                if d2.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(());
-                }
+                prefer_d2 = !prefer_d2;
                 Poll::Pending
             })
             .await;

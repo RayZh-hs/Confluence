@@ -307,8 +307,8 @@ impl Node {
             cores.remove(&kid);
         }
         self.metrics.mounted_scopes.fetch_sub(1, Ordering::Relaxed);
-        // Serialize scope detachment & standalone restore against concurrent `attach_datagram` (DG-03/06).
-        scope.ports.unmount_from(self.id, kid, Some(&self.ports));
+        // Serialize scope detachment, live LinkId handoff, & standalone restore (DG-03/06, R2-DG-02).
+        scope.ports.unmount_from(self.id, kid, &self.ports);
         scope.core.release_node(self.id);
         Some(scope)
     }
@@ -415,11 +415,15 @@ impl Drop for Node {
         }
         self.metrics.mounted_scopes.store(0, Ordering::Release);
 
-        for scope in &scopes {
-            scope.ports.unmount_from(self.id, scope.scope_kid(), None);
-        }
-
+        // Retire all idle inbound ports first, then restore mounted scopes while handing off
+        // any still-live (`outbound_refs > 0`) ports and unexpired CID quarantine histories (R2-DG-02/03).
         self.ports.shutdown_ingress();
+
+        for scope in &scopes {
+            scope
+                .ports
+                .unmount_from_dropped_node(self.id, &self.ports);
+        }
 
         for scope in &scopes {
             scope.core.release_node(self.id);

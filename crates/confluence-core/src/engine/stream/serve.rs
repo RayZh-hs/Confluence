@@ -98,25 +98,28 @@ pub(crate) async fn serve_stream_destination(
 
     // Phase 1: AwaitingConfirm (holding pending_permit, node_pending_permit, pending_setup!).
     let confirm_res: Result<Option<Vec<u8>>, CoreError> = async {
+        if scope.is_shutting_down() {
+            return Err(CoreError::Closed);
+        }
         let step = with_deadline_val(
             &*clock,
             confirm_deadline,
             race2(
+                wait_shutdown(&mut shutdown_rx),
                 race_session_guards(
                     frame_reader.next_frame(&mut *reader, &mut rx_cipher),
                     &lease,
                     &mut mtu_watch,
                     floor,
                 ),
-                wait_shutdown(&mut shutdown_rx),
             ),
         )
         .await?;
 
         let frame = match step {
-            Either::Left(Ok(f)) => f,
-            Either::Left(Err(err)) => return Err(err),
-            Either::Right(()) => return Err(CoreError::Closed),
+            Either::Left(()) => return Err(CoreError::Closed),
+            Either::Right(Ok(f)) => f,
+            Either::Right(Err(err)) => return Err(err),
         };
 
         match frame {
@@ -274,6 +277,10 @@ pub(crate) async fn serve_stream_destination(
         .metrics
         .record_setup_established(Plane::Stream, Role::Destination);
 
+    // Acquire BridgeGuard BEFORE spawning the Stream session worker so `is_drained()` can never
+    // transiently observe `true` if the worker exits before the bridge takes ownership of `app_stream`.
+    let bridge_guard = BridgeGuard::acquire(Arc::clone(&scope));
+
     let e2e = spawn_stream_session(StreamSessionParams {
         scope: Arc::clone(&scope),
         peer,
@@ -294,8 +301,8 @@ pub(crate) async fn serve_stream_destination(
         }),
     });
 
-    // Spawn bidirectional application bridge holding BridgeGuard for `is_drained()`.
-    spawn_stream_bridge(scope, e2e, app_stream);
+    // Spawn bidirectional application bridge taking ownership of `bridge_guard` for `is_drained()`.
+    spawn_stream_bridge(scope, e2e, app_stream, bridge_guard);
     Ok(())
 }
 
@@ -341,8 +348,12 @@ async fn wait_session_closed(rx: &mut WatchReceiver<Option<CoreError>>) -> CoreE
     }
 }
 
-fn spawn_stream_bridge(scope: Arc<ScopeCore>, e2e: E2eStream, app: BoxedStream) {
-    let guard = BridgeGuard::acquire(Arc::clone(&scope));
+fn spawn_stream_bridge(
+    scope: Arc<ScopeCore>,
+    e2e: E2eStream,
+    app: BoxedStream,
+    guard: BridgeGuard,
+) {
     let mut session_closed = e2e.subscribe_closed();
     let session_closed_dir2 = session_closed.clone();
     let spawner = Arc::clone(&scope.runtime.spawner);

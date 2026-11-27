@@ -1,6 +1,7 @@
 //! Shared scope execution context, limits, permit RAII guards, revocation listener, and
 //! runtime-independent async combinators (Layer 4 foundation; zero imports from `host` or peer engines).
 
+use core::any::Any;
 use core::future::{Future, poll_fn};
 use core::pin::Pin;
 use core::task::{Context, Poll};
@@ -27,7 +28,7 @@ use crate::seam::path::PathSource;
 use crate::stats::{NodeMetrics, ScopeMetrics, should_warn_pow2};
 use crate::trust::gate::{AuthGate, AuthLimits};
 use crate::trust::registry::PublishRegistry;
-use crate::types::{LinkId, Plane, PublicationId, PublicKey, Role, ScopeKid};
+use crate::types::{Cid, LinkId, Plane, PublicationId, PublicKey, Role, ScopeKid};
 
 // ---------------------------------------------------------------------------
 // ScopeLimits
@@ -207,11 +208,17 @@ impl Drop for BridgeGuard {
 }
 
 // ---------------------------------------------------------------------------
-// Bounded Per-Scope Cookie-Retry Link Cache (DG-10, Spec §4.8 & §6.2 Step 4)
+// Bounded Per-Scope Cookie-Retry Binding Cache (DG-10, R2-DG-04, Spec §4.8 & §6.2 Step 4)
 // ---------------------------------------------------------------------------
+
+/// Type-erased held outbound retry binding stored in [`ScopeCore`] without creating
+/// a circular dependency from `engine::context` onto `engine::datagram::port`.
+pub(crate) type BoxedCookieState = Box<dyn Any + Send>;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CookieRetryKey {
+    pub ingress_link_id: LinkId,
+    pub upstream_cid: Cid,
     pub peer: PublicKey,
     pub plane: Plane,
     pub pub_id: PublicationId,
@@ -219,13 +226,15 @@ pub(crate) struct CookieRetryKey {
 }
 
 struct CookieRetryEntry {
-    link_id: LinkId,
+    state: BoxedCookieState,
+    seq: u64,
     expires_at: MonotonicTime,
 }
 
 struct CookieRetryCache {
     entries: HashMap<CookieRetryKey, CookieRetryEntry>,
-    order: VecDeque<(CookieRetryKey, MonotonicTime)>,
+    order: VecDeque<(CookieRetryKey, u64, MonotonicTime)>,
+    next_seq: u64,
     max_entries: usize,
 }
 
@@ -234,20 +243,19 @@ impl CookieRetryCache {
         Self {
             entries: HashMap::new(),
             order: VecDeque::new(),
+            next_seq: 1,
             max_entries: max_entries.clamp(16, 1024),
         }
     }
 
-    fn prune(&mut self, now: MonotonicTime) {
-        while let Some((_, exp)) = self.order.front() {
+    fn prune(&mut self, now: MonotonicTime, dropped: &mut Vec<BoxedCookieState>) {
+        while let Some((_, _, exp)) = self.order.front() {
             if *exp <= now {
-                if let Some((key, exp_ts)) = self.order.pop_front() {
-                    if self
-                        .entries
-                        .get(&key)
-                        .is_some_and(|cur| cur.expires_at == exp_ts)
-                    {
-                        self.entries.remove(&key);
+                if let Some((key, seq, _)) = self.order.pop_front() {
+                    if self.entries.get(&key).is_some_and(|cur| cur.seq == seq) {
+                        if let Some(entry) = self.entries.remove(&key) {
+                            dropped.push(entry.state);
+                        }
                     }
                 }
             } else {
@@ -259,42 +267,79 @@ impl CookieRetryCache {
     fn record(
         &mut self,
         key: CookieRetryKey,
-        link_id: LinkId,
+        state: BoxedCookieState,
         now: MonotonicTime,
         expires_at: MonotonicTime,
-    ) {
-        self.prune(now);
-        self.entries.insert(
+        dropped: &mut Vec<BoxedCookieState>,
+    ) -> u64 {
+        self.prune(now, dropped);
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1).max(1);
+        if let Some(prev) = self.entries.insert(
             key.clone(),
             CookieRetryEntry {
-                link_id,
+                state,
+                seq,
                 expires_at,
             },
-        );
-        self.order.push_back((key, expires_at));
+        ) {
+            dropped.push(prev.state);
+        }
+        self.order.push_back((key, seq, expires_at));
 
         while self.entries.len() > self.max_entries
             || self.order.len() > self.max_entries.saturating_mul(2)
         {
-            let Some((old_key, old_exp)) = self.order.pop_front() else {
+            let Some((old_key, old_seq, _)) = self.order.pop_front() else {
                 break;
             };
             if self
                 .entries
                 .get(&old_key)
-                .is_some_and(|cur| cur.expires_at == old_exp)
+                .is_some_and(|cur| cur.seq == old_seq)
             {
-                self.entries.remove(&old_key);
+                if let Some(entry) = self.entries.remove(&old_key) {
+                    dropped.push(entry.state);
+                }
+            }
+        }
+        seq
+    }
+
+    fn take(
+        &mut self,
+        key: &CookieRetryKey,
+        now: MonotonicTime,
+        dropped: &mut Vec<BoxedCookieState>,
+    ) -> Option<BoxedCookieState> {
+        self.prune(now, dropped);
+        let entry = self.entries.remove(key)?;
+        if now < entry.expires_at {
+            Some(entry.state)
+        } else {
+            dropped.push(entry.state);
+            None
+        }
+    }
+
+    fn expire(
+        &mut self,
+        key: &CookieRetryKey,
+        seq: u64,
+        now: MonotonicTime,
+        dropped: &mut Vec<BoxedCookieState>,
+    ) {
+        self.prune(now, dropped);
+        if self.entries.get(key).is_some_and(|cur| cur.seq == seq) {
+            if let Some(entry) = self.entries.remove(key) {
+                dropped.push(entry.state);
             }
         }
     }
 
-    fn take(&mut self, key: &CookieRetryKey, now: MonotonicTime) -> Option<LinkId> {
-        self.prune(now);
-        self.entries
-            .remove(key)
-            .filter(|e| now < e.expires_at)
-            .map(|e| e.link_id)
+    fn clear(&mut self, dropped: &mut Vec<BoxedCookieState>) {
+        self.order.clear();
+        dropped.extend(self.entries.drain().map(|(_, e)| e.state));
     }
 }
 
@@ -412,29 +457,57 @@ impl ScopeCore {
             .compare_exchange(node_id, 0, Ordering::SeqCst, Ordering::Acquire);
     }
 
-    /// Records the outbound `LinkId` held by `hold_for_cookie_retry` scoped strictly to
-    /// `key` (`(peer, plane, pub_id, target)`) so the authenticated retry reuses the challenged link.
-    pub fn record_cookie_retry_link(
+    /// Records the held outbound retry binding scoped strictly to
+    /// `(ingress_link_id, upstream_cid, peer, plane, pub_id, target)` (R2-DG-04), dropping any
+    /// expired/evicted entries strictly outside the cache mutex.
+    pub fn record_cookie_retry(
         &self,
         key: CookieRetryKey,
-        link_id: LinkId,
+        state: BoxedCookieState,
         now: MonotonicTime,
         expires_at: MonotonicTime,
-    ) {
-        let mut cache = self
-            .cookie_retry_links
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.record(key, link_id, now, expires_at);
+    ) -> u64 {
+        let mut dropped = Vec::new();
+        let seq = {
+            let mut cache = self
+                .cookie_retry_links
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.record(key, state, now, expires_at, &mut dropped)
+        };
+        drop(dropped);
+        seq
     }
 
-    /// Consumes a previously recorded unexpired outbound `LinkId` for an authenticated retry.
-    pub fn take_cookie_retry_link(&self, key: &CookieRetryKey, now: MonotonicTime) -> Option<LinkId> {
-        let mut cache = self
-            .cookie_retry_links
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.take(key, now)
+    /// Consumes a previously recorded unexpired outbound retry binding for an authenticated retry.
+    pub fn take_cookie_retry(
+        &self,
+        key: &CookieRetryKey,
+        now: MonotonicTime,
+    ) -> Option<BoxedCookieState> {
+        let mut dropped = Vec::new();
+        let res = {
+            let mut cache = self
+                .cookie_retry_links
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.take(key, now, &mut dropped)
+        };
+        drop(dropped);
+        res
+    }
+
+    /// Expires a single unconsumed cookie-retry binding once its `SETUP_TIMEOUT` elapses.
+    pub fn expire_cookie_retry(&self, key: &CookieRetryKey, seq: u64, now: MonotonicTime) {
+        let mut dropped = Vec::new();
+        {
+            let mut cache = self
+                .cookie_retry_links
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.expire(key, seq, now, &mut dropped);
+        }
+        drop(dropped);
     }
 
     /// Updates automatic `under_load` hysteresis from current pending saturation and syncs metrics.
@@ -531,6 +604,15 @@ impl ScopeCore {
         self.pending.close();
         self.sessions.close();
         self.metrics.accepting.store(false, Ordering::Release);
+        let mut dropped = Vec::new();
+        {
+            let mut cache = self
+                .cookie_retry_links
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.clear(&mut dropped);
+        }
+        drop(dropped);
         self.shutdown_tx.send(true);
     }
 

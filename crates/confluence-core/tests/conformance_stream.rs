@@ -2458,3 +2458,620 @@ fn regression_st09_revoking_destination_with_idle_app_stream_drops_bridge_guard_
     );
     drop((_st1, st2, idle_ep));
 }
+
+// ===========================================================================
+// Codex Round 2 Regression Tests (`R2-ST-01` .. `R2-ST-03`)
+// ===========================================================================
+
+/// R2-ST-01: Calling `begin_shutdown()` while successfully accepted writes remain in
+/// `app_write_rx`, `pending_app_writes`, or `delayed_egress` MUST stop accepting NEW writes,
+/// drain ALL already-accepted writes in exact FIFO order, and ONLY THEN enqueue `e2e::ST_FIN`
+/// so accepted writes are never silently truncated into a clean EOF.
+#[test]
+fn regression_r2_st01_begin_shutdown_drains_accepted_writes_before_fin() {
+    use confluence_core::Direction;
+    use confluence_core::auth::{DatagramAction, StreamAction, TrafficGate};
+
+    // Part A: Accepted writes sitting in `app_write_rx` / `pending_app_writes` behind a
+    // backpressured carrier when `origin.begin_shutdown()` is called.
+    {
+        let tr = TestRuntime::new();
+        let origin = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone()).build();
+        let dest = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone())
+            .with_authorizer(Arc::new(AllowAll(Duration::from_secs(60))))
+            .build();
+
+        let (carrier, listener, log) = controlled_stream_channel(4_096);
+        origin.register_stream_carrier("mem", carrier).unwrap();
+        let (echo, _) = EchoEndpoint::new(&tr);
+        let _g = dest.publish_stream_endpoint("echo", echo).unwrap();
+        spawn_scope_stream_listener(&tr, &dest, listener);
+
+        let mut st = tr
+            .spawner
+            .try_block_on(origin.dial_stream_via(
+                dest.public_key(),
+                "echo",
+                ExplicitPath::direct(1, "mem", b"b".to_vec()),
+            ))
+            .unwrap()
+            .unwrap();
+
+        let (a_ctrl, _, _, _) = log.lock().unwrap()[0].clone();
+        // Stall Origin's carrier writes so accepted app writes queue in `app_write_rx` /
+        // `pending_app_writes` without flushing to the carrier yet.
+        a_ctrl.set_stall_writes(true);
+
+        // Enqueue 3 accepted writes without calling `flush()` or `shutdown()`.
+        let accepted = tr.spawner.try_block_on(async {
+            st.write_all(b"chunk-1-").await?;
+            st.write_all(b"chunk-2-").await?;
+            st.write_all(b"chunk-3!").await?;
+            Ok::<(), CoreError>(())
+        });
+        assert_eq!(accepted, Some(Ok(())));
+
+        // Trigger graceful shutdown BEFORE the carrier unblocks (and while chunks are queued!).
+        origin.begin_shutdown();
+        tr.drive_until_idle();
+
+        // Any NEW write after `begin_shutdown()` MUST be rejected immediately with `Closed`.
+        assert_eq!(
+            tr.spawner.try_block_on(st.write(b"rejected")),
+            Some(Err(CoreError::Closed))
+        );
+
+        // Now unblock the carrier: ALL 3 accepted chunks MUST be delivered in exact FIFO order
+        // BEFORE `ST_FIN`, echoed back cleanly by Destination, followed by clean EOF `Ok(0)`!
+        a_ctrl.set_stall_writes(false);
+        tr.drive_until_idle();
+
+        let mut received = Vec::new();
+        let read_res = tr.spawner.try_block_on(async {
+            let mut buf = [0u8; 64];
+            loop {
+                let n = st.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buf[..n]);
+            }
+            Ok::<(), CoreError>(())
+        });
+        assert_eq!(read_res, Some(Ok(())));
+        assert_eq!(
+            received, b"chunk-1-chunk-2-chunk-3!",
+            "R2-ST-01: accepted writes MUST NOT be truncated before ST_FIN on begin_shutdown()"
+        );
+        drop(st);
+        tr.drive_until_idle();
+        assert!(origin.is_drained());
+        assert!(dest.is_drained());
+    }
+
+    // Part B: Multiple accepted Destination writes behind an egress `TrafficGate::Delay` when
+    // `dest.begin_shutdown()` is called — ALL delayed + queued writes MUST drain in FIFO order
+    // before Destination's `ST_FIN`!
+    {
+        struct EgressDelayGate;
+        impl TrafficGate for EgressDelayGate {
+            fn check_datagram(&self, _dir: Direction, _bytes: usize) -> DatagramAction {
+                DatagramAction::Allow
+            }
+            fn charge_stream(&self, dir: Direction, _bytes: usize) -> StreamAction {
+                if dir == Direction::Egress {
+                    StreamAction::Delay(Duration::from_millis(100))
+                } else {
+                    StreamAction::Allow
+                }
+            }
+        }
+
+        struct DelayAuthorizer;
+        impl Authorizer for DelayAuthorizer {
+            fn authorize<'a>(&'a self, _req: AuthRequest<'a>) -> BoxFuture<'a, Result<Lease, AuthDenied>> {
+                Box::pin(async {
+                    Ok(Lease::new(Duration::from_secs(60))
+                        .with_gate(Arc::new(EgressDelayGate)))
+                })
+            }
+        }
+
+        struct ManualDestEndpoint {
+            app_write_tx: Mutex<Option<Box<dyn StreamWrite>>>,
+        }
+        impl StreamEndpointHandler for ManualDestEndpoint {
+            fn open(&self, _auth: SessionAuth) -> BoxFuture<'_, Result<BoxedStream, CoreError>> {
+                let pair = MemoryStreamPair::pair(4_096);
+                let (_r, w) = pair.b.into_halves();
+                *self.app_write_tx.lock().unwrap() = Some(Box::new(w));
+                Box::pin(async move { Ok(BoxedStream::from_stream(pair.a)) })
+            }
+        }
+
+        let tr = TestRuntime::new();
+        let origin = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone()).build();
+        let dest = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone())
+            .with_authorizer(Arc::new(DelayAuthorizer))
+            .build();
+        let (carrier, listener, _) = memory_stream_channel(4_096);
+        origin.register_stream_carrier("mem", carrier).unwrap();
+        let ep = Arc::new(ManualDestEndpoint {
+            app_write_tx: Mutex::new(None),
+        });
+        let _g = dest
+            .publish_stream_endpoint("delay", Arc::clone(&ep) as Arc<dyn StreamEndpointHandler>)
+            .unwrap();
+        spawn_scope_stream_listener(&tr, &dest, listener);
+
+        let mut st = tr
+            .spawner
+            .try_block_on(origin.dial_stream_via(
+                dest.public_key(),
+                "delay",
+                ExplicitPath::direct(2, "mem", b"b".to_vec()),
+            ))
+            .unwrap()
+            .unwrap();
+        tr.drive_until_idle();
+
+        let mut dest_app_w = ep.app_write_tx.lock().unwrap().take().unwrap();
+        // Write 3 separate chunks on Destination's app stream so chunk 1 enters `delayed_egress`
+        // while chunks 2 & 3 queue in `pending_app_writes` / `app_write_rx`.
+        tr.spawner
+            .try_block_on(dest_app_w.write_all(b"partA|"))
+            .unwrap()
+            .unwrap();
+        tr.drive_until_idle();
+        tr.spawner
+            .try_block_on(dest_app_w.write_all(b"partB|"))
+            .unwrap()
+            .unwrap();
+        tr.spawner
+            .try_block_on(dest_app_w.write_all(b"partC"))
+            .unwrap()
+            .unwrap();
+        tr.drive_until_idle();
+
+        // Call `dest.begin_shutdown()` while partA is delayed and partB+partC are queued!
+        dest.begin_shutdown();
+        // Step past each sequential 100 ms TrafficGate delay (`partA|`, `partB|`, `partC`, `ST_FIN`).
+        for _ in 0..5 {
+            tr.advance_and_drive(Duration::from_millis(120));
+        }
+
+        let mut got = Vec::new();
+        let rd = tr.spawner.try_block_on(async {
+            let mut buf = [0u8; 64];
+            loop {
+                let n = st.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            Ok::<(), CoreError>(())
+        });
+        assert_eq!(rd, Some(Ok(())));
+        assert_eq!(
+            got, b"partA|partB|partC",
+            "R2-ST-01: delayed_egress + queued pending_app_writes MUST ALL drain before ST_FIN"
+        );
+        tr.spawner.try_block_on(st.shutdown()).unwrap().unwrap();
+        drop(dest_app_w);
+        tr.drive_until_idle();
+        assert!(dest.is_drained());
+    }
+}
+
+/// R2-ST-02: After one successful renewal, flooding freshly encrypted duplicate renewal IDs
+/// while the return carrier is stalled in `Poll::Pending` MUST NOT grow an unbounded ACK queue
+/// (duplicate ACKs coalesce before sealing), and cancellation/revocation MUST stay responsive
+/// on BOTH Stream Destination (`session.rs`) and Stream Transit (`splice.rs`).
+#[test]
+fn regression_r2_st02_duplicate_renewal_flood_on_stalled_carrier_stays_bounded() {
+    use std::collections::HashMap;
+
+    use confluence_core::Cid;
+    use confluence_core::__conformance::{
+        HopFlightInput, SetupFlightBuilder, SetupFlightParams, StHopHeader, StreamCipher,
+        decode_renew_ok_payload, e2e_st, encode_renew_payload, outer,
+    };
+
+    // Helper: write one `ST_DATA` hop chunk wrapping a sealed E2E record.
+    fn frame_e2e_record(tx: &mut StreamCipher, opcode: u8, body: &[u8]) -> Vec<u8> {
+        let mut e2e = Vec::new();
+        tx.seal_into(opcode, body, &mut e2e).unwrap();
+        let hdr = StHopHeader {
+            kind: outer::ST_DATA,
+            ttl_or_dist: 0,
+            len: u16::try_from(e2e.len()).unwrap(),
+        };
+        let mut out = Vec::with_capacity(4 + e2e.len());
+        out.extend_from_slice(&hdr.encode());
+        out.extend_from_slice(&e2e);
+        out
+    }
+
+    // Helper: read one `ST_DATA`-wrapped E2E record from a raw stream reader.
+    async fn read_one_e2e(
+        r: &mut dyn StreamRead,
+        rx: &mut StreamCipher,
+        buf: &mut Vec<u8>,
+    ) -> Result<(u8, Vec<u8>), CoreError> {
+        loop {
+            if buf.len() >= 2 {
+                let blen = usize::from(u16::from_be_bytes([buf[0], buf[1]]));
+                let rec_len = blen + 19;
+                if buf.len() >= rec_len {
+                    let mut rec: Vec<u8> = buf.drain(..rec_len).collect();
+                    let opened = rx.open_record(&mut rec)?;
+                    return Ok((opened.opcode(), opened.body().to_vec()));
+                }
+            }
+            let mut h = [0u8; 4];
+            r.read_exact(&mut h).await?;
+            let hdr = StHopHeader::parse(&h)?;
+            let mut chunk = vec![0u8; usize::from(hdr.len)];
+            r.read_exact(&mut chunk).await?;
+            if hdr.kind == outer::ST_DATA {
+                buf.extend_from_slice(&chunk);
+            }
+        }
+    }
+
+    // Part A: Stream Destination (`session.rs`) duplicate `e2e::ST_RENEW` flood.
+    {
+        let tr = TestRuntime::new();
+        let origin_kp = ScopeKeypair::generate();
+        let dest = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone())
+            .with_authorizer(Arc::new(AllowAll(Duration::from_secs(60))))
+            .build();
+
+        let (carrier, listener, log) = controlled_stream_channel(4_096);
+        let idle_ep = IdleAppEndpoint::new();
+        let _g = dest.publish_stream_endpoint("idle", idle_ep).unwrap();
+        spawn_scope_stream_listener(&tr, &dest, listener);
+
+        let stream = tr
+            .spawner
+            .try_block_on(carrier.dial_stream(b"dest"))
+            .unwrap()
+            .unwrap();
+        let (mut r, mut w) = stream.into_halves();
+
+        let (origin_state, flight) = SetupFlightBuilder::build(&SetupFlightParams {
+            local: &origin_kp,
+            plane: Plane::Stream,
+            origin_local_mtu: 4_096,
+            min_mtu: STREAM_MIN_MTU,
+            upstream_cid: Cid::UNBOUND,
+            destination: dest.public_key(),
+            endpoint: "idle",
+            dest_credential: b"c0",
+            hops: &[],
+            cookies: &HashMap::new(),
+            wall_time_ms: tr.runtime.wall_time_ms(),
+        })
+        .unwrap();
+
+        tr.spawner.try_block_on(w.write_all(&flight)).unwrap().unwrap();
+        tr.spawner.try_block_on(w.flush()).unwrap().unwrap();
+        tr.drive_until_idle();
+
+        // Read SETUP_OK (70 B for 0 hops) and establish raw E2E StreamCiphers.
+        let mut ok_wire = [0u8; 70];
+        tr.spawner
+            .try_block_on(r.read_exact(&mut ok_wire))
+            .unwrap()
+            .unwrap();
+        let est = origin_state.finish_setup_ok(&ok_wire).unwrap();
+        let mut tx = StreamCipher::new(est.session_keys.tx_key());
+        let mut rx = StreamCipher::new(est.session_keys.rx_key());
+        let mut rx_buf = Vec::new();
+
+        // Confirm 1.0 RTT + read OPEN_OK.
+        let confirm = frame_e2e_record(&mut tx, e2e_st::ST_DATA, &[]);
+        tr.spawner.try_block_on(w.write_all(&confirm)).unwrap().unwrap();
+        tr.spawner.try_block_on(w.flush()).unwrap().unwrap();
+        tr.drive_until_idle();
+        let (op, _) = tr
+            .spawner
+            .try_block_on(read_one_e2e(&mut r, &mut rx, &mut rx_buf))
+            .unwrap()
+            .unwrap();
+        assert_eq!(op, e2e_st::OPEN_OK);
+
+        // Complete 1 real renewal (id = 1) so `dest_verifier.applied == 1`.
+        let renew1 = encode_renew_payload(1, b"c1").unwrap();
+        let renew1_frame = frame_e2e_record(&mut tx, e2e_st::ST_RENEW, &renew1);
+        tr.spawner
+            .try_block_on(w.write_all(&renew1_frame))
+            .unwrap()
+            .unwrap();
+        tr.spawner.try_block_on(w.flush()).unwrap().unwrap();
+        tr.drive_until_idle();
+        let (ack_op, ack_body) = tr
+            .spawner
+            .try_block_on(read_one_e2e(&mut r, &mut rx, &mut rx_buf))
+            .unwrap()
+            .unwrap();
+        assert_eq!(ack_op, e2e_st::ST_RENEW_OK);
+        assert_eq!(decode_renew_ok_payload(&ack_body).unwrap().0, 1);
+
+        // Now stall Destination's carrier write half in `Poll::Pending` (origin stops reading!)
+        // and flood 1,000 freshly encrypted duplicate `e2e::ST_RENEW(id = 1)` records!
+        let (_, dest_ctrl, _, _) = log.lock().unwrap()[0].clone();
+        dest_ctrl.set_stall_writes(true);
+
+        for _ in 0..1_000 {
+            let dup = frame_e2e_record(&mut tx, e2e_st::ST_RENEW, &renew1);
+            tr.spawner.try_block_on(w.write_all(&dup)).unwrap().unwrap();
+        }
+        tr.spawner.try_block_on(w.flush()).unwrap().unwrap();
+        tr.drive_until_idle();
+
+        // Unblock Destination's writer and count how many `ST_RENEW_OK` replies were actually
+        // queued: bounded writer channel (16) + 1 in-flight + 1 coalesced <= 20 (NOT 1,000!).
+        dest_ctrl.set_stall_writes(false);
+        tr.drive_until_idle();
+
+        let mut ack_count = 0usize;
+        while let Some(Ok((op, body))) =
+            tr.spawner.try_block_on(read_one_e2e(&mut r, &mut rx, &mut rx_buf))
+        {
+            assert_eq!(op, e2e_st::ST_RENEW_OK);
+            assert_eq!(decode_renew_ok_payload(&body).unwrap().0, 1);
+            ack_count += 1;
+            tr.drive_until_idle();
+        }
+        assert!(
+            (1..=24).contains(&ack_count),
+            "R2-ST-02 (Destination): expected coalesced bounded ACKs in 1..=24, got {ack_count}"
+        );
+
+        // Re-stall, flood another 500 duplicates, and verify revocation STILL drains immediately!
+        dest_ctrl.set_stall_writes(true);
+        for _ in 0..500 {
+            let dup = frame_e2e_record(&mut tx, e2e_st::ST_RENEW, &renew1);
+            tr.spawner.try_block_on(w.write_all(&dup)).unwrap().unwrap();
+        }
+        tr.drive_until_idle();
+        dest.revoke_peer(origin_kp.public_key());
+        // Step past both 50 ms best-effort teardown deadlines (`ST_CLOSE` + `writer.shutdown()`).
+        tr.advance_and_drive(Duration::from_millis(60));
+        tr.advance_and_drive(Duration::from_millis(60));
+        assert!(
+            dest.is_drained(),
+            "R2-ST-02 (Destination): session MUST stay responsive to revocation under duplicate flood"
+        );
+    }
+
+    // Part B: Stream Transit (`splice.rs`) duplicate `hop::ST_RENEW` flood.
+    {
+        let tr = TestRuntime::new();
+        let origin_kp = ScopeKeypair::generate();
+        let hop0 = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone())
+            .with_authorizer(Arc::new(AllowAll(Duration::from_secs(60))))
+            .build();
+        let dest = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone())
+            .with_authorizer(Arc::new(AllowAll(Duration::from_secs(60))))
+            .build();
+
+        let (c_a_h0, l_h0, log_a_h0) = controlled_stream_channel(4_096);
+        let (c_h0_b, l_b, _) = memory_stream_channel(4_096);
+        let _t0 = hop0
+            .publish_stream_transit("to-b", static_stream_transit(c_h0_b, b"b".to_vec()))
+            .unwrap();
+        let idle_ep = IdleAppEndpoint::new();
+        let _g = dest.publish_stream_endpoint("idle", idle_ep).unwrap();
+        spawn_scope_stream_listener(&tr, &hop0, l_h0);
+        spawn_scope_stream_listener(&tr, &dest, l_b);
+
+        let stream = tr
+            .spawner
+            .try_block_on(c_a_h0.dial_stream(b"h0"))
+            .unwrap()
+            .unwrap();
+        let (mut r, mut w) = stream.into_halves();
+
+        let hop_inputs = [HopFlightInput {
+            peer: hop0.public_key(),
+            target: "to-b",
+            credential: b"h0",
+        }];
+        let (origin_state, flight) = SetupFlightBuilder::build(&SetupFlightParams {
+            local: &origin_kp,
+            plane: Plane::Stream,
+            origin_local_mtu: 4_096,
+            min_mtu: STREAM_MIN_MTU,
+            upstream_cid: Cid::UNBOUND,
+            destination: dest.public_key(),
+            endpoint: "idle",
+            dest_credential: b"d0",
+            hops: &hop_inputs,
+            cookies: &HashMap::new(),
+            wall_time_ms: tr.runtime.wall_time_ms(),
+        })
+        .unwrap();
+
+        tr.spawner.try_block_on(w.write_all(&flight)).unwrap().unwrap();
+        tr.spawner.try_block_on(w.flush()).unwrap().unwrap();
+        tr.drive_until_idle();
+
+        // Read SETUP_OK (70 + 26 = 96 B for 1 hop).
+        let mut ok_wire = [0u8; 96];
+        tr.spawner
+            .try_block_on(r.read_exact(&mut ok_wire))
+            .unwrap()
+            .unwrap();
+        let est = origin_state.finish_setup_ok(&ok_wire).unwrap();
+        let mut hop_ctrl = est.hop_keys[0].control_cipher(true);
+
+        let renew1 = encode_renew_payload(1, b"h1").unwrap();
+        let make_hop_renew = |ctrl: &mut confluence_core::__conformance::ControlCipher| {
+            let sealed = ctrl.seal(outer::ST_RENEW, &renew1).unwrap();
+            let hdr = StHopHeader {
+                kind: outer::ST_RENEW,
+                ttl_or_dist: 0,
+                len: u16::try_from(sealed.len()).unwrap(),
+            };
+            let mut frame = Vec::with_capacity(4 + sealed.len());
+            frame.extend_from_slice(&hdr.encode());
+            frame.extend_from_slice(&sealed);
+            frame
+        };
+
+        // Complete 1 real hop renewal (id = 1).
+        let f1 = make_hop_renew(&mut hop_ctrl);
+        tr.spawner.try_block_on(w.write_all(&f1)).unwrap().unwrap();
+        tr.spawner.try_block_on(w.flush()).unwrap().unwrap();
+        tr.drive_until_idle();
+
+        let mut h_raw = [0u8; 4];
+        tr.spawner
+            .try_block_on(r.read_exact(&mut h_raw))
+            .unwrap()
+            .unwrap();
+        let hdr = StHopHeader::parse(&h_raw).unwrap();
+        assert_eq!(hdr.kind, outer::ST_RENEW_OK);
+        let mut body = vec![0u8; usize::from(hdr.len)];
+        tr.spawner
+            .try_block_on(r.read_exact(&mut body))
+            .unwrap()
+            .unwrap();
+        let pt = hop_ctrl.open(outer::ST_RENEW_OK, &body).unwrap();
+        assert_eq!(decode_renew_ok_payload(&pt).unwrap().0, 1);
+
+        // Stall hop0's reverse writer (`left_w`) in `Poll::Pending` and flood 1,000 duplicate
+        // `hop::ST_RENEW(id = 1)` frames!
+        let (_, h0_left_ctrl, _, _) = log_a_h0.lock().unwrap()[0].clone();
+        h0_left_ctrl.set_stall_writes(true);
+
+        for _ in 0..1_000 {
+            let dup = make_hop_renew(&mut hop_ctrl);
+            tr.spawner.try_block_on(w.write_all(&dup)).unwrap().unwrap();
+        }
+        tr.spawner.try_block_on(w.flush()).unwrap().unwrap();
+        tr.drive_until_idle();
+
+        // Unblock and verify ONLY bounded coalesced ACKs arrive (32-slot ctrl channel + 1 in-flight
+        // + 1 coalesced <= 36, NOT 1,000!).
+        h0_left_ctrl.set_stall_writes(false);
+        tr.drive_until_idle();
+
+        let mut hop_acks = 0usize;
+        while let Some(Ok(())) = tr.spawner.try_block_on(r.read_exact(&mut h_raw)) {
+            let h = StHopHeader::parse(&h_raw).unwrap();
+            let mut b = vec![0u8; usize::from(h.len)];
+            tr.spawner.try_block_on(r.read_exact(&mut b)).unwrap().unwrap();
+            assert_eq!(h.kind, outer::ST_RENEW_OK);
+            let p = hop_ctrl.open(outer::ST_RENEW_OK, &b).unwrap();
+            assert_eq!(decode_renew_ok_payload(&p).unwrap().0, 1);
+            hop_acks += 1;
+            tr.drive_until_idle();
+        }
+        assert!(
+            (1..=40).contains(&hop_acks),
+            "R2-ST-02 (Transit): expected coalesced bounded ACKs in 1..=40, got {hop_acks}"
+        );
+
+        // Re-stall, flood more duplicates, and verify revocation STILL tears down splice cleanly!
+        h0_left_ctrl.set_stall_writes(true);
+        for _ in 0..500 {
+            let dup = make_hop_renew(&mut hop_ctrl);
+            tr.spawner.try_block_on(w.write_all(&dup)).unwrap().unwrap();
+        }
+        tr.drive_until_idle();
+        hop0.revoke_peer(origin_kp.public_key());
+        tr.advance_and_drive(Duration::from_millis(60));
+        tr.advance_and_drive(Duration::from_millis(60));
+        assert!(
+            hop0.is_drained(),
+            "R2-ST-02 (Transit): splice MUST stay responsive to revocation under duplicate flood"
+        );
+    }
+}
+
+/// R2-ST-03 (Stream): Revoking (or expiring) a staged Stream's destination peer locally BEFORE
+/// calling `StagedStream::confirm()` while the carrier is immediately writable MUST fail BEFORE
+/// transmitting confirmation, so Destination's `StreamEndpointHandler::open` is NEVER invoked.
+#[test]
+fn regression_r2_st03_revoked_staged_stream_confirm_never_triggers_destination() {
+    let tr = TestRuntime::new();
+    let outcomes = RecordingPathSource::new();
+    let origin = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone())
+        .with_path_source(outcomes.clone())
+        .build();
+    let dest = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone())
+        .with_authorizer(Arc::new(AllowAll(Duration::from_secs(5))))
+        .build();
+
+    let (carrier, listener, _) = memory_stream_channel(4_096);
+    origin.register_stream_carrier("mem", carrier).unwrap();
+    let (echo, opens) = EchoEndpoint::new(&tr);
+    let _g = dest.publish_stream_endpoint("echo", echo).unwrap();
+    spawn_scope_stream_listener(&tr, &dest, listener);
+
+    // Part A: Local peer revocation BEFORE `confirm()` while carrier is immediately writable!
+    let staged = tr
+        .spawner
+        .try_block_on(origin.dial_stream_staged_via(
+            dest.public_key(),
+            "echo",
+            ExplicitPath::direct(301, "mem", b"b".to_vec()),
+        ))
+        .unwrap()
+        .unwrap();
+    tr.drive_until_idle();
+    assert_eq!(opens.load(Ordering::SeqCst), 0);
+
+    origin.revoke_peer(dest.public_key());
+
+    let err = tr
+        .spawner
+        .try_block_on(staged.confirm())
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(err, CoreError::Revoked);
+    tr.advance_and_drive(Duration::from_millis(100));
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        0,
+        "R2-ST-03: revoked StagedStream::confirm() MUST NOT transmit confirmation or open Destination"
+    );
+    assert!(outcomes
+        .snapshot()
+        .contains(&(301, PathOutcome::Failed(CoreError::Revoked))));
+    assert!(origin.is_drained());
+    assert!(dest.is_drained());
+
+    // Part B: Lease expiry BEFORE `confirm()` while carrier is writable!
+    origin.unrevoke_peer(dest.public_key());
+    let staged2 = tr
+        .spawner
+        .try_block_on(origin.dial_stream_staged_via(
+            dest.public_key(),
+            "echo",
+            ExplicitPath::direct(302, "mem", b"b".to_vec()),
+        ))
+        .unwrap()
+        .unwrap();
+    // Advance past 5 s dest TTL before confirming.
+    tr.advance_and_drive(Duration::from_secs(6));
+    let err2 = tr
+        .spawner
+        .try_block_on(staged2.confirm())
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(err2, CoreError::Expired);
+    tr.advance_and_drive(Duration::from_millis(100));
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        0,
+        "R2-ST-03: expired StagedStream::confirm() MUST NOT open Destination"
+    );
+    assert!(outcomes
+        .snapshot()
+        .contains(&(302, PathOutcome::Failed(CoreError::Expired))));
+}

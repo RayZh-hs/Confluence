@@ -16,7 +16,7 @@ use crate::engine::context::{
     CookieRetryKey, Either, NodePendingPermit, PendingPermit, ScopeCore, race2, with_deadline_val,
 };
 use crate::engine::datagram::port::{
-    DatagramPort, DatagramSetupHandler, SetupReplies, hold_for_cookie_retry,
+    Binding, DatagramPort, DatagramSetupHandler, SetupReplies, hold_for_cookie_retry,
 };
 use crate::engine::datagram::serve::serve_datagram_destination;
 use crate::engine::datagram::transit::{DatagramTransitParams, run_datagram_transit};
@@ -217,23 +217,30 @@ async fn handle_datagram_setup(
             return;
         };
 
-        // DG-10: Reuse a held downstream link from a recent SETUP_COOKIE challenge scoped
-        // strictly to `(peer, plane, pub_id, full_name)` before invoking `handler.open()`.
+        // DG-10 & R2-DG-04: Correlate cookie-retry state by `(ingress_link_id, upstream_cid,
+        // peer, plane, pub_id, target)` and reuse the exact challenged outbound `Binding`
+        // (preserving BOTH the outbound link's `source_tag` AND `right.cid()` for multi-hop
+        // downstream correlation across concurrent dials!).
         let cookie_retry_key = CookieRetryKey {
+            ingress_link_id: port.link_id(),
+            upstream_cid: hdr.upstream,
             peer: admitted.peer,
             plane: Plane::Datagram,
             pub_id: admitted.pub_id,
             target: admitted.full_name.clone(),
         };
-        let cached_port = scope
-            .take_cookie_retry_link(&cookie_retry_key, clock.now())
-            .and_then(|link_id| registry.acquire_live_outbound(link_id));
+        let cached_right = scope
+            .take_cookie_retry(&cookie_retry_key, clock.now())
+            .and_then(|boxed| boxed.downcast::<Binding>().ok())
+            .map(|b| *b)
+            .filter(|b| !b.is_port_closing());
 
-        let (out_port, _out_hold) = if let Some(reused) = cached_port {
+        let right = if let Some(reused) = cached_right {
             if let Err(err) = admitted.lease.remaining() {
                 send_dg_setup_err(&scope, &port, Role::Transit, hdr.upstream, &hop_key, &err).await;
                 return;
             }
+            reused.drain_rx();
             reused
         } else {
             if let Err(err) = admitted.lease.remaining() {
@@ -275,8 +282,17 @@ async fn handle_datagram_setup(
                 return;
             }
 
-            match registry.attach_outbound(out_link) {
+            let (out_port, _out_hold) = match registry.attach_outbound(out_link) {
                 Ok(v) => v,
+                Err(err) => {
+                    send_dg_setup_err(&scope, &port, Role::Transit, hdr.upstream, &hop_key, &err)
+                        .await;
+                    return;
+                }
+            };
+
+            match out_port.bind(Some(Arc::clone(&scope.metrics))) {
+                Ok(b) => b,
                 Err(err) => {
                     send_dg_setup_err(&scope, &port, Role::Transit, hdr.upstream, &hop_key, &err)
                         .await;
@@ -286,13 +302,6 @@ async fn handle_datagram_setup(
         };
 
         let left = match port.bind(Some(Arc::clone(&scope.metrics))) {
-            Ok(b) => b,
-            Err(err) => {
-                send_dg_setup_err(&scope, &port, Role::Transit, hdr.upstream, &hop_key, &err).await;
-                return;
-            }
-        };
-        let right = match out_port.bind(Some(Arc::clone(&scope.metrics))) {
             Ok(b) => b,
             Err(err) => {
                 send_dg_setup_err(&scope, &port, Role::Transit, hdr.upstream, &hop_key, &err).await;
@@ -496,22 +505,34 @@ async fn handle_datagram_setup(
                     if cookie_frame.target_cid != right.cid() {
                         continue;
                     }
-                    // Spec §6.2 Step 4 & DG-10: retain Arc<DatagramPort> for 3 s AND cache its
-                    // LinkId scoped to `(peer, plane, pub_id, full_name)` so the authenticated
-                    // retry reuses the exact challenged link even if `handler.open()` mints a
-                    // fresh link/source_tag per call!
+                    // Spec §6.2 Step 4, DG-10 & R2-DG-04: retain Arc<DatagramPort> for 3 s AND
+                    // cache the exact outbound `Binding` keyed by `(ingress_link_id, upstream_cid,
+                    // peer, plane, pub_id, target)` so concurrent retries keep distinct outbound
+                    // links AND preserve `right.cid()` for downstream multi-hop correlation!
                     let now = clock.now();
+                    let expires_at = now.saturating_add(SETUP_TIMEOUT);
+                    drop(replies);
+                    let out_port = right.port_arc();
                     hold_for_cookie_retry(
-                        Arc::clone(&out_port),
+                        out_port,
                         Arc::clone(&clock),
                         &*scope.runtime.spawner,
                     );
-                    scope.record_cookie_retry_link(
-                        cookie_retry_key,
-                        out_port.link_id(),
+                    right.drain_rx();
+                    let seq = scope.record_cookie_retry(
+                        cookie_retry_key.clone(),
+                        Box::new(right),
                         now,
-                        now.saturating_add(SETUP_TIMEOUT),
+                        expires_at,
                     );
+                    let weak_scope = Arc::downgrade(&scope);
+                    let clk = Arc::clone(&clock);
+                    scope.runtime.spawner.spawn(Box::pin(async move {
+                        clk.sleep_until(expires_at).await;
+                        if let Some(sc) = weak_scope.upgrade() {
+                            sc.expire_cookie_retry(&cookie_retry_key, seq, clk.now());
+                        }
+                    }));
                     if let Ok(rewritten) =
                         HopSetupRewrite::rewrite_cookie(&cookie_frame, hdr.upstream)
                     {

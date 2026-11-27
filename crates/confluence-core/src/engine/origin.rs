@@ -4,6 +4,7 @@
 //! `engine::datagram::{port, session}` — NEVER imports `engine::datagram::inbound` or `engine::admission`.
 
 use core::fmt;
+use core::future::Future;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -15,7 +16,9 @@ use crate::constants::{
     SETUP_TIMEOUT, STREAM_MIN_MTU,
 };
 use crate::crypto::cipher::{ControlCipher, DatagramRx, DatagramTx, StreamCipher};
-use crate::engine::context::{ScopeCore, SessionPermit, with_deadline};
+use crate::engine::context::{
+    Either, ScopeCore, SessionPermit, race2, wait_shutdown, with_deadline,
+};
 use crate::engine::datagram::port::{Binding, PortSlot, SetupReplies};
 use crate::engine::datagram::session::{
     DatagramSessionParams, DatagramSessionRole, E2eDatagram, OriginDatagramMeta,
@@ -35,6 +38,7 @@ use crate::protocol::renewal::RenewalDriver;
 use crate::protocol::setup::{
     HopFlightInput, OriginEstablished, OriginSetupState, SetupFlightBuilder, SetupFlightParams,
 };
+use crate::runtime::sync::WatchReceiver;
 use crate::seam::auth::CredentialRequest;
 use crate::seam::channel::{IntoStreamHalves, MtuWatch, StreamRead, StreamWrite};
 use crate::seam::path::{ExplicitPath, PathOutcome};
@@ -122,46 +126,43 @@ impl StagedStream {
         } = inner;
 
         let clock = Arc::clone(&scope.runtime.clock);
-
-        if scope.sessions.is_closed() {
-            scope
-                .path_source
-                .report_outcome(path_id, PathOutcome::Failed(CoreError::Closed));
-            scope.metrics.record_setup_failure(
-                Plane::Stream,
-                Role::Origin,
-                CoreError::Closed.failure_class(),
-            );
-            let hop_ctrls = hops.into_iter().map(|(_, _, c)| c).collect();
-            scope
-                .runtime
-                .spawner
-                .spawn(Box::pin(abort_stream_hops(writer, hop_ctrls, clock)));
-            return Err(CoreError::Closed);
-        }
-
         let confirm_deadline = clock.now().saturating_add(SETUP_TIMEOUT);
         let mut frame_reader = StreamFrameReader::new();
         let mut e2e_scratch = Vec::with_capacity(64);
         let mut chunk_scratch = Vec::with_capacity(64);
+        let mut shutdown_rx = scope.subscribe_shutdown();
 
         let confirm_res: Result<(), CoreError> = async {
-            // Transmit empty e2e::ST_DATA (seq = 0).
+            // Pre-flight guard check BEFORE transmitting confirmation (R2-ST-03):
+            // an already-shutting-down scope, revoked/expired lease, or below-floor MTU
+            // must never emit empty e2e::ST_DATA and trigger Destination's handler.
+            if scope.is_shutting_down() {
+                return Err(CoreError::Closed);
+            }
+            lease.remaining()?;
+            let live_mtu = mtu_watch.sample();
+            if live_mtu < floor {
+                return Err(CoreError::MtuTooSmall(live_mtu));
+            }
+
+            // Transmit empty e2e::ST_DATA (seq = 0), prioritizing cancellation guards ahead of send.
             with_deadline(
                 &*clock,
                 confirm_deadline,
-                race_session_guards(
+                race_confirm_guards(
                     write_e2e_record(
                         &mut *writer,
                         &mut tx_cipher,
                         e2e_st::ST_DATA,
                         &[],
-                        mtu_watch.current(),
+                        live_mtu,
                         floor,
                         &*clock,
                         &mut e2e_scratch,
                         &mut chunk_scratch,
                     ),
+                    &scope,
+                    &mut shutdown_rx,
                     &lease,
                     &mut mtu_watch,
                     floor,
@@ -173,8 +174,10 @@ impl StagedStream {
             let frame = with_deadline(
                 &*clock,
                 confirm_deadline,
-                race_session_guards(
+                race_confirm_guards(
                     frame_reader.next_frame(&mut *reader, &mut rx_cipher),
+                    &scope,
+                    &mut shutdown_rx,
                     &lease,
                     &mut mtu_watch,
                     floor,
@@ -206,7 +209,9 @@ impl StagedStream {
                     if !body.is_empty() {
                         return Err(CoreError::Malformed);
                     }
-                    StreamOpenStatus::from_opcode(opcode)?.into_result()
+                    StreamOpenStatus::from_opcode(opcode)?.into_result()?;
+                    lease.remaining()?;
+                    Ok(())
                 }
             }
         }
@@ -362,32 +367,33 @@ impl StagedDatagram {
         } = inner;
 
         let clock = Arc::clone(&scope.runtime.clock);
-
-        if scope.sessions.is_closed() {
-            scope
-                .path_source
-                .report_outcome(path_id, PathOutcome::Failed(CoreError::Closed));
-            scope.metrics.record_setup_failure(
-                Plane::Datagram,
-                Role::Origin,
-                CoreError::Closed.failure_class(),
-            );
-            let hop_ctrls = hops.into_iter().map(|(_, _, c)| c).collect();
-            scope.runtime.spawner.spawn(Box::pin(abort_datagram_staged(
-                binding,
-                remote_cid,
-                tx,
-                hop_ctrls,
-            )));
-            return Err(CoreError::Closed);
-        }
-
         let confirm_deadline = clock.now().saturating_add(SETUP_TIMEOUT);
+        let floor = path_mtu.floor();
+        let mut confirm_mtu_watch = binding.mtu_watch();
+        let mut shutdown_rx = scope.subscribe_shutdown();
+
         let send_res: Result<(), CoreError> = async {
+            // Pre-flight guard check BEFORE transmitting confirmation (R2-ST-03):
+            // an already-shutting-down scope, revoked/expired lease, or below-floor MTU
+            // must never emit empty e2e::DG_DATA and invoke Destination's handler.
+            if scope.is_shutting_down() {
+                return Err(CoreError::Closed);
+            }
+            lease.remaining()?;
+            let live_mtu = confirm_mtu_watch.sample();
+            if live_mtu < floor {
+                return Err(CoreError::MtuTooSmall(live_mtu));
+            }
             let confirm_pkt = build_e2e_packet(&mut tx, e2e_dg::DG_DATA, &[], remote_cid)?;
-            binding
-                .send_reliable_until(confirm_pkt, &*clock, confirm_deadline)
-                .await
+            race_confirm_guards(
+                binding.send_reliable_until(confirm_pkt, &*clock, confirm_deadline),
+                &scope,
+                &mut shutdown_rx,
+                &lease,
+                &mut confirm_mtu_watch,
+                floor,
+            )
+            .await
         }
         .await;
 
@@ -462,6 +468,38 @@ impl fmt::Debug for StagedDatagram {
             .field("mtu", &self.mtu())
             .field("path_id", &self.path_id())
             .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Staged Confirmation Guard Helper (R2-ST-03)
+// ---------------------------------------------------------------------------
+
+/// Races a staged confirmation operation against scope shutdown, lease cancellation, and live
+/// MTU floor violations, checking every guard up front and prioritizing cancellation ahead of
+/// transmission so a revoked/shutting-down staged handle never triggers Destination's handler.
+async fn race_confirm_guards<F, T>(
+    fut: F,
+    scope: &ScopeCore,
+    shutdown_rx: &mut WatchReceiver<bool>,
+    lease: &LeaseHandle,
+    mtu_watch: &mut MtuWatch,
+    floor: u16,
+) -> Result<T, CoreError>
+where
+    F: Future<Output = Result<T, CoreError>>,
+{
+    if scope.is_shutting_down() {
+        return Err(CoreError::Closed);
+    }
+    match race2(
+        wait_shutdown(shutdown_rx),
+        race_session_guards(fut, lease, mtu_watch, floor),
+    )
+    .await
+    {
+        Either::Left(()) => Err(CoreError::Closed),
+        Either::Right(res) => res,
     }
 }
 

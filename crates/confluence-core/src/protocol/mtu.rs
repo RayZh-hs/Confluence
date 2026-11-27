@@ -191,6 +191,11 @@ impl OriginPathMtu {
     }
 
     #[must_use]
+    pub const fn floor(&self) -> u16 {
+        self.floor
+    }
+
+    #[must_use]
     pub const fn max_payload(&self) -> usize {
         (self.effective as usize).saturating_sub(DG_OVERHEAD)
     }
@@ -285,6 +290,11 @@ impl DestPathMtu {
     #[must_use]
     pub const fn current_mtu(&self) -> u16 {
         self.effective
+    }
+
+    #[must_use]
+    pub const fn floor(&self) -> u16 {
+        self.floor
     }
 
     #[must_use]

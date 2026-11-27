@@ -5,8 +5,9 @@ use core::future::{Future, poll_fn};
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::time::Duration;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 
@@ -26,7 +27,7 @@ use crate::seam::path::PathSource;
 use crate::stats::{NodeMetrics, ScopeMetrics, should_warn_pow2};
 use crate::trust::gate::{AuthGate, AuthLimits};
 use crate::trust::registry::PublishRegistry;
-use crate::types::{Plane, Role, ScopeKid};
+use crate::types::{LinkId, Plane, PublicationId, PublicKey, Role, ScopeKid};
 
 // ---------------------------------------------------------------------------
 // ScopeLimits
@@ -186,21 +187,114 @@ impl Drop for SessionPermit {
     }
 }
 
-/// RAII guard tracking an active Destination Stream application bridge task for `is_drained()`.
+/// RAII guard tracking an active Destination application bridge task (Stream or Datagram)
+/// for `ScopeInstance::is_drained()`.
 pub(crate) struct BridgeGuard {
     scope: Arc<ScopeCore>,
 }
 
 impl BridgeGuard {
     pub fn acquire(scope: Arc<ScopeCore>) -> Self {
-        scope.stream_bridges.fetch_add(1, Ordering::AcqRel);
+        scope.dest_bridges.fetch_add(1, Ordering::AcqRel);
         Self { scope }
     }
 }
 
 impl Drop for BridgeGuard {
     fn drop(&mut self) {
-        self.scope.stream_bridges.fetch_sub(1, Ordering::AcqRel);
+        self.scope.dest_bridges.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded Per-Scope Cookie-Retry Link Cache (DG-10, Spec §4.8 & §6.2 Step 4)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CookieRetryKey {
+    pub peer: PublicKey,
+    pub plane: Plane,
+    pub pub_id: PublicationId,
+    pub target: String,
+}
+
+struct CookieRetryEntry {
+    link_id: LinkId,
+    expires_at: MonotonicTime,
+}
+
+struct CookieRetryCache {
+    entries: HashMap<CookieRetryKey, CookieRetryEntry>,
+    order: VecDeque<(CookieRetryKey, MonotonicTime)>,
+    max_entries: usize,
+}
+
+impl CookieRetryCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            max_entries: max_entries.clamp(16, 1024),
+        }
+    }
+
+    fn prune(&mut self, now: MonotonicTime) {
+        while let Some((_, exp)) = self.order.front() {
+            if *exp <= now {
+                if let Some((key, exp_ts)) = self.order.pop_front() {
+                    if self
+                        .entries
+                        .get(&key)
+                        .is_some_and(|cur| cur.expires_at == exp_ts)
+                    {
+                        self.entries.remove(&key);
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn record(
+        &mut self,
+        key: CookieRetryKey,
+        link_id: LinkId,
+        now: MonotonicTime,
+        expires_at: MonotonicTime,
+    ) {
+        self.prune(now);
+        self.entries.insert(
+            key.clone(),
+            CookieRetryEntry {
+                link_id,
+                expires_at,
+            },
+        );
+        self.order.push_back((key, expires_at));
+
+        while self.entries.len() > self.max_entries
+            || self.order.len() > self.max_entries.saturating_mul(2)
+        {
+            let Some((old_key, old_exp)) = self.order.pop_front() else {
+                break;
+            };
+            if self
+                .entries
+                .get(&old_key)
+                .is_some_and(|cur| cur.expires_at == old_exp)
+            {
+                self.entries.remove(&old_key);
+            }
+        }
+    }
+
+    fn take(&mut self, key: &CookieRetryKey, now: MonotonicTime) -> Option<LinkId> {
+        self.prune(now);
+        self.entries
+            .remove(key)
+            .filter(|e| now < e.expires_at)
+            .map(|e| e.link_id)
     }
 }
 
@@ -224,8 +318,10 @@ pub(crate) struct ScopeCore {
     pub pending: Arc<CloseableSemaphore>,
     pub sessions: Arc<CloseableSemaphore>,
     pub shutdown_tx: Watch<bool>,
-    pub stream_bridges: AtomicUsize,
-    pub mounted: AtomicBool,
+    pub dest_bridges: AtomicUsize,
+    /// Owning monotonic `NodeId` (`0` = standalone/unmounted; non-zero = claimed/mounted by that `Node`).
+    mounted_node: AtomicU64,
+    cookie_retry_links: Mutex<CookieRetryCache>,
     pub span: tracing::Span,
     /// Dropped automatically when the final `Arc<ScopeCore>` drops, waking background tasks cleanly.
     alive_tx: Watch<()>,
@@ -282,8 +378,9 @@ impl ScopeCore {
             pending,
             sessions,
             shutdown_tx,
-            stream_bridges: AtomicUsize::new(0),
-            mounted: AtomicBool::new(false),
+            dest_bridges: AtomicUsize::new(0),
+            mounted_node: AtomicU64::new(0),
+            cookie_retry_links: Mutex::new(CookieRetryCache::new(limits.max_pending)),
             span,
             alive_tx,
         });
@@ -294,6 +391,50 @@ impl ScopeCore {
         }
 
         core
+    }
+
+    /// Atomically claims Node membership for `node_id` (non-zero monotonic ID), failing with
+    /// [`CoreError::AlreadyPublished`] if another `Node` already owns or is mounting this scope.
+    pub fn try_claim_node(&self, node_id: u64) -> Result<(), CoreError> {
+        if node_id == 0 {
+            return Err(CoreError::InvalidParameter);
+        }
+        self.mounted_node
+            .compare_exchange(0, node_id, Ordering::SeqCst, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| CoreError::AlreadyPublished)
+    }
+
+    /// Releases Node membership iff currently owned by `node_id`.
+    pub fn release_node(&self, node_id: u64) {
+        let _ = self
+            .mounted_node
+            .compare_exchange(node_id, 0, Ordering::SeqCst, Ordering::Acquire);
+    }
+
+    /// Records the outbound `LinkId` held by `hold_for_cookie_retry` scoped strictly to
+    /// `key` (`(peer, plane, pub_id, target)`) so the authenticated retry reuses the challenged link.
+    pub fn record_cookie_retry_link(
+        &self,
+        key: CookieRetryKey,
+        link_id: LinkId,
+        now: MonotonicTime,
+        expires_at: MonotonicTime,
+    ) {
+        let mut cache = self
+            .cookie_retry_links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.record(key, link_id, now, expires_at);
+    }
+
+    /// Consumes a previously recorded unexpired outbound `LinkId` for an authenticated retry.
+    pub fn take_cookie_retry_link(&self, key: &CookieRetryKey, now: MonotonicTime) -> Option<LinkId> {
+        let mut cache = self
+            .cookie_retry_links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.take(key, now)
     }
 
     /// Updates automatic `under_load` hysteresis from current pending saturation and syncs metrics.
@@ -380,6 +521,11 @@ impl ScopeCore {
         self.shutdown_tx.subscribe()
     }
 
+    /// Returns `true` once graceful shutdown has been initiated.
+    pub fn is_shutting_down(&self) -> bool {
+        self.sessions.is_closed() || self.shutdown_tx.borrow_cloned()
+    }
+
     /// Initiates graceful scope shutdown (Spec §6.8).
     pub fn begin_shutdown(&self) {
         self.pending.close();
@@ -388,11 +534,11 @@ impl ScopeCore {
         self.shutdown_tx.send(true);
     }
 
-    /// Returns `true` once all pending setups, active sessions, and destination stream bridges finished.
+    /// Returns `true` once all pending setups, active sessions, and destination bridges finished.
     pub fn is_drained(&self) -> bool {
         self.pending.in_use() == 0
             && self.sessions.in_use() == 0
-            && self.stream_bridges.load(Ordering::Acquire) == 0
+            && self.dest_bridges.load(Ordering::Acquire) == 0
     }
 
     /// Creates a child structured tracing span for a session or transit circuit.

@@ -149,6 +149,10 @@ impl E2eDatagram {
         self.tx_sem.close();
         self.close_req.send(true);
     }
+
+    pub(crate) fn subscribe_closed(&self) -> WatchReceiver<Option<CoreError>> {
+        self.closed_rx.clone()
+    }
 }
 
 impl fmt::Debug for E2eDatagram {
@@ -290,8 +294,12 @@ async fn run_datagram_session(
         }
     }
 
+    // DG-12: Origin starts with an unadvertised `MtuReporter::new()` because Destination only
+    // observed cleartext `ForwardHeader.max_mtu` on the forward flight, not the authenticated
+    // reverse `SETUP_OK` hop trailers. Origin reliably advertises its authenticated path minimum
+    // on startup (with `[150, 300, 600, 1200, 2400]` ms retries until ACKed).
     let mut e2e_mtu_reporter = match &role {
-        DatagramSessionRole::Origin(o) => MtuReporter::with_initial(o.path_mtu.current_mtu()),
+        DatagramSessionRole::Origin(_) => MtuReporter::new(),
         DatagramSessionRole::Destination(d) => MtuReporter::with_initial(d.initial_local_mtu),
     };
 
@@ -301,49 +309,77 @@ async fn run_datagram_session(
     let mut dest_verifier = RenewalVerifierState::new();
     let mut dest_auth_fut: Option<RenewalAuthFut> = None;
 
-    // Startup live MtuWatch sample catching link shifts between SETUP_OK and confirm (Spec §6.6).
+    // Startup live MtuWatch sample catching link shifts between SETUP_OK and confirm (Spec §6.6, DG-12/13).
     let startup_err: Option<CoreError> = {
         let now = clock.now();
         let live_local = mtu_watch.sample();
         match &mut role {
-            DatagramSessionRole::Origin(orig) => match orig.path_mtu.update_local(live_local) {
-                MtuChange::BelowFloor(m) => Some(CoreError::MtuTooSmall(m)),
-                MtuChange::Changed(m) => {
-                    apply_effective_mtu(&current_mtu, &max_payload, m, &scope);
-                    scope
-                        .path_source
-                        .report_outcome(orig.path_id, PathOutcome::MtuChanged { mtu: m });
-                    if let Some((ep, advertised)) = e2e_mtu_reporter.publish(m, now) {
-                        let _ = send_e2e_control(
-                            &binding,
-                            remote_cid,
-                            &mut tx,
-                            e2e_dg::DG_MTU,
-                            &encode_mtu_payload(ep, advertised),
-                        );
+            DatagramSessionRole::Origin(orig) => {
+                let change = orig.path_mtu.update_local(live_local);
+                match change {
+                    MtuChange::BelowFloor(m) => Some(CoreError::MtuTooSmall(m)),
+                    MtuChange::Changed(m) => {
+                        apply_effective_mtu(&current_mtu, &max_payload, m, &scope);
+                        scope
+                            .path_source
+                            .report_outcome(orig.path_id, PathOutcome::MtuChanged { mtu: m });
+                        if let Some((ep, advertised)) = e2e_mtu_reporter.publish(m, now) {
+                            match send_e2e_control(
+                                &binding,
+                                remote_cid,
+                                &mut tx,
+                                e2e_dg::DG_MTU,
+                                &encode_mtu_payload(ep, advertised),
+                            ) {
+                                Err(err) if !err.is_retryable() => Some(err),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
                     }
-                    None
+                    MtuChange::Unchanged => {
+                        let effective = orig.path_mtu.current_mtu();
+                        if let Some((ep, advertised)) = e2e_mtu_reporter.publish(effective, now) {
+                            match send_e2e_control(
+                                &binding,
+                                remote_cid,
+                                &mut tx,
+                                e2e_dg::DG_MTU,
+                                &encode_mtu_payload(ep, advertised),
+                            ) {
+                                Err(err) if !err.is_retryable() => Some(err),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    }
                 }
-                MtuChange::Unchanged => None,
-            },
+            }
             DatagramSessionRole::Destination(dest) => {
                 let change = dest.path_mtu.update_local(live_local);
+                let mut send_fatal = None;
                 if let Some((ep, advertised)) = e2e_mtu_reporter.publish(live_local, now) {
-                    let _ = send_e2e_control(
+                    if let Err(err) = send_e2e_control(
                         &binding,
                         remote_cid,
                         &mut tx,
                         e2e_dg::DG_MTU,
                         &encode_mtu_payload(ep, advertised),
-                    );
+                    ) {
+                        if !err.is_retryable() {
+                            send_fatal = Some(err);
+                        }
+                    }
                 }
                 match change {
                     MtuChange::BelowFloor(m) => Some(CoreError::MtuTooSmall(m)),
                     MtuChange::Changed(m) => {
                         apply_effective_mtu(&current_mtu, &max_payload, m, &scope);
-                        None
+                        send_fatal
                     }
-                    MtuChange::Unchanged => None,
+                    MtuChange::Unchanged => send_fatal,
                 }
             }
         }
@@ -352,6 +388,7 @@ async fn run_datagram_session(
     let terminal_reason: CoreError = if let Some(err) = startup_err {
         err
     } else {
+        let mut prefer_outbound = false;
         loop {
             let renewal_dl = match &role {
                 DatagramSessionRole::Origin(o) => o.renewals.next_deadline(),
@@ -407,16 +444,33 @@ async fn run_datagram_session(
                     if let Poll::Ready(()) = timer_fut.as_mut().poll(cx) {
                         return Poll::Ready(Ev::TimerFired);
                     }
-                    if let Poll::Ready(pkt) = in_fut.as_mut().poll(cx) {
-                        return Poll::Ready(Ev::Inbound(pkt));
-                    }
-                    if let Poll::Ready(item) = out_fut.as_mut().poll(cx) {
-                        return Poll::Ready(Ev::Outbound(item));
+                    // DG-15: Alternate inbound/outbound polling so continuous inbound traffic
+                    // cannot starve the application outbound send queue (or vice versa).
+                    if prefer_outbound {
+                        if let Poll::Ready(item) = out_fut.as_mut().poll(cx) {
+                            return Poll::Ready(Ev::Outbound(item));
+                        }
+                        if let Poll::Ready(pkt) = in_fut.as_mut().poll(cx) {
+                            return Poll::Ready(Ev::Inbound(pkt));
+                        }
+                    } else {
+                        if let Poll::Ready(pkt) = in_fut.as_mut().poll(cx) {
+                            return Poll::Ready(Ev::Inbound(pkt));
+                        }
+                        if let Poll::Ready(item) = out_fut.as_mut().poll(cx) {
+                            return Poll::Ready(Ev::Outbound(item));
+                        }
                     }
                     Poll::Pending
                 })
                 .await
             };
+
+            match &ev {
+                Ev::Inbound(_) => prefer_outbound = true,
+                Ev::Outbound(_) => prefer_outbound = false,
+                _ => {}
+            }
 
             match ev {
                 Ev::LeaseCancelled(err) => break err,

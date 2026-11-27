@@ -385,7 +385,9 @@ impl StagedDatagram {
         let confirm_deadline = clock.now().saturating_add(SETUP_TIMEOUT);
         let send_res: Result<(), CoreError> = async {
             let confirm_pkt = build_e2e_packet(&mut tx, e2e_dg::DG_DATA, &[], remote_cid)?;
-            with_deadline(&*clock, confirm_deadline, binding.send_wait(confirm_pkt)).await
+            binding
+                .send_reliable_until(confirm_pkt, &*clock, confirm_deadline)
+                .await
         }
         .await;
 
@@ -827,8 +829,7 @@ async fn stage_datagram_inner(
 
     // Open first_channel link ONCE before the cookie-retry loop and reuse ONE Binding across retries (Spec §6.1).
     let link = with_deadline(&*clock, deadline, carrier.open_link(&path.first_locator)).await?;
-    let registry = ports.current();
-    let (port, _port_hold) = registry.attach_outbound(link)?;
+    let (port, _port_hold) = ports.attach_outbound(link)?;
     let binding = port.bind(Some(Arc::clone(&scope.metrics)))?;
 
     let max_attempts = path.hops.len().saturating_add(2);
@@ -871,7 +872,7 @@ async fn stage_datagram_inner(
         })?;
 
         let mut state_slot = Some(origin_state);
-        let mut replies = SetupReplies::send(&binding, &flight, &*clock)?;
+        let mut replies = SetupReplies::send(&binding, &flight, &*clock, deadline).await?;
 
         let retry_cookie = loop {
             let pkt = replies.next_reply(deadline).await?;

@@ -14,12 +14,13 @@ use crate::trust::gate::PendingSetup;
 use crate::trust::lease::LeaseHandle;
 use crate::trust::registry::{EndpointHandlerKind, ResolvedTransitHandler};
 use crate::trust::revocation::TransitEpochTarget;
-use crate::types::{Plane, PublicKey, Role, TargetRef};
+use crate::types::{Plane, PublicationId, PublicKey, Role, TargetRef};
 use crate::wire::setup::{DispatchPrefix, SetupPlaintext};
 
 /// Admitted inbound Transit circuit ready for downstream `TransitHandler::open` and forwarding.
 pub(crate) struct AdmittedTransit {
     pub peer: PublicKey,
+    pub pub_id: PublicationId,
     pub full_name: String,
     pub subtarget: String,
     pub floor: u16,
@@ -128,6 +129,7 @@ pub(crate) async fn admit_transit(
 
     Ok(AdmittedTransit {
         peer,
+        pub_id: resolved.pub_id,
         full_name: target_name.to_owned(),
         subtarget: resolved.subtarget,
         floor,

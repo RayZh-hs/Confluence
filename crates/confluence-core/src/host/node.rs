@@ -6,7 +6,7 @@
 
 use core::fmt;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use crate::constants::{DEFAULT_MAX_DATAGRAM_PORTS, DEFAULT_NODE_MAX_PENDING};
@@ -23,6 +23,17 @@ use crate::seam::channel::{
 };
 use crate::stats::{NodeMetrics, NodeStats};
 use crate::types::ScopeKid;
+
+static NEXT_NODE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_node_id() -> u64 {
+    loop {
+        let id = NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+    }
+}
 
 /// Clamped admission and datagram port capacity limits for a multi-scope [`Node`] (Spec §3.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +109,7 @@ impl NodeBuilder {
         );
 
         Arc::new(Node {
+            id: allocate_node_id(),
             runtime: self.runtime,
             limits,
             metrics,
@@ -150,6 +162,7 @@ impl ScopeResolver for NodeScopeResolver {
 
 /// Multi-scope runtime container mounting isolated [`ScopeInstance`]s behind shared listeners.
 pub struct Node {
+    id: u64,
     runtime: Runtime,
     limits: NodeLimits,
     metrics: Arc<NodeMetrics>,
@@ -159,6 +172,36 @@ pub struct Node {
     scope_cores: Arc<RwLock<HashMap<ScopeKid, Arc<ScopeCore>>>>,
     resolver: Arc<NodeScopeResolver>,
     ports: Arc<PortRegistry>,
+}
+
+/// RAII rollback guard releasing a scope's atomic `NodeId` claim if mounting fails before commit.
+struct MountClaimGuard<'a> {
+    core: &'a ScopeCore,
+    node_id: u64,
+    committed: bool,
+}
+
+impl<'a> MountClaimGuard<'a> {
+    fn acquire(core: &'a ScopeCore, node_id: u64) -> Result<Self, CoreError> {
+        core.try_claim_node(node_id)?;
+        Ok(Self {
+            core,
+            node_id,
+            committed: false,
+        })
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for MountClaimGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.core.release_node(self.node_id);
+        }
+    }
 }
 
 /// Weak non-owning handle to a [`Node`] preventing `Arc` reference cycles.
@@ -207,9 +250,11 @@ impl Node {
     /// Mounts `scope` onto this `Node` (Spec §8.2 Rules 1, 2, 4).
     ///
     /// - Enforces exact `Arc::ptr_eq` shared [`crate::runtime::Clock`] identity (`InvalidParameter`).
-    /// - Rejects duplicate `PublicKey`, duplicate `ScopeKid`, or already-mounted scopes (`AlreadyPublished`).
+    /// - Atomically claims single-Node membership at `scope` (`AlreadyPublished` on concurrent mount).
+    /// - Rejects duplicate `PublicKey` or duplicate `ScopeKid` (`AlreadyPublished`).
     /// - Atomically validates capacity (`Busy`) and non-conflicting `LinkId`s (`AlreadyPublished`)
-    ///   before adopting any live standalone `DatagramPort`s (`node_wide = false`).
+    ///   before adopting any live standalone `DatagramPort`s (`node_wide = false`), rolling back
+    ///   the membership claim cleanly on any failure.
     pub fn add_scope(&self, scope: Arc<ScopeInstance>) -> Result<(), CoreError> {
         if !Arc::ptr_eq(&self.runtime.clock, &scope.core.runtime.clock) {
             return Err(CoreError::InvalidParameter);
@@ -221,36 +266,33 @@ impl Node {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        if scope.core.mounted.load(Ordering::Acquire) {
-            return Err(CoreError::AlreadyPublished);
-        }
-
         let kid = scope.scope_kid();
         let pk = scope.public_key();
         if mounted.contains_key(&kid) || mounted.values().any(|s| s.public_key() == pk) {
             return Err(CoreError::AlreadyPublished);
         }
 
-        // Lock Level 2: atomically adopt any live standalone datagram ports into the Node registry.
-        self.ports.adopt_from(scope.ports.standalone())?;
+        // Atomically claim Node membership at ScopeCore (DG-02); automatically rolls back on error.
+        let claim = MountClaimGuard::acquire(&scope.core, self.id)?;
 
-        // Commit membership atomically.
-        scope.ports.switch_to(Arc::clone(&self.ports));
-        scope.core.mounted.store(true, Ordering::Release);
-        {
+        // Lock Level 1.5 -> Level 2: serialize against concurrent `attach_datagram` / outbound
+        // attaches while adopting live standalone ports and switching the scope's `PortSlot` (DG-03).
+        scope.ports.mount_onto(self.id, &self.ports, || {
             let mut cores = self
                 .scope_cores
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             cores.insert(kid, Arc::clone(&scope.core));
-        }
+        })?;
+
+        claim.commit();
         mounted.insert(kid, scope);
         self.metrics.mounted_scopes.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     /// Unmounts the scope identified by `kid`, removing it from node demultiplexing and from all
-    /// explicit scope lists on attached `DatagramPort`s (Spec §8.2 Rule 4).
+    /// explicit scope lists on attached `DatagramPort`s (Spec §8.2 Rule 4, DG-03, DG-06).
     pub fn remove_scope(&self, kid: ScopeKid) -> Option<Arc<ScopeInstance>> {
         let mut mounted = self
             .membership
@@ -265,9 +307,9 @@ impl Node {
             cores.remove(&kid);
         }
         self.metrics.mounted_scopes.fetch_sub(1, Ordering::Relaxed);
-        self.ports.detach_scope(kid);
-        scope.ports.restore_standalone();
-        scope.core.mounted.store(false, Ordering::Release);
+        // Serialize scope detachment & standalone restore against concurrent `attach_datagram` (DG-03/06).
+        scope.ports.unmount_from(self.id, kid, Some(&self.ports));
+        scope.core.release_node(self.id);
         Some(scope)
     }
 
@@ -346,6 +388,44 @@ impl Node {
     #[must_use]
     pub fn stats(&self) -> NodeStats {
         self.metrics.snapshot()
+    }
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        // Close node admission, restore all mounted scopes to clean standalone state, shut down
+        // all node inbound port ingress (waking/retiring idle pumps), and release Node membership
+        // claims so any retained `Arc<ScopeInstance>` can drop cleanly or join a new `Node` (DG-05).
+        self.pending.close();
+
+        let scopes: Vec<Arc<ScopeInstance>> = {
+            let mut mounted = self
+                .membership
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            mounted.drain().map(|(_, s)| s).collect()
+        };
+
+        {
+            let mut cores = self
+                .scope_cores
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cores.clear();
+        }
+        self.metrics.mounted_scopes.store(0, Ordering::Release);
+
+        for scope in &scopes {
+            scope.ports.unmount_from(self.id, scope.scope_kid(), None);
+        }
+
+        self.ports.shutdown_ingress();
+
+        for scope in &scopes {
+            scope.core.release_node(self.id);
+        }
+
+        drop(scopes);
     }
 }
 

@@ -68,6 +68,7 @@ pub(crate) async fn handle_stream_transit(
 
     let AdmittedTransit {
         peer,
+        pub_id: _,
         full_name,
         subtarget,
         floor,

@@ -1,6 +1,8 @@
 //! Datagram Destination 1.0 RTT deferred open (`AwaitingConfirm` -> `EndpointHandler::open`
 //! -> bidirectional local `DatagramLink` bridge, Spec §6.3).
 
+use core::future::{Future, poll_fn};
+use core::task::Poll;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -8,7 +10,7 @@ use crate::constants::SETUP_TIMEOUT;
 use crate::crypto::cipher::{DatagramRx, DatagramTx};
 use crate::engine::admission::AdmittedEndpoint;
 use crate::engine::context::{
-    Either, NodePendingPermit, PendingPermit, ScopeCore, race2, wait_shutdown, with_deadline,
+    BridgeGuard, Either, NodePendingPermit, PendingPermit, ScopeCore, race2, wait_shutdown,
     with_deadline_val,
 };
 use crate::engine::datagram::port::Binding;
@@ -19,6 +21,7 @@ use crate::engine::datagram::session::{
 use crate::error::CoreError;
 use crate::packet::PacketBuf;
 use crate::protocol::mtu::DestPathMtu;
+use crate::runtime::sync::WatchReceiver;
 use crate::seam::auth::DatagramAction;
 use crate::seam::channel::{DatagramLink, DatagramLinkExt};
 use crate::seam::handler::DatagramEndpointHandler;
@@ -71,35 +74,41 @@ pub(crate) async fn serve_datagram_destination(
     .encode_base(&reply);
 
     let confirm_deadline = clock.now().saturating_add(SETUP_TIMEOUT);
-    with_deadline(
-        &*clock,
-        confirm_deadline,
-        binding.send_wait(PacketBuf::from_payload(&ok_wire)),
-    )
-    .await?;
+    binding
+        .send_reliable_until(PacketBuf::from_payload(&ok_wire), &*clock, confirm_deadline)
+        .await?;
 
     let mut tx = DatagramTx::new(session_keys.tx_key());
     let mut rx = DatagramRx::new(session_keys.rx_key());
     let mut shutdown_rx = scope.subscribe_shutdown();
 
     // Phase 1: AwaitingConfirm (retaining pending_permit, node_pending_permit, pending_setup!).
-    let confirm_res: Result<Option<PacketBuf>, CoreError> = async {
+    // Prioritize lease cancellation and scope shutdown over queued receive packets (DG-01).
+    let confirm_res: Result<Option<PacketBuf>, (CoreError, bool)> = async {
         loop {
+            if let Err(err) = lease.remaining() {
+                return Err((err, true));
+            }
+            if scope.is_shutting_down() {
+                return Err((CoreError::Closed, true));
+            }
+
             let step = with_deadline_val(
                 &*clock,
                 confirm_deadline,
                 race2(
-                    binding.recv(),
                     race2(lease.cancelled(), wait_shutdown(&mut shutdown_rx)),
+                    binding.recv(),
                 ),
             )
-            .await?;
+            .await
+            .map_err(|err| (err, false))?;
 
             let mut pkt = match step {
-                Either::Left(Ok(p)) => p,
-                Either::Left(Err(err)) => return Err(err),
-                Either::Right(Either::Left(err)) => return Err(err),
-                Either::Right(Either::Right(())) => return Err(CoreError::Closed),
+                Either::Left(Either::Left(err)) => return Err((err, true)),
+                Either::Left(Either::Right(())) => return Err((CoreError::Closed, true)),
+                Either::Right(Ok(p)) => p,
+                Either::Right(Err(err)) => return Err((err, false)),
             };
 
             // Spec §5.7.1 & §6.3: Silently ignore all non-DG_DATA packets (including 0x23..=0x27)
@@ -117,17 +126,21 @@ pub(crate) async fn serve_datagram_destination(
             match opcode {
                 e2e_dg::DG_CLOSE => {
                     // Authenticated e2e::DG_CLOSE aborts AwaitingConfirm WITHOUT invoking handler!
-                    return Err(CoreError::Closed);
+                    return Err((CoreError::Closed, false));
                 }
                 e2e_dg::DG_DATA => {
+                    // DG-01: Verify active lease AND non-shutdown even on empty seq == 0 marker!
+                    if let Err(err) = lease.remaining() {
+                        return Err((err, true));
+                    }
+                    if scope.is_shutting_down() {
+                        return Err((CoreError::Closed, true));
+                    }
                     if seq == 0 && pkt.is_empty() {
                         // Spec §5.8.1 & §6.3: Confirmed with first = None (suppressed!).
                         return Ok(None);
                     }
-                    if lease.is_active() {
-                        return Ok(Some(pkt));
-                    }
-                    return Err(lease.remaining().err().unwrap_or(CoreError::Expired));
+                    return Ok(Some(pkt));
                 }
                 e2e_dg::DG_RENEW => {
                     pkt.zeroize_payload();
@@ -141,12 +154,15 @@ pub(crate) async fn serve_datagram_destination(
 
     let mut first_packet = match confirm_res {
         Ok(pkt) => pkt,
-        Err(err) => {
+        Err((err, notify_peer)) => {
             tracing::debug!(
                 parent: &span,
                 error = err.static_code(),
                 "datagram destination aborted before confirmation"
             );
+            if notify_peer {
+                send_dest_e2e_close(&binding, &mut tx, upstream_cid, &err).await;
+            }
             return Err(err);
         }
     };
@@ -170,43 +186,67 @@ pub(crate) async fn serve_datagram_destination(
                     first_packet = None;
                 }
                 DatagramAction::Close(err) => {
-                    let bytes = encode_wire_error_bytes(&err);
-                    if let Ok(close_pkt) =
-                        build_e2e_packet(&mut tx, e2e_dg::DG_CLOSE, &bytes, upstream_cid)
-                    {
-                        binding.send_best_effort(close_pkt).await;
-                    }
+                    send_dest_e2e_close(&binding, &mut tx, upstream_cid, &err).await;
                     return Err(err);
                 }
             }
         }
     }
 
+    // DG-01: Re-check lease and scope shutdown BEFORE invoking `handler.open()`.
+    if let Err(err) = lease.remaining() {
+        send_dest_e2e_close(&binding, &mut tx, upstream_cid, &err).await;
+        return Err(err);
+    }
+    if scope.is_shutting_down() {
+        send_dest_e2e_close(&binding, &mut tx, upstream_cid, &CoreError::Closed).await;
+        return Err(CoreError::Closed);
+    }
+
     // Step 4: Invoke DatagramEndpointHandler::open strictly AFTER confirmation,
-    // bounded by SETUP_TIMEOUT and lease.cancelled() (Spec §6.3 Step 4).
+    // bounded by SETUP_TIMEOUT and raced against BOTH lease.cancelled() and scope shutdown (DG-01).
     let open_deadline = clock.now().saturating_add(SETUP_TIMEOUT);
     let open_res = with_deadline_val(
         &*clock,
         open_deadline,
-        race2(handler.open(lease.session_auth()), lease.cancelled()),
+        race2(
+            race2(lease.cancelled(), wait_shutdown(&mut shutdown_rx)),
+            handler.open(lease.session_auth()),
+        ),
     )
     .await;
 
     let app_link = match open_res {
-        Ok(Either::Left(Ok(link))) => link,
-        Ok(Either::Left(Err(err))) => {
+        Ok(Either::Right(Ok(link))) => link,
+        Ok(Either::Right(Err(err))) => {
             send_dest_e2e_close(&binding, &mut tx, upstream_cid, &err).await;
             return Err(err);
         }
-        Ok(Either::Right(err)) => {
+        Ok(Either::Left(Either::Left(err))) => {
             send_dest_e2e_close(&binding, &mut tx, upstream_cid, &err).await;
             return Err(err);
+        }
+        Ok(Either::Left(Either::Right(()))) => {
+            send_dest_e2e_close(&binding, &mut tx, upstream_cid, &CoreError::Closed).await;
+            return Err(CoreError::Closed);
         }
         Err(err) => {
             send_dest_e2e_close(&binding, &mut tx, upstream_cid, &err).await;
             return Err(err);
         }
     };
+
+    // Final re-check after `handler.open()` returned before recording established.
+    if let Err(err) = lease.remaining() {
+        drop(app_link);
+        send_dest_e2e_close(&binding, &mut tx, upstream_cid, &err).await;
+        return Err(err);
+    }
+    if scope.is_shutting_down() {
+        drop(app_link);
+        send_dest_e2e_close(&binding, &mut tx, upstream_cid, &CoreError::Closed).await;
+        return Err(CoreError::Closed);
+    }
 
     scope
         .metrics
@@ -249,41 +289,102 @@ async fn send_dest_e2e_close(
     }
 }
 
+async fn wait_session_closed(rx: &mut WatchReceiver<Option<CoreError>>) -> CoreError {
+    loop {
+        if let Some(err) = rx.borrow_cloned() {
+            return err;
+        }
+        if !rx.changed().await {
+            return rx.borrow_cloned().unwrap_or(CoreError::Closed);
+        }
+    }
+}
+
 fn spawn_datagram_bridge(
     scope: Arc<ScopeCore>,
     e2e: E2eDatagram,
     app_link: Arc<dyn DatagramLink>,
 ) {
-    // Direction 1: e2e -> app_link.
-    let e2e_in = e2e.clone();
-    let app_out = Arc::clone(&app_link);
-    scope.runtime.spawner.spawn(Box::pin(async move {
-        while let Ok(pkt) = e2e_in.recv().await {
-            match app_out.send(pkt).await {
-                Ok(()) => {}
-                Err(err) if err.is_retryable() || matches!(err, CoreError::MtuTooSmall(_)) => {}
-                Err(_) => {
-                    e2e_in.close();
-                    break;
-                }
-            }
-        }
-    }));
+    // Acquire BridgeGuard BEFORE spawning so `is_drained()` never returns `true` while the
+    // destination bridge task is alive or still owns `app_link` (DG-08).
+    let guard = BridgeGuard::acquire(Arc::clone(&scope));
+    let mut session_closed = e2e.subscribe_closed();
+    let mut shutdown_rx = scope.subscribe_shutdown();
+    let spawner = Arc::clone(&scope.runtime.spawner);
 
-    // Direction 2: app_link -> e2e (Spec §6.3 Step 5: drop MessageTooLarge without closing!).
-    scope.runtime.spawner.spawn(Box::pin(async move {
-        loop {
-            let pkt = match app_link.recv().await {
-                Ok(p) => p,
-                Err(_) => {
-                    e2e.close();
-                    break;
+    spawner.spawn(Box::pin(async move {
+        let _guard = guard;
+        {
+            let e2e_in = e2e.clone();
+            let app_out = Arc::clone(&app_link);
+            let dir1 = async move {
+                while let Ok(pkt) = e2e_in.recv().await {
+                    match app_out.send(pkt).await {
+                        Ok(()) => {}
+                        Err(err)
+                            if err.is_retryable() || matches!(err, CoreError::MtuTooSmall(_)) => {}
+                        Err(_) => {
+                            e2e_in.close();
+                            break;
+                        }
+                    }
                 }
             };
-            match e2e.send_wait(pkt).await {
-                Ok(()) | Err(CoreError::MessageTooLarge(_)) => {}
-                Err(_) => break,
-            }
+
+            let e2e_out = e2e.clone();
+            let app_in = Arc::clone(&app_link);
+            let dir2 = async move {
+                loop {
+                    let pkt = match app_in.recv().await {
+                        Ok(p) => p,
+                        Err(_) => {
+                            e2e_out.close();
+                            break;
+                        }
+                    };
+                    match e2e_out.send_wait(pkt).await {
+                        Ok(()) | Err(CoreError::MessageTooLarge(_)) => {}
+                        Err(_) => break,
+                    }
+                }
+            };
+
+            let mut d1 = core::pin::pin!(dir1);
+            let mut d2 = core::pin::pin!(dir2);
+            let mut closed_fut = core::pin::pin!(wait_session_closed(&mut session_closed));
+            let mut shutdown_fut = core::pin::pin!(wait_shutdown(&mut shutdown_rx));
+
+            // Supervise BOTH directions against session closure and scope shutdown (DG-08):
+            // - Scope shutdown or non-clean revocation/error aborts immediately.
+            // - Clean peer close lets `dir1` drain any immediately deliverable queued packets,
+            //   then aborts idle `dir2` / stalled `dir1` immediately so `app_link` and `_guard`
+            //   always drop promptly!
+            poll_fn(|cx| {
+                if shutdown_fut.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(());
+                }
+                if let Poll::Ready(reason) = closed_fut.as_mut().poll(cx) {
+                    if reason != CoreError::Closed {
+                        return Poll::Ready(());
+                    }
+                    // On clean close, give `d1` one non-blocking poll to flush any immediately
+                    // deliverable queued packet before exiting.
+                    let _ = d1.as_mut().poll(cx);
+                    return Poll::Ready(());
+                }
+                if d1.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(());
+                }
+                if d2.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(());
+                }
+                Poll::Pending
+            })
+            .await;
+
+            e2e.close();
+            drop(app_link);
         }
+        // `d1`, `d2`, `app_link`, and `e2e` are all dropped strictly BEFORE `_guard` drops!
     }));
 }

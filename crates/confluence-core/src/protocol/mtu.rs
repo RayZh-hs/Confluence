@@ -348,6 +348,12 @@ pub enum TransitMtuEvent {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TransitDrain {
+    bound: u16,
+    deadline: MonotonicTime,
+}
+
 /// Intermediate Datagram Transit leg MTU tracker with `5 s` floor-violation drain window (Spec §6.6).
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -356,7 +362,7 @@ pub struct TransitPathMtu {
     right_mtu: u16,
     floor: u16,
     effective: u16,
-    drain_deadline: Option<MonotonicTime>,
+    drain: Option<TransitDrain>,
 }
 
 #[allow(dead_code)]
@@ -369,7 +375,7 @@ impl TransitPathMtu {
             right_mtu,
             floor,
             effective,
-            drain_deadline: None,
+            drain: None,
         }
     }
 
@@ -389,17 +395,31 @@ impl TransitPathMtu {
     }
 
     #[must_use]
-    pub const fn drain_deadline(&self) -> Option<MonotonicTime> {
-        self.drain_deadline
+    pub fn drain_deadline(&self) -> Option<MonotonicTime> {
+        self.drain.map(|d| d.deadline)
+    }
+
+    #[must_use]
+    pub fn drain_bound(&self) -> Option<u16> {
+        self.drain.map(|d| d.bound)
     }
 
     fn evaluate(&mut self, now: MonotonicTime) -> TransitMtuEvent {
+        if let Some(drain) = self.drain {
+            // Once floor-violation drain begins, latch the violating bound so transient
+            // recovery cannot supersede the pending below-floor report or overwrite the
+            // terminal `MtuTooSmall` bound with an above-floor value (Spec §6.6).
+            self.effective = drain.bound;
+            return TransitMtuEvent::Unchanged;
+        }
         let next = self.left_mtu.min(self.right_mtu);
         if next < self.floor {
             self.effective = next;
-            let deadline = *self
-                .drain_deadline
-                .get_or_insert_with(|| now.saturating_add(MTU_REPORT_TIMEOUT));
+            let deadline = now.saturating_add(MTU_REPORT_TIMEOUT);
+            self.drain = Some(TransitDrain {
+                bound: next,
+                deadline,
+            });
             return TransitMtuEvent::FloorViolation {
                 mtu: next,
                 drain_deadline: deadline,
@@ -411,6 +431,14 @@ impl TransitPathMtu {
         } else {
             TransitMtuEvent::Unchanged
         }
+    }
+
+    /// Updates both leg MTUs simultaneously (used at transit startup to compare against
+    /// the exact `physical_mtu` sent in the `SETUP_OK` hop trailer without double publishing).
+    pub fn update_both(&mut self, left: u16, right: u16, now: MonotonicTime) -> TransitMtuEvent {
+        self.left_mtu = left;
+        self.right_mtu = right;
+        self.evaluate(now)
     }
 
     pub fn update_left(&mut self, mtu: u16, now: MonotonicTime) -> TransitMtuEvent {
@@ -503,7 +531,7 @@ mod tests {
         // Hop 0 drops below floor (epoch 2) -> BelowFloor(1100).
         assert_eq!(orig.on_hop_mtu(0, 2, 1100), MtuChange::BelowFloor(1100));
 
-        // Transit floor violation enters 5 s drain window.
+        // Transit floor violation enters 5 s drain window and latches violating bound across recovery.
         let mut tr = TransitPathMtu::new(1300, 1250, 1152);
         let t0 = MonotonicTime::from_nanos(1_000_000_000);
         assert_eq!(
@@ -513,5 +541,23 @@ mod tests {
                 drain_deadline: t0.saturating_add(Duration::from_secs(5)),
             }
         );
+        assert_eq!(tr.drain_bound(), Some(1100));
+        // Transient recovery above floor MUST NOT supersede the latched violation or emit Updated!
+        let t1 = t0.saturating_add(Duration::from_millis(50));
+        assert_eq!(tr.update_right(1500, t1), TransitMtuEvent::Unchanged);
+        assert_eq!(tr.drain_bound(), Some(1100));
+        assert_eq!(tr.effective(), 1100);
+        assert_eq!(
+            tr.drain_deadline(),
+            Some(t0.saturating_add(Duration::from_secs(5)))
+        );
+
+        // Startup update_both compares live legs against initial SETUP_OK trailer MTU in one event.
+        let mut tr2 = TransitPathMtu::new(1500, 1500, 1152);
+        assert_eq!(
+            tr2.update_both(1500, 1200, t0),
+            TransitMtuEvent::Updated(1200)
+        );
+        assert_eq!(tr2.effective(), 1200);
     }
 }

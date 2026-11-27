@@ -74,15 +74,15 @@ pub(crate) async fn run_datagram_transit(params: DatagramTransitParams) {
     let mut auth_fut: Option<RenewalAuthFut> = None;
     let mut shutdown_rx = scope.subscribe_shutdown();
 
-    // Startup check catching live MTU shifts right after SETUP_OK while synchronizing watch baselines.
+    // Startup check comparing first live sampled legs against the exact `physical` MTU sent in
+    // the `SETUP_OK` hop trailer while synchronizing watch baselines atomically (DG-11, DG-13).
     {
         let now = clock.now();
-        let ev1 = path_mtu.update_left(initial_left, now);
-        handle_transit_mtu_event(ev1, &mut mtu_reporter, &mut ctrl, &left, caller_cid, now);
-        let ev2 = path_mtu.update_right(initial_right, now);
-        handle_transit_mtu_event(ev2, &mut mtu_reporter, &mut ctrl, &left, caller_cid, now);
+        let ev = path_mtu.update_both(initial_left, initial_right, now);
+        handle_transit_mtu_event(ev, &mut mtu_reporter, &mut ctrl, &left, caller_cid, now);
     }
 
+    let mut prefer_reverse = false;
     let exit_result: Result<(), CoreError> = loop {
         let mtu_retry_dl = mtu_reporter.next_deadline();
         let drain_dl = path_mtu.drain_deadline();
@@ -127,16 +127,33 @@ pub(crate) async fn run_datagram_transit(params: DatagramTransitParams) {
                 if let Poll::Ready(()) = t_fut.as_mut().poll(cx) {
                     return Poll::Ready(Ev::TimerFired);
                 }
-                if let Poll::Ready(pkt) = lp_fut.as_mut().poll(cx) {
-                    return Poll::Ready(Ev::LeftPkt(pkt));
-                }
-                if let Poll::Ready(pkt) = rp_fut.as_mut().poll(cx) {
-                    return Poll::Ready(Ev::RightPkt(pkt));
+                // DG-15: Alternate forward/reverse mailbox polling so sustained forward floods
+                // cannot starve reverse DG_RENEW_OK, DG_MTU, or reverse traffic.
+                if prefer_reverse {
+                    if let Poll::Ready(pkt) = rp_fut.as_mut().poll(cx) {
+                        return Poll::Ready(Ev::RightPkt(pkt));
+                    }
+                    if let Poll::Ready(pkt) = lp_fut.as_mut().poll(cx) {
+                        return Poll::Ready(Ev::LeftPkt(pkt));
+                    }
+                } else {
+                    if let Poll::Ready(pkt) = lp_fut.as_mut().poll(cx) {
+                        return Poll::Ready(Ev::LeftPkt(pkt));
+                    }
+                    if let Poll::Ready(pkt) = rp_fut.as_mut().poll(cx) {
+                        return Poll::Ready(Ev::RightPkt(pkt));
+                    }
                 }
                 Poll::Pending
             })
             .await
         };
+
+        match &ev {
+            Ev::LeftPkt(_) => prefer_reverse = true,
+            Ev::RightPkt(_) => prefer_reverse = false,
+            _ => {}
+        }
 
         match ev {
             Ev::LeaseCancelled(err) => break Err(err),
@@ -153,16 +170,17 @@ pub(crate) async fn run_datagram_transit(params: DatagramTransitParams) {
             }
             Ev::TimerFired => {
                 let now = clock.now();
-                if let Some(dl) = path_mtu.drain_deadline() {
+                if let (Some(dl), Some(bound)) = (path_mtu.drain_deadline(), path_mtu.drain_bound())
+                {
                     if now >= dl {
-                        break Err(CoreError::MtuTooSmall(path_mtu.effective()));
+                        break Err(CoreError::MtuTooSmall(bound));
                     }
                 }
                 if let Some((epoch, mtu)) = mtu_reporter.poll_retry(now) {
                     emit_hop_mtu(&mut ctrl, &left, caller_cid, epoch, mtu);
                 }
             }
-            Ev::LeftPkt(Err(_)) | Ev::RightPkt(Err(_)) => break Err(CoreError::Closed),
+            Ev::LeftPkt(Err(err)) | Ev::RightPkt(Err(err)) => break Err(err),
             Ev::LeftPkt(Ok(mut pkt)) => {
                 let Some(&op) = pkt.payload().first() else {
                     continue;
@@ -248,6 +266,12 @@ pub(crate) async fn run_datagram_transit(params: DatagramTransitParams) {
                         match hdr.kind {
                             outer::DG_CLOSE => {
                                 if decode_wire_error_bytes(&pt).is_ok() {
+                                    // DG-14 / Spec §6.6: An authenticated hop close during
+                                    // floor-violation drain terminates with the latched
+                                    // `MtuTooSmall(bound)` rather than generic `Ok(())`.
+                                    if let Some(bound) = path_mtu.drain_bound() {
+                                        break Err(CoreError::MtuTooSmall(bound));
+                                    }
                                     break Ok(());
                                 }
                             }

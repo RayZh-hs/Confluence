@@ -13,7 +13,7 @@ use crate::crypto::cookie::CookieDecision;
 use crate::crypto::noise::{HopKey, Responder};
 use crate::engine::admission::{admit_endpoint, admit_transit};
 use crate::engine::context::{
-    Either, NodePendingPermit, PendingPermit, ScopeCore, race2, with_deadline, with_deadline_val,
+    CookieRetryKey, Either, NodePendingPermit, PendingPermit, ScopeCore, race2, with_deadline_val,
 };
 use crate::engine::datagram::port::{
     DatagramPort, DatagramSetupHandler, SetupReplies, hold_for_cookie_retry,
@@ -204,37 +204,6 @@ async fn handle_datagram_setup(
 
         let setup_deadline = clock.now().saturating_add(SETUP_TIMEOUT);
 
-        // Open outbound DatagramLink racing lease.cancelled() and SETUP_TIMEOUT.
-        let out_link = match with_deadline_val(
-            &*clock,
-            setup_deadline,
-            race2(
-                handler.open(&admitted.subtarget, admitted.lease.session_auth()),
-                admitted.lease.cancelled(),
-            ),
-        )
-        .await
-        {
-            Ok(Either::Left(Ok(link))) => link,
-            Ok(Either::Left(Err(err))) => {
-                send_dg_setup_err(&scope, &port, Role::Transit, hdr.upstream, &hop_key, &err).await;
-                return;
-            }
-            Ok(Either::Right(err)) => {
-                send_dg_setup_err(&scope, &port, Role::Transit, hdr.upstream, &hop_key, &err).await;
-                return;
-            }
-            Err(err) => {
-                send_dg_setup_err(&scope, &port, Role::Transit, hdr.upstream, &hop_key, &err).await;
-                return;
-            }
-        };
-
-        if let Err(err) = admitted.lease.remaining() {
-            send_dg_setup_err(&scope, &port, Role::Transit, hdr.upstream, &hop_key, &err).await;
-            return;
-        }
-
         let Some(registry) = port.owner_registry() else {
             send_dg_setup_err(
                 &scope,
@@ -248,11 +217,71 @@ async fn handle_datagram_setup(
             return;
         };
 
-        let (out_port, _out_hold) = match registry.attach_outbound(out_link) {
-            Ok(v) => v,
-            Err(err) => {
+        // DG-10: Reuse a held downstream link from a recent SETUP_COOKIE challenge scoped
+        // strictly to `(peer, plane, pub_id, full_name)` before invoking `handler.open()`.
+        let cookie_retry_key = CookieRetryKey {
+            peer: admitted.peer,
+            plane: Plane::Datagram,
+            pub_id: admitted.pub_id,
+            target: admitted.full_name.clone(),
+        };
+        let cached_port = scope
+            .take_cookie_retry_link(&cookie_retry_key, clock.now())
+            .and_then(|link_id| registry.acquire_live_outbound(link_id));
+
+        let (out_port, _out_hold) = if let Some(reused) = cached_port {
+            if let Err(err) = admitted.lease.remaining() {
                 send_dg_setup_err(&scope, &port, Role::Transit, hdr.upstream, &hop_key, &err).await;
                 return;
+            }
+            reused
+        } else {
+            if let Err(err) = admitted.lease.remaining() {
+                send_dg_setup_err(&scope, &port, Role::Transit, hdr.upstream, &hop_key, &err).await;
+                return;
+            }
+
+            // Open outbound DatagramLink racing lease.cancelled() and SETUP_TIMEOUT.
+            let out_link = match with_deadline_val(
+                &*clock,
+                setup_deadline,
+                race2(
+                    admitted.lease.cancelled(),
+                    handler.open(&admitted.subtarget, admitted.lease.session_auth()),
+                ),
+            )
+            .await
+            {
+                Ok(Either::Right(Ok(link))) => link,
+                Ok(Either::Right(Err(err))) => {
+                    send_dg_setup_err(&scope, &port, Role::Transit, hdr.upstream, &hop_key, &err)
+                        .await;
+                    return;
+                }
+                Ok(Either::Left(err)) => {
+                    send_dg_setup_err(&scope, &port, Role::Transit, hdr.upstream, &hop_key, &err)
+                        .await;
+                    return;
+                }
+                Err(err) => {
+                    send_dg_setup_err(&scope, &port, Role::Transit, hdr.upstream, &hop_key, &err)
+                        .await;
+                    return;
+                }
+            };
+
+            if let Err(err) = admitted.lease.remaining() {
+                send_dg_setup_err(&scope, &port, Role::Transit, hdr.upstream, &hop_key, &err).await;
+                return;
+            }
+
+            match registry.attach_outbound(out_link) {
+                Ok(v) => v,
+                Err(err) => {
+                    send_dg_setup_err(&scope, &port, Role::Transit, hdr.upstream, &hop_key, &err)
+                        .await;
+                    return;
+                }
             }
         };
 
@@ -288,9 +317,14 @@ async fn handle_datagram_setup(
             right.cid(),
             seg.tail,
         );
-        let mut replies = match SetupReplies::send(&right, &fwd, &*clock) {
-            Ok(r) => r,
-            Err(err) => {
+        let mut replies = match race2(
+            admitted.lease.cancelled(),
+            SetupReplies::send(&right, &fwd, &*clock, setup_deadline),
+        )
+        .await
+        {
+            Either::Right(Ok(r)) => r,
+            Either::Right(Err(err)) | Either::Left(err) => {
                 send_dg_setup_err(&scope, &port, Role::Transit, hdr.upstream, &hop_key, &err).await;
                 return;
             }
@@ -298,18 +332,13 @@ async fn handle_datagram_setup(
 
         loop {
             let pkt = match race2(
-                replies.next_reply(setup_deadline),
                 admitted.lease.cancelled(),
+                replies.next_reply(setup_deadline),
             )
             .await
             {
-                Either::Left(Ok(p)) => p,
-                Either::Left(Err(err)) => {
-                    send_dg_setup_err(&scope, &port, Role::Transit, hdr.upstream, &hop_key, &err)
-                        .await;
-                    return;
-                }
-                Either::Right(err) => {
+                Either::Right(Ok(p)) => p,
+                Either::Right(Err(err)) | Either::Left(err) => {
                     send_dg_setup_err(&scope, &port, Role::Transit, hdr.upstream, &hop_key, &err)
                         .await;
                     return;
@@ -402,12 +431,13 @@ async fn handle_datagram_setup(
                             }
                         };
 
-                    if let Err(err) = with_deadline(
-                        &*clock,
-                        setup_deadline,
-                        left.send_wait(PacketBuf::from_payload(&ok_wire)),
-                    )
-                    .await
+                    if let Err(err) = left
+                        .send_reliable_until(
+                            PacketBuf::from_payload(&ok_wire),
+                            &*clock,
+                            setup_deadline,
+                        )
+                        .await
                     {
                         scope.metrics.record_setup_failure(
                             Plane::Datagram,
@@ -466,11 +496,21 @@ async fn handle_datagram_setup(
                     if cookie_frame.target_cid != right.cid() {
                         continue;
                     }
-                    // Spec §6.2 Step 4: retain Arc<DatagramPort> for 3 s so outbound source_tag stays stable!
+                    // Spec §6.2 Step 4 & DG-10: retain Arc<DatagramPort> for 3 s AND cache its
+                    // LinkId scoped to `(peer, plane, pub_id, full_name)` so the authenticated
+                    // retry reuses the exact challenged link even if `handler.open()` mints a
+                    // fresh link/source_tag per call!
+                    let now = clock.now();
                     hold_for_cookie_retry(
                         Arc::clone(&out_port),
                         Arc::clone(&clock),
                         &*scope.runtime.spawner,
+                    );
+                    scope.record_cookie_retry_link(
+                        cookie_retry_key,
+                        out_port.link_id(),
+                        now,
+                        now.saturating_add(SETUP_TIMEOUT),
                     );
                     if let Ok(rewritten) =
                         HopSetupRewrite::rewrite_cookie(&cookie_frame, hdr.upstream)

@@ -12,6 +12,36 @@ struct SlotEntry<T> {
     value: Option<T>,
 }
 
+/// Generation and 60-second wrap-quarantine state preserved across idle port retirement (Spec §6.5).
+#[derive(Debug, Clone)]
+pub struct SlabHistory {
+    generations: Vec<u8>,
+    free_list: Vec<u32>,
+    quarantine: VecDeque<(u32, MonotonicTime)>,
+    retired_at: MonotonicTime,
+}
+
+#[allow(dead_code)]
+impl SlabHistory {
+    /// Returns `true` if no slots were ever allocated in this slab.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.generations.is_empty()
+    }
+
+    /// Returns the monotonic timestamp when this history was captured.
+    #[must_use]
+    pub const fn retired_at(&self) -> MonotonicTime {
+        self.retired_at
+    }
+
+    /// Returns `true` once the 60-second idle quarantine cooldown has elapsed since retirement.
+    #[must_use]
+    pub fn is_expired(&self, now: MonotonicTime) -> bool {
+        now.saturating_duration_since(self.retired_at) >= SLAB_QUARANTINE_DURATION
+    }
+}
+
 /// Bounded per-link circuit table (`4096` active cap) issuing non-zero 32-bit [`Cid`]s
 /// (`[generation: 8b (1..=255) | slot_idx: 24b]`) with a 60-second monotonic FIFO quarantine
 /// whenever a slot's generation wraps from `255` back to `1` (Spec §6.5).
@@ -163,6 +193,60 @@ impl<T> SlabTable<T> {
     pub fn quarantined_len(&self) -> usize {
         self.quarantine.len()
     }
+
+    /// Removes all active entries (advancing their generations and applying 60-second wrap
+    /// quarantine identically to [`Self::remove`]) and extracts the table's generation history,
+    /// resetting `self` to an empty table so subsequent bindings on the same logical link never
+    /// immediately alias previously issued CIDs.
+    pub fn drain_to_history(&mut self, now: MonotonicTime) -> SlabHistory {
+        let mut generations = Vec::with_capacity(self.slots.len());
+        let mut free_list = core::mem::take(&mut self.free_list);
+        let mut quarantine = core::mem::take(&mut self.quarantine);
+
+        for (idx_usize, mut slot) in self.slots.drain(..).enumerate() {
+            if slot.value.take().is_some() {
+                if let Ok(idx) = u32::try_from(idx_usize) {
+                    if slot.generation < u8::MAX {
+                        slot.generation += 1;
+                        free_list.push(idx);
+                    } else {
+                        slot.generation = 1;
+                        quarantine.push_back((idx, now));
+                    }
+                }
+            }
+            generations.push(slot.generation);
+        }
+        self.active_count = 0;
+
+        SlabHistory {
+            generations,
+            free_list,
+            quarantine,
+            retired_at: now,
+        }
+    }
+
+    /// Reconstructs an empty `SlabTable` preserving prior per-slot generations, free list,
+    /// and 60-second wrap quarantine state from `history`.
+    #[must_use]
+    pub fn from_history(history: SlabHistory) -> Self {
+        let slots = history
+            .generations
+            .into_iter()
+            .map(|generation| SlotEntry {
+                generation: generation.max(1),
+                value: None,
+            })
+            .collect();
+        Self {
+            max_active: SLAB_MAX_ACTIVE,
+            active_count: 0,
+            slots,
+            free_list: history.free_list,
+            quarantine: history.quarantine,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -230,5 +314,38 @@ mod tests {
         assert_eq!(slab.insert(3, t0), Err(CoreError::Busy));
         assert_eq!(slab.remove(c1, t0), Some(1));
         assert!(slab.insert(3, t0).is_ok());
+    }
+
+    #[test]
+    fn slab_table_history_preserves_generations_and_quarantine_across_reattach() {
+        let mut slab = SlabTable::<u32>::new();
+        let t0 = MonotonicTime::ZERO;
+        let c1 = slab.insert(10, t0).unwrap();
+        assert_eq!((c1.slot(), c1.generation()), (0, 1));
+        // Drain while slot 0 is still active -> advances generation to 2 and clears active entries.
+        let hist = slab.drain_to_history(t0);
+        assert!(slab.is_empty());
+        assert!(!hist.is_empty());
+
+        let mut restored = SlabTable::<u32>::from_history(hist);
+        let c2 = restored.insert(20, t0.saturating_add(Duration::from_millis(50))).unwrap();
+        assert_eq!((c2.slot(), c2.generation()), (0, 2));
+        assert_ne!(c1, c2);
+        restored.remove(c2, t0);
+
+        // Advance slot 0 through 255 -> wrap into 60 s quarantine and persist across drain/restore.
+        for _ in 3..=255u8 {
+            let c = restored.insert(0, t0).unwrap();
+            assert_eq!(c.slot(), 0);
+            restored.remove(c, t0);
+        }
+        assert_eq!(restored.quarantined_len(), 1);
+        let hist2 = restored.drain_to_history(t0);
+        let mut restored2 = SlabTable::<u32>::from_history(hist2);
+        let c_next = restored2
+            .insert(99, t0.saturating_add(Duration::from_secs(30)))
+            .unwrap();
+        assert_eq!(c_next.slot(), 1);
+        assert_eq!(c_next.generation(), 1);
     }
 }

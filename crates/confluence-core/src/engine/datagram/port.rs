@@ -3,10 +3,21 @@
 //!
 //! Strictly acyclic: NEVER imports `engine::admission` (hands off inbound setups through
 //! the [`DatagramSetupHandler`] trait implemented by `engine::datagram::inbound`).
+//!
+//! # Lock Hierarchy
+//! - Level 1: `Node::membership` (in `host::node`)
+//! - Level 1.5: `PortSlot::state`
+//! - Level 2: `PortRegistry::inner` (in `adopt_from`: Node `dst` first, standalone `src` second)
+//! - Level 3: `DatagramPort::state`
+//! - Level 4: `DatagramPort::slab` (leaf lock)
+//!
+//! Never invoke `TaskSpawner::spawn`, `ScopeResolver`, or drop `PortPermit`/`Arc<ScopeCore>`
+//! while holding registry or port locks.
 
 use core::future::{Future, poll_fn};
 use core::task::Poll;
-use std::collections::HashMap;
+use core::time::Duration;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
@@ -24,8 +35,8 @@ use crate::protocol::fragment::{
     FeedOutcome, FragmentBurst, FragmentReassembler, FragmentReceipt, OpeningVerdict,
     PreparedFlight,
 };
-use crate::protocol::slab::SlabTable;
-use crate::runtime::sync::{CloseableSemaphore, SemaphorePermit, Watch, WatchReceiver};
+use crate::protocol::slab::{SlabHistory, SlabTable};
+use crate::runtime::sync::{CloseableSemaphore, SemaphorePermit, Watch};
 use crate::runtime::{Clock, MonotonicTime, TaskSpawner};
 use crate::seam::channel::{
     AdmissionAttempt, AdmissionTracker, DatagramIngress, DatagramLink, DatagramLinkExt, MtuWatch,
@@ -48,6 +59,9 @@ fn read_unpoisoned<T>(rw: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
 fn write_unpoisoned<T>(rw: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
     rw.write().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
+type SpawnPump = (Arc<dyn TaskSpawner>, Arc<DatagramPort>);
+type OutboundAttachment = (Arc<DatagramPort>, OutboundPortHold);
 
 // ---------------------------------------------------------------------------
 // Acyclic Setup Handoff Trait (implemented by `datagram::inbound`)
@@ -158,13 +172,22 @@ struct MailboxEntry {
     metrics: Option<Arc<ScopeMetrics>>,
 }
 
-struct PortRouting {
+struct PortState {
     node_wide: bool,
     scopes: HashMap<ScopeKid, Arc<ScopeCore>>,
     resolver: Arc<dyn ScopeResolver>,
     setup_handler: Arc<dyn DatagramSetupHandler>,
     owner: Weak<PortRegistry>,
     node_pending: Option<Arc<NodePendingGate>>,
+    closing: bool,
+    close_reason: Option<CoreError>,
+    port_permit: Option<PortPermit>,
+}
+
+impl PortState {
+    fn has_inbound_ownership(&self) -> bool {
+        self.node_wide || !self.scopes.is_empty()
+    }
 }
 
 /// Shared per-`DatagramLink` multiplexer owning one generational [`SlabTable`] (`4096` cap),
@@ -177,11 +200,12 @@ pub(crate) struct DatagramPort {
     reassembler: Arc<Mutex<FragmentReassembler>>,
     admission: Arc<AdmissionTracker>,
     closed_tx: Watch<Option<CoreError>>,
+    /// Lock-free SeqCst mirror of `state.has_inbound_ownership()`, paired with `outbound_refs`.
     has_inbound: AtomicBool,
     outbound_refs: AtomicUsize,
-    stop_tx: Watch<bool>,
-    routing: RwLock<PortRouting>,
-    port_permit: Mutex<Option<PortPermit>>,
+    /// Monotonic wakeup generation counter (pump never writes back -> zero lost wakeups).
+    stop_tx: Watch<u64>,
+    state: Mutex<PortState>,
 }
 
 /// RAII keep-alive reference for outbound-only [`DatagramPort`] usage (bindings and cookie-retry holds).
@@ -191,14 +215,20 @@ pub(crate) struct OutboundPortHold {
 
 impl Drop for OutboundPortHold {
     fn drop(&mut self) {
-        let prev = self.port.outbound_refs.fetch_sub(1, Ordering::AcqRel);
-        if prev == 1 && !self.port.has_inbound.load(Ordering::Acquire) {
-            self.port.stop_tx.send(true);
+        let prev = self.port.outbound_refs.fetch_sub(1, Ordering::SeqCst);
+        if prev == 1 && !self.port.has_inbound.load(Ordering::SeqCst) {
+            self.port.wake_pump();
         }
     }
 }
 
 impl DatagramPort {
+    /// Returns this port's stable logical [`LinkId`].
+    #[must_use]
+    pub const fn link_id(&self) -> LinkId {
+        self.link_id
+    }
+
     /// Returns the link's current live effective MTU.
     pub fn mtu(&self) -> u16 {
         self.link.current_mtu()
@@ -221,15 +251,38 @@ impl DatagramPort {
 
     /// Returns the currently owning [`PortRegistry`], if still alive.
     pub fn owner_registry(&self) -> Option<Arc<PortRegistry>> {
-        read_unpoisoned(&self.routing).owner.upgrade()
+        lock_unpoisoned(&self.state).owner.upgrade()
     }
 
-    /// Acquires an RAII keep-alive hold on this port.
-    pub fn acquire_outbound_hold(self: &Arc<Self>) -> OutboundPortHold {
-        self.outbound_refs.fetch_add(1, Ordering::AcqRel);
-        OutboundPortHold {
-            port: Arc::clone(self),
+    /// Returns the port's recorded terminal error (or [`CoreError::Closed`] if closed cleanly).
+    pub(crate) fn terminal_err(&self) -> CoreError {
+        if let Some(err) = lock_unpoisoned(&self.state).close_reason.clone() {
+            return err;
         }
+        self.closed_tx.borrow_cloned().unwrap_or(CoreError::Closed)
+    }
+
+    fn is_closing(&self) -> bool {
+        lock_unpoisoned(&self.state).closing
+    }
+
+    fn wake_pump(&self) {
+        self.stop_tx.send_if_modified(|v| {
+            *v = v.wrapping_add(1);
+            true
+        });
+    }
+
+    /// Acquires an RAII keep-alive hold on this port unless it is already closing.
+    pub fn try_acquire_outbound_hold(self: &Arc<Self>) -> Result<OutboundPortHold, CoreError> {
+        let st = lock_unpoisoned(&self.state);
+        if st.closing {
+            return Err(st.close_reason.clone().unwrap_or(CoreError::Closed));
+        }
+        self.outbound_refs.fetch_add(1, Ordering::SeqCst);
+        Ok(OutboundPortHold {
+            port: Arc::clone(self),
+        })
     }
 
     /// Allocates a unique bound [`Cid`] and 32-slot circuit mailbox on this port's [`SlabTable`].
@@ -237,15 +290,18 @@ impl DatagramPort {
         self: &Arc<Self>,
         metrics: Option<Arc<ScopeMetrics>>,
     ) -> Result<Binding, CoreError> {
-        if self.closed_tx.borrow_cloned().is_some() {
-            return Err(CoreError::Closed);
-        }
-        let hold = self.acquire_outbound_hold();
+        let hold = self.try_acquire_outbound_hold()?;
         let (tx, rx) = async_channel::bounded::<PacketBuf>(DATAGRAM_MAILBOX_CAP);
         let cid = {
             let mut slab = lock_unpoisoned(&self.slab);
             slab.insert(MailboxEntry { tx, metrics }, self.clock.now())?
         };
+        // Re-check closing in case a fatal carrier error raced between acquiring `hold` and inserting.
+        if self.is_closing() {
+            let mut slab = lock_unpoisoned(&self.slab);
+            let _ = slab.remove(cid, self.clock.now());
+            return Err(self.terminal_err());
+        }
         Ok(Binding {
             port: Arc::clone(self),
             cid,
@@ -262,82 +318,191 @@ impl DatagramPort {
 
     /// Resolves `kid` according to this port's explicit scope list / `node_wide` policy.
     fn resolve_scope_for_setup(&self, kid: ScopeKid) -> Option<Arc<ScopeCore>> {
-        let routing = read_unpoisoned(&self.routing);
-        if routing.node_wide {
-            routing.resolver.resolve(kid)
-        } else {
-            routing.scopes.get(&kid).cloned()
+        let lookup = {
+            let st = lock_unpoisoned(&self.state);
+            if st.closing {
+                return None;
+            }
+            if st.node_wide {
+                Ok(Arc::clone(&st.resolver))
+            } else {
+                Err(st.scopes.get(&kid).cloned())
+            }
+        };
+        match lookup {
+            Ok(resolver) => resolver.resolve(kid),
+            Err(scope) => scope,
         }
     }
 
     fn record_unknown_scope(&self) {
-        read_unpoisoned(&self.routing).resolver.record_unknown_scope();
+        let resolver = Arc::clone(&lock_unpoisoned(&self.state).resolver);
+        resolver.record_unknown_scope();
     }
 
     fn record_mac1_drop(&self, matched: Option<&ScopeCore>) {
-        read_unpoisoned(&self.routing)
-            .resolver
-            .record_mac1_drop(matched);
+        let resolver = Arc::clone(&lock_unpoisoned(&self.state).resolver);
+        resolver.record_mac1_drop(matched);
     }
 
     /// Background receive pump driving O(1) CID dispatch, fragment reassembly, and setup handoff.
     async fn run_pump(self: Arc<Self>) {
         let mut stop_rx = self.stop_tx.subscribe();
         let close_reason = loop {
-            if !self.has_inbound.load(Ordering::Acquire)
-                && self.outbound_refs.load(Ordering::Acquire) == 0
+            let _ = stop_rx.borrow_and_mark_seen();
+            if self.is_closing() {
+                break self.terminal_err();
+            }
+            if !self.has_inbound.load(Ordering::SeqCst)
+                && self.outbound_refs.load(Ordering::SeqCst) == 0
                 && self.try_retire_if_idle()
             {
                 break CoreError::Closed;
             }
-            let pkt = match race2(self.link.recv(), wait_stop(&mut stop_rx)).await {
-                Either::Left(Ok(p)) => p,
-                Either::Left(Err(err)) => break err,
-                Either::Right(()) => {
-                    if self.try_retire_if_idle() {
-                        break CoreError::Closed;
-                    }
-                    self.stop_tx.send(false);
-                    stop_rx.mark_seen();
-                    continue;
-                }
+            let pkt = match race2(stop_rx.changed(), self.link.recv()).await {
+                Either::Left(_) => continue,
+                Either::Right(Ok(p)) => p,
+                Either::Right(Err(err)) => break err,
             };
             self.dispatch_inbound_packet(pkt);
         };
 
-        // Remove ourselves from current owner registry (only if pointer matches).
-        if let Some(reg) = self.owner_registry() {
-            reg.remove_if_same(self.link_id, &self);
+        // Synchronized teardown (DG-04, DG-07, DG-16):
+        // 1. Mark `closing = true` and record `close_reason` BEFORE closing circuit mailboxes so
+        //    every `Binding::recv()` immediately sees the real carrier error.
+        // 2. Synchronize registry removal with any concurrent `adopt_from` owner transfer.
+        // 3. Extract `SlabHistory` into the owning registry's quarantine cache.
+        // 4. Drop `PortPermit` and scope references outside locks BEFORE waking `DatagramIngress::closed()`.
+        let mut dropped_permit: Option<PortPermit> = None;
+        let mut dropped_scopes: Vec<Arc<ScopeCore>> = Vec::new();
+        loop {
+            let owner_opt = {
+                let mut st = lock_unpoisoned(&self.state);
+                st.closing = true;
+                if st.close_reason.is_none() {
+                    st.close_reason = Some(close_reason.clone());
+                }
+                st.owner.upgrade()
+            };
+
+            let Some(reg) = owner_opt else {
+                let _ = lock_unpoisoned(&self.slab).drain_to_history(self.clock.now());
+                let mut st = lock_unpoisoned(&self.state);
+                st.node_wide = false;
+                dropped_scopes.extend(st.scopes.drain().map(|(_, sc)| sc));
+                self.has_inbound.store(false, Ordering::SeqCst);
+                if dropped_permit.is_none() {
+                    dropped_permit = st.port_permit.take();
+                }
+                break;
+            };
+
+            let mut reg_inner = lock_unpoisoned(&reg.inner);
+            let mut st = lock_unpoisoned(&self.state);
+            let still_owned = st
+                .owner
+                .upgrade()
+                .is_some_and(|cur| Arc::ptr_eq(&cur, &reg));
+            if !still_owned {
+                drop(st);
+                drop(reg_inner);
+                continue;
+            }
+            let now = self.clock.now();
+            let history = lock_unpoisoned(&self.slab).drain_to_history(now);
+            if reg_inner
+                .ports
+                .get(&self.link_id)
+                .is_some_and(|existing| Arc::ptr_eq(existing, &self))
+            {
+                reg_inner.ports.remove(&self.link_id);
+                reg_inner.retired_slabs.insert(self.link_id, history, now);
+            }
+            st.owner = Weak::new();
+            st.node_wide = false;
+            dropped_scopes.extend(st.scopes.drain().map(|(_, sc)| sc));
+            self.has_inbound.store(false, Ordering::SeqCst);
+            if dropped_permit.is_none() {
+                dropped_permit = st.port_permit.take();
+            }
+            break;
         }
 
-        // Clear all circuit mailboxes so active sessions/transits immediately observe closure.
-        {
-            let mut slab = lock_unpoisoned(&self.slab);
-            *slab = SlabTable::new();
-        }
-
-        self.closed_tx.send(Some(close_reason));
-        let _ = lock_unpoisoned(&self.port_permit).take();
+        drop(dropped_permit);
+        drop(dropped_scopes);
+        let final_reason = self.terminal_err();
+        self.closed_tx.send(Some(final_reason));
     }
 
-    /// Atomically removes this port from its owner registry iff still idle (`!has_inbound && outbound_refs == 0`).
+    /// Atomically removes this port from its owner registry iff still idle
+    /// (`!has_inbound_ownership && outbound_refs == 0`), preserving CID generation history.
     fn try_retire_if_idle(self: &Arc<Self>) -> bool {
-        let Some(reg) = self.owner_registry() else {
-            return !self.has_inbound.load(Ordering::Acquire)
-                && self.outbound_refs.load(Ordering::Acquire) == 0;
+        let mut dropped_permit: Option<PortPermit> = None;
+        let retired = loop {
+            let owner_opt = {
+                let st = lock_unpoisoned(&self.state);
+                if st.closing {
+                    break true;
+                }
+                if st.has_inbound_ownership() || self.outbound_refs.load(Ordering::SeqCst) > 0 {
+                    break false;
+                }
+                st.owner.upgrade()
+            };
+
+            let Some(reg) = owner_opt else {
+                let mut st = lock_unpoisoned(&self.state);
+                if st.closing {
+                    break true;
+                }
+                if st.has_inbound_ownership() || self.outbound_refs.load(Ordering::SeqCst) > 0 {
+                    break false;
+                }
+                st.closing = true;
+                if st.close_reason.is_none() {
+                    st.close_reason = Some(CoreError::Closed);
+                }
+                dropped_permit = st.port_permit.take();
+                break true;
+            };
+
+            let mut reg_inner = lock_unpoisoned(&reg.inner);
+            let mut st = lock_unpoisoned(&self.state);
+            if st.closing {
+                break true;
+            }
+            let still_owned = st
+                .owner
+                .upgrade()
+                .is_some_and(|cur| Arc::ptr_eq(&cur, &reg));
+            if !still_owned {
+                drop(st);
+                drop(reg_inner);
+                continue;
+            }
+            if st.has_inbound_ownership() || self.outbound_refs.load(Ordering::SeqCst) > 0 {
+                break false;
+            }
+            let now = self.clock.now();
+            let history = lock_unpoisoned(&self.slab).drain_to_history(now);
+            if reg_inner
+                .ports
+                .get(&self.link_id)
+                .is_some_and(|existing| Arc::ptr_eq(existing, self))
+            {
+                reg_inner.ports.remove(&self.link_id);
+                reg_inner.retired_slabs.insert(self.link_id, history, now);
+            }
+            st.closing = true;
+            if st.close_reason.is_none() {
+                st.close_reason = Some(CoreError::Closed);
+            }
+            st.owner = Weak::new();
+            dropped_permit = st.port_permit.take();
+            break true;
         };
-        let mut map = lock_unpoisoned(&reg.ports);
-        if self.has_inbound.load(Ordering::Acquire) || self.outbound_refs.load(Ordering::Acquire) > 0
-        {
-            return false;
-        }
-        if map
-            .get(&self.link_id)
-            .is_some_and(|existing| Arc::ptr_eq(existing, self))
-        {
-            map.remove(&self.link_id);
-        }
-        true
+        drop(dropped_permit);
+        retired
     }
 
     fn dispatch_inbound_packet(self: &Arc<Self>, pkt: PacketBuf) {
@@ -350,7 +515,8 @@ impl DatagramPort {
             // O(1) SlabTable lookup & non-blocking 32-slot mailbox enqueue (Spec §6.2).
             let send_res = {
                 let slab = lock_unpoisoned(&self.slab);
-                slab.get(cid).map(|entry| (entry.tx.clone(), entry.metrics.clone()))
+                slab.get(cid)
+                    .map(|entry| (entry.tx.clone(), entry.metrics.clone()))
             };
             if let Some((tx, metrics)) = send_res {
                 if let Err(async_channel::TrySendError::Full(_)) = tx.try_send(pkt) {
@@ -361,6 +527,11 @@ impl DatagramPort {
                     }
                 }
             }
+            return;
+        }
+
+        // Ignore inbound setups on outbound-only / detached ports.
+        if !self.has_inbound.load(Ordering::Acquire) {
             return;
         }
 
@@ -430,11 +601,7 @@ impl DatagramPort {
         }
     }
 
-    fn handle_setup_fwd(
-        self: &Arc<Self>,
-        wire: &[u8],
-        receipt: Option<FragmentReceipt>,
-    ) {
+    fn handle_setup_fwd(self: &Arc<Self>, wire: &[u8], receipt: Option<FragmentReceipt>) {
         // Zero-allocation pre-validation on `&[u8]` before allocating `Vec<u8>` or spawning!
         let Ok(hdr) = ForwardHeader::parse(wire) else {
             return;
@@ -464,8 +631,11 @@ impl DatagramPort {
         let attempt = self.admission.begin_attempt();
 
         let (setup_handler, node_pending_gate) = {
-            let r = read_unpoisoned(&self.routing);
-            (Arc::clone(&r.setup_handler), r.node_pending.clone())
+            let st = lock_unpoisoned(&self.state);
+            if st.closing {
+                return;
+            }
+            (Arc::clone(&st.setup_handler), st.node_pending.clone())
         };
 
         let node_pending_permit = match node_pending_gate {
@@ -489,20 +659,6 @@ impl DatagramPort {
             pending_permit,
             node_pending_permit,
         );
-    }
-}
-
-async fn wait_stop(rx: &mut WatchReceiver<bool>) {
-    loop {
-        if rx.borrow_cloned() {
-            return;
-        }
-        if !rx.changed().await {
-            if rx.borrow_cloned() {
-                return;
-            }
-            core::future::pending::<()>().await;
-        }
     }
 }
 
@@ -534,16 +690,46 @@ impl Binding {
         self.port.mtu_watch()
     }
 
+    /// Receives the next packet routed to this binding's CID, propagating the port's real
+    /// terminal carrier error if the underlying link failed (DG-16).
     pub async fn recv(&self) -> Result<PacketBuf, CoreError> {
-        self.rx.recv().await.map_err(|_| CoreError::Closed)
+        self.rx
+            .recv()
+            .await
+            .map_err(|_| self.port.terminal_err())
     }
 
     pub fn send_now(&self, packet: PacketBuf) -> Result<(), CoreError> {
         self.port.link.try_send(packet)
     }
 
-    pub async fn send_wait(&self, packet: PacketBuf) -> Result<(), CoreError> {
-        self.port.link.send(packet).await
+    /// Waits for link send readiness and retries transient [`CoreError::WouldBlock`] until
+    /// accepted, a fatal error occurs, or `deadline` expires (DG-09).
+    pub async fn send_reliable_until(
+        &self,
+        packet: PacketBuf,
+        clock: &dyn Clock,
+        deadline: MonotonicTime,
+    ) -> Result<(), CoreError> {
+        with_deadline(clock, deadline, async {
+            let mut consecutive_would_block = 0u32;
+            loop {
+                self.port.link.send_ready().await?;
+                match self.port.link.try_send(packet.clone()) {
+                    Ok(()) => return Ok(()),
+                    Err(CoreError::WouldBlock) => {
+                        consecutive_would_block = consecutive_would_block.saturating_add(1);
+                        if consecutive_would_block < 4 {
+                            yield_once().await;
+                        } else {
+                            clock.sleep(Duration::from_millis(10)).await;
+                        }
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        })
+        .await
     }
 
     pub async fn send_best_effort(&self, packet: PacketBuf) {
@@ -558,6 +744,20 @@ impl Drop for Binding {
     }
 }
 
+async fn yield_once() {
+    let mut yielded = false;
+    poll_fn(|cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await;
+}
+
 // ---------------------------------------------------------------------------
 // hold_for_cookie_retry (Spec §6.2 Datagram Step 4)
 // ---------------------------------------------------------------------------
@@ -569,7 +769,9 @@ pub(crate) fn hold_for_cookie_retry(
     clock: Arc<dyn Clock>,
     spawner: &dyn TaskSpawner,
 ) {
-    let hold = port.acquire_outbound_hold();
+    let Ok(hold) = port.try_acquire_outbound_hold() else {
+        return;
+    };
     spawner.spawn(Box::pin(async move {
         clock.sleep(SETUP_TIMEOUT).await;
         drop(hold);
@@ -591,15 +793,21 @@ pub(crate) struct SetupReplies<'a> {
 }
 
 impl<'a> SetupReplies<'a> {
-    pub fn send(
+    /// Transmits a datagram setup flight:
+    /// - Single-packet unfragmented `SETUP_FWD`: waits for link readiness and retries `WouldBlock`
+    ///   within `deadline` (DG-09).
+    /// - Fragmented `SETUP_FRAG` burst: transmits all fragments ignoring per-fragment `WouldBlock`
+    ///   and schedules `[150, 300, 600]` ms retries (Spec §5.6).
+    pub async fn send(
         binding: &'a Binding,
         wire: &[u8],
         clock: &'a dyn Clock,
+        deadline: MonotonicTime,
     ) -> Result<Self, CoreError> {
         let prepared = FragmentBurst::prepare(wire, binding.mtu(), binding.cid())?;
         match prepared {
             PreparedFlight::Single(pkt) => {
-                send_ignoring_would_block(binding, pkt)?;
+                binding.send_reliable_until(pkt, clock, deadline).await?;
                 Ok(Self {
                     binding,
                     clock,
@@ -700,12 +908,143 @@ fn send_ignoring_would_block(binding: &Binding, pkt: PacketBuf) -> Result<(), Co
 }
 
 // ---------------------------------------------------------------------------
+// Bounded Per-LinkId Retired Slab Generation Cache (DG-07, Spec §6.5)
+// ---------------------------------------------------------------------------
+
+struct RetiredSlabCache {
+    entries: HashMap<LinkId, SlabHistory>,
+    order: VecDeque<(LinkId, MonotonicTime)>,
+    max_entries: usize,
+}
+
+impl RetiredSlabCache {
+    fn new(max_ports: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            max_entries: max_ports.saturating_mul(4).clamp(64, 16_384),
+        }
+    }
+
+    fn prune(&mut self, now: MonotonicTime) {
+        while let Some((_, ts)) = self.order.front() {
+            let expired = self
+                .entries
+                .get(&self.order[0].0)
+                .is_none_or(|h| h.retired_at() != *ts || h.is_expired(now));
+            if expired {
+                if let Some((id, retired_at)) = self.order.pop_front() {
+                    if self
+                        .entries
+                        .get(&id)
+                        .is_some_and(|h| h.retired_at() == retired_at && h.is_expired(now))
+                    {
+                        self.entries.remove(&id);
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn insert(&mut self, link_id: LinkId, history: SlabHistory, now: MonotonicTime) {
+        if history.is_empty() {
+            return;
+        }
+        self.prune(now);
+        let ts = history.retired_at();
+        self.entries.insert(link_id, history);
+        self.order.push_back((link_id, ts));
+
+        while self.entries.len() > self.max_entries
+            || self.order.len() > self.max_entries.saturating_mul(2)
+        {
+            let Some((old_id, old_ts)) = self.order.pop_front() else {
+                break;
+            };
+            if self
+                .entries
+                .get(&old_id)
+                .is_some_and(|h| h.retired_at() == old_ts)
+            {
+                self.entries.remove(&old_id);
+            }
+        }
+    }
+
+    fn take(&mut self, link_id: LinkId, now: MonotonicTime) -> Option<SlabHistory> {
+        self.prune(now);
+        self.entries
+            .remove(&link_id)
+            .filter(|h| !h.is_expired(now))
+    }
+
+    fn drain_into(
+        &mut self,
+        dst: &mut Self,
+        active_in_dst: &HashMap<LinkId, Arc<DatagramPort>>,
+        now: MonotonicTime,
+    ) {
+        self.prune(now);
+        dst.prune(now);
+        self.order.clear();
+        for (link_id, hist) in self.entries.drain() {
+            if !hist.is_expired(now)
+                && !active_in_dst.contains_key(&link_id)
+                && !dst.entries.contains_key(&link_id)
+            {
+                dst.insert(link_id, hist, now);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PortRegistry & PortSlot (Deduplication & Atomic Node Adoption, Spec §8.2)
 // ---------------------------------------------------------------------------
 
+struct RegistryInner {
+    ports: HashMap<LinkId, Arc<DatagramPort>>,
+    retired_slabs: RetiredSlabCache,
+    adopted_by: Option<Weak<PortRegistry>>,
+    ingress_closed: bool,
+}
+
+impl RegistryInner {
+    /// Prunes any `closing` ports still sitting in `self.ports`, preserving their `SlabHistory`
+    /// and returning any `PortPermit`s so the caller can drop them immediately.
+    fn prune_closing_ports(
+        &mut self,
+        now: MonotonicTime,
+        dropped_permits: &mut Vec<PortPermit>,
+        dropped_scopes: &mut Vec<Arc<ScopeCore>>,
+    ) {
+        let closing_ids: Vec<LinkId> = self
+            .ports
+            .iter()
+            .filter_map(|(&id, port)| lock_unpoisoned(&port.state).closing.then_some(id))
+            .collect();
+        for id in closing_ids {
+            if let Some(port) = self.ports.remove(&id) {
+                let mut st = lock_unpoisoned(&port.state);
+                let hist = lock_unpoisoned(&port.slab).drain_to_history(now);
+                self.retired_slabs.insert(id, hist, now);
+                st.owner = Weak::new();
+                st.node_wide = false;
+                dropped_scopes.extend(st.scopes.drain().map(|(_, sc)| sc));
+                port.has_inbound.store(false, Ordering::SeqCst);
+                if let Some(p) = st.port_permit.take() {
+                    dropped_permits.push(p);
+                }
+            }
+        }
+    }
+}
+
 /// Registry deduplicating active [`DatagramPort`]s by [`LinkId`] (Lock Level 2).
 pub(crate) struct PortRegistry {
-    ports: Mutex<HashMap<LinkId, Arc<DatagramPort>>>,
+    inner: Mutex<RegistryInner>,
     port_sem: Arc<CloseableSemaphore>,
     metric_owner: PortMetricOwner,
     clock: Arc<dyn Clock>,
@@ -726,9 +1065,15 @@ impl PortRegistry {
         setup_handler: Arc<dyn DatagramSetupHandler>,
         node_pending: Option<Arc<NodePendingGate>>,
     ) -> Arc<Self> {
+        let cap = max_ports.max(1);
         Arc::new(Self {
-            ports: Mutex::new(HashMap::new()),
-            port_sem: CloseableSemaphore::new(max_ports.max(1)),
+            inner: Mutex::new(RegistryInner {
+                ports: HashMap::new(),
+                retired_slabs: RetiredSlabCache::new(cap),
+                adopted_by: None,
+                ingress_closed: false,
+            }),
+            port_sem: CloseableSemaphore::new(cap),
             metric_owner,
             clock,
             spawner,
@@ -738,216 +1083,538 @@ impl PortRegistry {
         })
     }
 
-    /// Attaches an inbound `DatagramLink` (deduplicating by `LinkId` into one `DatagramPort`/`SlabTable`).
+    /// Attaches an inbound `DatagramLink` (deduplicating by `LinkId` into one `DatagramPort`/`SlabTable`),
+    /// spawning any new pump task strictly AFTER releasing all locks.
     pub fn attach_inbound(
         self: &Arc<Self>,
         link: Arc<dyn DatagramLink>,
         scope: Option<Arc<ScopeCore>>,
         node_wide: bool,
     ) -> Result<DatagramIngress, CoreError> {
-        let link_id = link.link_id();
-        let mut map = lock_unpoisoned(&self.ports);
-
-        if let Some(existing) = map.get(&link_id) {
-            existing.has_inbound.store(true, Ordering::Release);
-            {
-                let mut routing = write_unpoisoned(&existing.routing);
-                if node_wide {
-                    routing.node_wide = true;
-                }
-                if let Some(sc) = scope {
-                    routing.scopes.insert(sc.keypair.scope_kid(), sc);
-                }
-            }
-            return Ok(existing.ingress());
+        let (ingress, to_spawn) = self.attach_inbound_prepared(link, scope, node_wide)?;
+        if let Some((spawner, port)) = to_spawn {
+            spawner.spawn(Box::pin(port.run_pump()));
         }
-
-        let permit = PortPermit::acquire(&self.port_sem, &self.metric_owner)?;
-        let mut scopes = HashMap::new();
-        if let Some(sc) = scope {
-            scopes.insert(sc.keypair.scope_kid(), sc);
-        }
-
-        let (closed_tx, _) = Watch::new(None::<CoreError>);
-        let (stop_tx, _) = Watch::new(false);
-        let port = Arc::new(DatagramPort {
-            link,
-            link_id,
-            clock: Arc::clone(&self.clock),
-            slab: Mutex::new(SlabTable::new()),
-            reassembler: Arc::new(Mutex::new(FragmentReassembler::new())),
-            admission: Arc::new(AdmissionTracker::new()),
-            closed_tx,
-            has_inbound: AtomicBool::new(true),
-            outbound_refs: AtomicUsize::new(0),
-            stop_tx,
-            routing: RwLock::new(PortRouting {
-                node_wide,
-                scopes,
-                resolver: Arc::clone(&self.resolver),
-                setup_handler: Arc::clone(&self.setup_handler),
-                owner: Arc::downgrade(self),
-                node_pending: self.node_pending.clone(),
-            }),
-            port_permit: Mutex::new(Some(permit)),
-        });
-        let ingress = port.ingress();
-        map.insert(link_id, Arc::clone(&port));
-        drop(map);
-
-        self.spawner.spawn(Box::pin(port.run_pump()));
         Ok(ingress)
     }
 
-    /// Attaches an outbound `DatagramLink` (sharing an existing `DatagramPort` if `LinkId` matches).
+    fn attach_inbound_prepared(
+        self: &Arc<Self>,
+        link: Arc<dyn DatagramLink>,
+        scope: Option<Arc<ScopeCore>>,
+        node_wide: bool,
+    ) -> Result<(DatagramIngress, Option<SpawnPump>), CoreError> {
+        let link_id = link.link_id();
+        let redirect = {
+            let mut reg = lock_unpoisoned(&self.inner);
+            if let Some(target) = reg.adopted_by.as_ref().and_then(Weak::upgrade) {
+                Some(target)
+            } else {
+                if reg.ingress_closed {
+                    return Err(CoreError::Closed);
+                }
+
+                let now = self.clock.now();
+                if let Some(existing) = reg.ports.get(&link_id).cloned() {
+                    let mut st = lock_unpoisoned(&existing.state);
+                    if st.closing {
+                        let hist = lock_unpoisoned(&existing.slab).drain_to_history(now);
+                        reg.ports.remove(&link_id);
+                        reg.retired_slabs.insert(link_id, hist, now);
+                        st.owner = Weak::new();
+                        let stale_permit = st.port_permit.take();
+                        drop(st);
+                        drop(stale_permit);
+                    } else {
+                        if node_wide {
+                            st.node_wide = true;
+                        }
+                        if let Some(sc) = scope {
+                            st.scopes.insert(sc.keypair.scope_kid(), sc);
+                        }
+                        existing
+                            .has_inbound
+                            .store(st.has_inbound_ownership(), Ordering::SeqCst);
+                        return Ok((existing.ingress(), None));
+                    }
+                }
+
+                let permit = PortPermit::acquire(&self.port_sem, &self.metric_owner)?;
+                let mut scopes = HashMap::new();
+                if let Some(sc) = scope {
+                    scopes.insert(sc.keypair.scope_kid(), sc);
+                }
+                let has_inbound_now = node_wide || !scopes.is_empty();
+                let slab = match reg.retired_slabs.take(link_id, now) {
+                    Some(hist) => SlabTable::from_history(hist),
+                    None => SlabTable::new(),
+                };
+
+                let (closed_tx, _) = Watch::new(None::<CoreError>);
+                let (stop_tx, _) = Watch::new(0u64);
+                let port = Arc::new(DatagramPort {
+                    link,
+                    link_id,
+                    clock: Arc::clone(&self.clock),
+                    slab: Mutex::new(slab),
+                    reassembler: Arc::new(Mutex::new(FragmentReassembler::new())),
+                    admission: Arc::new(AdmissionTracker::new()),
+                    closed_tx,
+                    has_inbound: AtomicBool::new(has_inbound_now),
+                    outbound_refs: AtomicUsize::new(0),
+                    stop_tx,
+                    state: Mutex::new(PortState {
+                        node_wide,
+                        scopes,
+                        resolver: Arc::clone(&self.resolver),
+                        setup_handler: Arc::clone(&self.setup_handler),
+                        owner: Arc::downgrade(self),
+                        node_pending: self.node_pending.clone(),
+                        closing: false,
+                        close_reason: None,
+                        port_permit: Some(permit),
+                    }),
+                });
+                let ingress = port.ingress();
+                reg.ports.insert(link_id, Arc::clone(&port));
+                return Ok((ingress, Some((Arc::clone(&self.spawner), port))));
+            }
+        };
+
+        match redirect {
+            Some(target) => target.attach_inbound_prepared(link, scope, node_wide),
+            None => Err(CoreError::Closed),
+        }
+    }
+
+    /// Attaches an outbound `DatagramLink` (sharing an existing `DatagramPort` if `LinkId` matches),
+    /// spawning any new pump task strictly AFTER releasing all locks.
     pub fn attach_outbound(
         self: &Arc<Self>,
         link: Arc<dyn DatagramLink>,
     ) -> Result<(Arc<DatagramPort>, OutboundPortHold), CoreError> {
-        let link_id = link.link_id();
-        let mut map = lock_unpoisoned(&self.ports);
-
-        if let Some(existing) = map.get(&link_id) {
-            let hold = existing.acquire_outbound_hold();
-            return Ok((Arc::clone(existing), hold));
+        let (res, to_spawn) = self.attach_outbound_prepared(link)?;
+        if let Some((spawner, port)) = to_spawn {
+            spawner.spawn(Box::pin(port.run_pump()));
         }
-
-        let permit = PortPermit::acquire(&self.port_sem, &self.metric_owner)?;
-        let (closed_tx, _) = Watch::new(None::<CoreError>);
-        let (stop_tx, _) = Watch::new(false);
-        let port = Arc::new(DatagramPort {
-            link,
-            link_id,
-            clock: Arc::clone(&self.clock),
-            slab: Mutex::new(SlabTable::new()),
-            reassembler: Arc::new(Mutex::new(FragmentReassembler::new())),
-            admission: Arc::new(AdmissionTracker::new()),
-            closed_tx,
-            has_inbound: AtomicBool::new(false),
-            outbound_refs: AtomicUsize::new(0),
-            stop_tx,
-            routing: RwLock::new(PortRouting {
-                node_wide: false,
-                scopes: HashMap::new(),
-                resolver: Arc::clone(&self.resolver),
-                setup_handler: Arc::clone(&self.setup_handler),
-                owner: Arc::downgrade(self),
-                node_pending: self.node_pending.clone(),
-            }),
-            port_permit: Mutex::new(Some(permit)),
-        });
-        let hold = port.acquire_outbound_hold();
-        map.insert(link_id, Arc::clone(&port));
-        drop(map);
-
-        self.spawner.spawn(Box::pin(Arc::clone(&port).run_pump()));
-        Ok((port, hold))
+        Ok(res)
     }
 
-    fn remove_if_same(&self, link_id: LinkId, target: &Arc<DatagramPort>) {
-        let mut map = lock_unpoisoned(&self.ports);
-        if map
-            .get(&link_id)
-            .is_some_and(|existing| Arc::ptr_eq(existing, target))
-        {
-            map.remove(&link_id);
+    fn attach_outbound_prepared(
+        self: &Arc<Self>,
+        link: Arc<dyn DatagramLink>,
+    ) -> Result<(OutboundAttachment, Option<SpawnPump>), CoreError> {
+        let link_id = link.link_id();
+        let redirect = {
+            let mut reg = lock_unpoisoned(&self.inner);
+            if let Some(target) = reg.adopted_by.as_ref().and_then(Weak::upgrade) {
+                Some(target)
+            } else {
+                if reg.ingress_closed {
+                    return Err(CoreError::Closed);
+                }
+
+                let now = self.clock.now();
+                if let Some(existing) = reg.ports.get(&link_id).cloned() {
+                    let mut st = lock_unpoisoned(&existing.state);
+                    if st.closing {
+                        let hist = lock_unpoisoned(&existing.slab).drain_to_history(now);
+                        reg.ports.remove(&link_id);
+                        reg.retired_slabs.insert(link_id, hist, now);
+                        st.owner = Weak::new();
+                        let stale_permit = st.port_permit.take();
+                        drop(st);
+                        drop(stale_permit);
+                    } else {
+                        existing.outbound_refs.fetch_add(1, Ordering::SeqCst);
+                        let hold = OutboundPortHold {
+                            port: Arc::clone(&existing),
+                        };
+                        drop(st);
+                        return Ok(((existing, hold), None));
+                    }
+                }
+
+                let permit = PortPermit::acquire(&self.port_sem, &self.metric_owner)?;
+                let slab = match reg.retired_slabs.take(link_id, now) {
+                    Some(hist) => SlabTable::from_history(hist),
+                    None => SlabTable::new(),
+                };
+                let (closed_tx, _) = Watch::new(None::<CoreError>);
+                let (stop_tx, _) = Watch::new(0u64);
+                let port = Arc::new(DatagramPort {
+                    link,
+                    link_id,
+                    clock: Arc::clone(&self.clock),
+                    slab: Mutex::new(slab),
+                    reassembler: Arc::new(Mutex::new(FragmentReassembler::new())),
+                    admission: Arc::new(AdmissionTracker::new()),
+                    closed_tx,
+                    has_inbound: AtomicBool::new(false),
+                    outbound_refs: AtomicUsize::new(1),
+                    stop_tx,
+                    state: Mutex::new(PortState {
+                        node_wide: false,
+                        scopes: HashMap::new(),
+                        resolver: Arc::clone(&self.resolver),
+                        setup_handler: Arc::clone(&self.setup_handler),
+                        owner: Arc::downgrade(self),
+                        node_pending: self.node_pending.clone(),
+                        closing: false,
+                        close_reason: None,
+                        port_permit: Some(permit),
+                    }),
+                });
+                let hold = OutboundPortHold {
+                    port: Arc::clone(&port),
+                };
+                reg.ports.insert(link_id, Arc::clone(&port));
+                return Ok(((Arc::clone(&port), hold), Some((Arc::clone(&self.spawner), port))));
+            }
+        };
+
+        match redirect {
+            Some(target) => target.attach_outbound_prepared(link),
+            None => Err(CoreError::Closed),
         }
+    }
+
+    /// Acquires an existing LIVE [`DatagramPort`] by `link_id` without invoking `handler.open()`.
+    ///
+    /// Used by Datagram Transit cookie-retry link reuse (DG-10) so carriers that mint a fresh
+    /// `source_tag` per `open()` call still reuse the exact challenged link held by
+    /// [`hold_for_cookie_retry`].
+    pub fn acquire_live_outbound(
+        self: &Arc<Self>,
+        link_id: LinkId,
+    ) -> Option<(Arc<DatagramPort>, OutboundPortHold)> {
+        let redirect = {
+            let reg = lock_unpoisoned(&self.inner);
+            if let Some(target) = reg.adopted_by.as_ref().and_then(Weak::upgrade) {
+                Some(target)
+            } else if reg.ingress_closed {
+                return None;
+            } else if let Some(existing) = reg.ports.get(&link_id) {
+                let st = lock_unpoisoned(&existing.state);
+                if st.closing {
+                    return None;
+                }
+                existing.outbound_refs.fetch_add(1, Ordering::SeqCst);
+                return Some((
+                    Arc::clone(existing),
+                    OutboundPortHold {
+                        port: Arc::clone(existing),
+                    },
+                ));
+            } else {
+                return None;
+            }
+        };
+        redirect.and_then(|target| target.acquire_live_outbound(link_id))
     }
 
     /// Atomically adopts all live ports from a standalone scope's `PortRegistry` into `self`
-    /// (`Node`'s `PortRegistry`, Spec §8.2 Rule 4).
+    /// (`Node`'s `PortRegistry`, Spec §8.2 Rule 4, DG-04, DG-07).
     ///
-    /// Validates BOTH non-conflicting `LinkId`s (`AlreadyPublished`) and `max_datagram_ports`
-    /// capacity (`Busy`) BEFORE mutating either registry, ensuring zero partial mutation on error.
+    /// Prunes closing ports, validates non-conflicting `LinkId`s (`AlreadyPublished`) and
+    /// `max_datagram_ports` capacity (`Busy`) BEFORE mutating either registry, ensuring zero
+    /// partial mutation on error.
     pub fn adopt_from(self: &Arc<Self>, source: &PortRegistry) -> Result<(), CoreError> {
-        // Lock order: Node's `self.ports` FIRST, then standalone `source.ports` SECOND.
-        let mut dst = lock_unpoisoned(&self.ports);
-        let mut src = lock_unpoisoned(&source.ports);
+        let now = self.clock.now();
+        let mut dropped_permits: Vec<PortPermit> = Vec::new();
+        let mut dropped_scopes: Vec<Arc<ScopeCore>> = Vec::new();
 
-        if src.is_empty() {
-            return Ok(());
-        }
+        let res = {
+            // Lock order: Node's `self.inner` (2a) FIRST, standalone `source.inner` (2b) SECOND.
+            let mut dst = lock_unpoisoned(&self.inner);
+            let mut src = lock_unpoisoned(&source.inner);
 
-        // Step 1: Check for conflicting LinkIds (Spec §8.2 Rule 4 -> AlreadyPublished).
-        for link_id in src.keys() {
-            if dst.contains_key(link_id) {
-                return Err(CoreError::AlreadyPublished);
+            if dst.ingress_closed {
+                return Err(CoreError::Closed);
             }
-        }
 
-        // Step 2: Atomically acquire all required node port permits BEFORE moving any port.
-        let mut new_permits = Vec::with_capacity(src.len());
-        for _ in 0..src.len() {
-            match PortPermit::acquire(&self.port_sem, &self.metric_owner) {
-                Ok(p) => new_permits.push(p),
-                Err(err) => {
-                    // Roll back all acquired permits automatically on drop; ZERO mutation!
-                    drop(new_permits);
-                    return Err(err);
+            // Prune any closing ports from both registries before conflict/capacity checks (DG-04).
+            dst.prune_closing_ports(now, &mut dropped_permits, &mut dropped_scopes);
+            src.prune_closing_ports(now, &mut dropped_permits, &mut dropped_scopes);
+            // Release pruned permits immediately so semaphore capacity is up to date!
+            dropped_permits.clear();
+
+            // Step 1: Check for conflicting live LinkIds (Spec §8.2 Rule 4 -> AlreadyPublished).
+            for link_id in src.ports.keys() {
+                if dst.ports.contains_key(link_id) {
+                    return Err(CoreError::AlreadyPublished);
+                }
+            }
+
+            // Step 2: Atomically acquire all required node port permits BEFORE moving any port.
+            let mut new_permits = Vec::with_capacity(src.ports.len());
+            for _ in 0..src.ports.len() {
+                match PortPermit::acquire(&self.port_sem, &self.metric_owner) {
+                    Ok(p) => new_permits.push(p),
+                    Err(err) => {
+                        drop(new_permits);
+                        return Err(err);
+                    }
+                }
+            }
+
+            // Step 3: Commit adoption (rejecting any port whose pump entered closing concurrently).
+            for ((link_id, port), new_permit) in src.ports.drain().zip(new_permits) {
+                let mut st = lock_unpoisoned(&port.state);
+                if st.closing {
+                    let hist = lock_unpoisoned(&port.slab).drain_to_history(now);
+                    dst.retired_slabs.insert(link_id, hist, now);
+                    st.owner = Weak::new();
+                    st.node_wide = false;
+                    dropped_scopes.extend(st.scopes.drain().map(|(_, sc)| sc));
+                    port.has_inbound.store(false, Ordering::SeqCst);
+                    if let Some(old) = st.port_permit.take() {
+                        dropped_permits.push(old);
+                    }
+                    dropped_permits.push(new_permit);
+                    continue;
+                }
+                // Adopted ports keep `node_wide = false` and their explicit scope list!
+                st.node_wide = false;
+                st.resolver = Arc::clone(&self.resolver);
+                st.setup_handler = Arc::clone(&self.setup_handler);
+                st.owner = Arc::downgrade(self);
+                st.node_pending = self.node_pending.clone();
+                if let Some(old_permit) = st.port_permit.replace(new_permit) {
+                    dropped_permits.push(old_permit);
+                }
+                drop(st);
+                dst.ports.insert(link_id, port);
+            }
+
+            // Preserve any recent retired-CID histories across scope adoption (DG-07).
+            let dst_inner = &mut *dst;
+            src.retired_slabs
+                .drain_into(&mut dst_inner.retired_slabs, &dst_inner.ports, now);
+            src.adopted_by = Some(Arc::downgrade(self));
+            Ok(())
+        };
+
+        drop(dropped_permits);
+        drop(dropped_scopes);
+        res
+    }
+
+    /// Clears the standalone registry's adoption redirect (called on unmount / `Node` drop).
+    pub fn clear_adopted_by(&self) {
+        lock_unpoisoned(&self.inner).adopted_by = None;
+    }
+
+    /// Removes `kid` from every port's explicit scope list (called by `Node::remove_scope`,
+    /// Spec §8.2) and immediately retires any port that no longer has inbound ownership or
+    /// active outbound holds so port capacity is never stranded (DG-06).
+    pub fn detach_scope(&self, kid: ScopeKid) {
+        let now = self.clock.now();
+        let mut dropped_permits: Vec<PortPermit> = Vec::new();
+        let mut dropped_scopes: Vec<Arc<ScopeCore>> = Vec::new();
+        let mut to_wake: Vec<Arc<DatagramPort>> = Vec::new();
+
+        {
+            let mut reg = lock_unpoisoned(&self.inner);
+            let mut to_remove: Vec<LinkId> = Vec::new();
+
+            for (&link_id, port) in &reg.ports {
+                let mut st = lock_unpoisoned(&port.state);
+                if let Some(removed) = st.scopes.remove(&kid) {
+                    dropped_scopes.push(removed);
+                }
+                let has_inbound_now = st.has_inbound_ownership();
+                port.has_inbound.store(has_inbound_now, Ordering::SeqCst);
+
+                if st.closing {
+                    to_remove.push(link_id);
+                    st.owner = Weak::new();
+                    if let Some(p) = st.port_permit.take() {
+                        dropped_permits.push(p);
+                    }
+                    continue;
+                }
+
+                if !has_inbound_now && port.outbound_refs.load(Ordering::SeqCst) == 0 {
+                    st.closing = true;
+                    if st.close_reason.is_none() {
+                        st.close_reason = Some(CoreError::Closed);
+                    }
+                    st.owner = Weak::new();
+                    if let Some(p) = st.port_permit.take() {
+                        dropped_permits.push(p);
+                    }
+                    to_remove.push(link_id);
+                    to_wake.push(Arc::clone(port));
+                }
+            }
+
+            for link_id in to_remove {
+                if let Some(port) = reg.ports.remove(&link_id) {
+                    let hist = lock_unpoisoned(&port.slab).drain_to_history(now);
+                    reg.retired_slabs.insert(link_id, hist, now);
                 }
             }
         }
 
-        // Step 3: Commit adoption (cannot fail!).
-        for ((link_id, port), new_permit) in src.drain().zip(new_permits) {
-            {
-                let mut routing = write_unpoisoned(&port.routing);
-                // Adopted ports keep `node_wide = false` and their explicit scope list!
-                routing.node_wide = false;
-                routing.resolver = Arc::clone(&self.resolver);
-                routing.setup_handler = Arc::clone(&self.setup_handler);
-                routing.owner = Arc::downgrade(self);
-                routing.node_pending = self.node_pending.clone();
-            }
-            {
-                // Replace scope PortPermit with node PortPermit (transfers active_datagram_ports count!).
-                let mut slot = lock_unpoisoned(&port.port_permit);
-                *slot = Some(new_permit);
-            }
-            dst.insert(link_id, port);
+        drop(dropped_permits);
+        drop(dropped_scopes);
+        for port in to_wake {
+            port.wake_pump();
         }
-
-        Ok(())
     }
 
-    /// Removes `kid` from every port's explicit scope list (called by `Node::remove_scope`, Spec §8.2).
-    pub fn detach_scope(&self, kid: ScopeKid) {
-        let map = lock_unpoisoned(&self.ports);
-        for port in map.values() {
-            let mut routing = write_unpoisoned(&port.routing);
-            routing.scopes.remove(&kid);
+    /// Disables all inbound ownership on every port in this registry and wakes/retires idle pumps.
+    ///
+    /// Called on final `Drop` of a standalone `ScopeInstance` or `Node` so background receive
+    /// pumps never leak indefinitely in `link.recv()` (DG-05).
+    pub fn shutdown_ingress(&self) {
+        let now = self.clock.now();
+        let mut dropped_permits: Vec<PortPermit> = Vec::new();
+        let mut dropped_scopes: Vec<Arc<ScopeCore>> = Vec::new();
+        let mut to_wake: Vec<Arc<DatagramPort>> = Vec::new();
+
+        {
+            let mut reg = lock_unpoisoned(&self.inner);
+            reg.ingress_closed = true;
+            reg.adopted_by = None;
+
+            let mut to_remove: Vec<LinkId> = Vec::new();
+            for (&link_id, port) in &reg.ports {
+                let mut st = lock_unpoisoned(&port.state);
+                st.node_wide = false;
+                dropped_scopes.extend(st.scopes.drain().map(|(_, sc)| sc));
+                port.has_inbound.store(false, Ordering::SeqCst);
+
+                if st.closing || port.outbound_refs.load(Ordering::SeqCst) == 0 {
+                    st.closing = true;
+                    if st.close_reason.is_none() {
+                        st.close_reason = Some(CoreError::Closed);
+                    }
+                    st.owner = Weak::new();
+                    if let Some(p) = st.port_permit.take() {
+                        dropped_permits.push(p);
+                    }
+                    to_remove.push(link_id);
+                    to_wake.push(Arc::clone(port));
+                }
+            }
+
+            for link_id in to_remove {
+                if let Some(port) = reg.ports.remove(&link_id) {
+                    let hist = lock_unpoisoned(&port.slab).drain_to_history(now);
+                    reg.retired_slabs.insert(link_id, hist, now);
+                }
+            }
+        }
+
+        drop(dropped_permits);
+        drop(dropped_scopes);
+        for port in to_wake {
+            port.wake_pump();
         }
     }
 }
 
-/// Indirection slot pointing to a scope's currently active [`PortRegistry`]
+struct PortSlotState {
+    owner_node: Option<u64>,
+    registry: Arc<PortRegistry>,
+}
+
+/// Synchronized indirection slot pointing to a scope's currently active [`PortRegistry`]
 /// (its own standalone registry when unmounted, or its hosting `Node`'s registry when mounted).
+///
+/// Lock Level 1.5: read-locked during `attach_inbound`/`attach_outbound`, write-locked during
+/// `mount_onto`/`unmount_from` so concurrent attachments can never land in the wrong registry
+/// or reinsert an unmounted `ScopeKid` (DG-03).
 pub(crate) struct PortSlot {
     standalone: Arc<PortRegistry>,
-    current: RwLock<Arc<PortRegistry>>,
+    state: RwLock<PortSlotState>,
 }
 
 impl PortSlot {
     pub fn new(standalone: Arc<PortRegistry>) -> Arc<Self> {
         Arc::new(Self {
-            current: RwLock::new(Arc::clone(&standalone)),
+            state: RwLock::new(PortSlotState {
+                owner_node: None,
+                registry: Arc::clone(&standalone),
+            }),
             standalone,
         })
-    }
-
-    pub fn current(&self) -> Arc<PortRegistry> {
-        Arc::clone(&read_unpoisoned(&self.current))
     }
 
     pub fn standalone(&self) -> &Arc<PortRegistry> {
         &self.standalone
     }
 
-    pub fn switch_to(&self, target: Arc<PortRegistry>) {
-        *write_unpoisoned(&self.current) = target;
+    /// Serializes inbound attachment against concurrent mount/unmount transitions (DG-03),
+    /// spawning any newly created receive pump strictly AFTER releasing all locks.
+    pub fn attach_inbound(
+        &self,
+        link: Arc<dyn DatagramLink>,
+        scope: Arc<ScopeCore>,
+    ) -> Result<DatagramIngress, CoreError> {
+        let (ingress, to_spawn) = {
+            let st = read_unpoisoned(&self.state);
+            if scope.pending.is_closed() {
+                return Err(CoreError::Closed);
+            }
+            st.registry
+                .attach_inbound_prepared(link, Some(scope), false)?
+        };
+        if let Some((spawner, port)) = to_spawn {
+            spawner.spawn(Box::pin(port.run_pump()));
+        }
+        Ok(ingress)
     }
 
-    pub fn restore_standalone(&self) {
-        *write_unpoisoned(&self.current) = Arc::clone(&self.standalone);
+    /// Serializes outbound attachment against concurrent mount/unmount transitions (DG-03),
+    /// spawning any newly created receive pump strictly AFTER releasing all locks.
+    pub fn attach_outbound(
+        &self,
+        link: Arc<dyn DatagramLink>,
+    ) -> Result<(Arc<DatagramPort>, OutboundPortHold), CoreError> {
+        let (res, to_spawn) = {
+            let st = read_unpoisoned(&self.state);
+            st.registry.attach_outbound_prepared(link)?
+        };
+        if let Some((spawner, port)) = to_spawn {
+            spawner.spawn(Box::pin(port.run_pump()));
+        }
+        Ok(res)
+    }
+
+    /// Atomically adopts standalone ports into `target`, switches this slot to `target`,
+    /// and invokes `on_committed` under the exclusive write lock (DG-03).
+    pub fn mount_onto(
+        &self,
+        node_id: u64,
+        target: &Arc<PortRegistry>,
+        on_committed: impl FnOnce(),
+    ) -> Result<(), CoreError> {
+        let mut st = write_unpoisoned(&self.state);
+        if st.owner_node.is_some() {
+            return Err(CoreError::AlreadyPublished);
+        }
+        target.adopt_from(&self.standalone)?;
+        st.owner_node = Some(node_id);
+        st.registry = Arc::clone(target);
+        on_committed();
+        Ok(())
+    }
+
+    /// Atomically detaches `kid` from `node_ports` (if provided), clears the standalone
+    /// adoption redirect, and restores standalone routing under the exclusive write lock (DG-03/05/06).
+    pub fn unmount_from(&self, node_id: u64, kid: ScopeKid, node_ports: Option<&PortRegistry>) {
+        let mut st = write_unpoisoned(&self.state);
+        if st.owner_node != Some(node_id) {
+            return;
+        }
+        if let Some(ports) = node_ports {
+            ports.detach_scope(kid);
+        }
+        self.standalone.clear_adopted_by();
+        st.owner_node = None;
+        st.registry = Arc::clone(&self.standalone);
     }
 }

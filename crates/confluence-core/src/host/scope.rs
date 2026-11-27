@@ -434,8 +434,8 @@ impl ScopeInstance {
         if self.core.pending.is_closed() {
             return Err(CoreError::Closed);
         }
-        let registry = self.ports.current();
-        registry.attach_inbound(Arc::new(link), Some(Arc::clone(&self.core)), false)
+        self.ports
+            .attach_inbound(Arc::new(link), Arc::clone(&self.core))
     }
 
     /// Runs an inbound Stream listener loop, ignoring per-connection admission errors and
@@ -510,8 +510,8 @@ impl ScopeInstance {
         self.core.begin_shutdown();
     }
 
-    /// Returns `true` once all pending setups, active sessions/circuits, and destination stream
-    /// bridges have finished and released their permits (Spec §6.8).
+    /// Returns `true` once all pending setups, active sessions/circuits, and destination
+    /// application bridges have finished and released their permits (Spec §6.8).
     #[must_use]
     pub fn is_drained(&self) -> bool {
         self.core.is_drained()
@@ -521,6 +521,14 @@ impl ScopeInstance {
     #[must_use]
     pub fn stats(&self) -> ScopeStats {
         self.core.metrics.snapshot()
+    }
+}
+
+impl Drop for ScopeInstance {
+    fn drop(&mut self) {
+        // Disable standalone inbound ingress and wake/retire any idle receive pumps so pumps
+        // never leak indefinitely in `link.recv()` once the final `Arc<ScopeInstance>` drops (DG-05).
+        self.ports.standalone().shutdown_ingress();
     }
 }
 

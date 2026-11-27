@@ -1221,3 +1221,575 @@ fn outer_crate_pure_public_api_framed_carrier_custom_authorizer_and_multiscope_n
     });
     assert_eq!(ok, Some(Ok(())));
 }
+
+
+// ---------------------------------------------------------------------------
+// Regression Tests for Codex Round 1 (DG-02, DG-03, DG-04, DG-05, DG-06)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn regression_dg02_dg03_concurrent_node_mount_rollback_and_attach_race() {
+    use std::sync::Barrier;
+    use std::thread;
+
+    // Part A (DG-02): Two Nodes concurrently calling `add_scope` on the SAME `ScopeInstance`
+    // across OS threads MUST allow AT MOST ONE winner and reject the other with `AlreadyPublished`!
+    for _ in 0..32 {
+        let tr = TestRuntime::new();
+        let scope = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone()).build();
+        let node1 = Node::builder(tr.runtime.clone()).build();
+        let node2 = Node::builder(tr.runtime.clone()).build();
+        let barrier = Arc::new(Barrier::new(2));
+
+        let b1 = Arc::clone(&barrier);
+        let n1 = Arc::clone(&node1);
+        let s1 = Arc::clone(&scope);
+        let t1 = thread::spawn(move || {
+            b1.wait();
+            n1.add_scope(s1)
+        });
+
+        let b2 = Arc::clone(&barrier);
+        let n2 = Arc::clone(&node2);
+        let s2 = Arc::clone(&scope);
+        let t2 = thread::spawn(move || {
+            b2.wait();
+            n2.add_scope(s2)
+        });
+
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+        match (r1, r2) {
+            (Ok(()), Err(CoreError::AlreadyPublished)) => {
+                assert_eq!(node1.stats().mounted_scopes, 1);
+                assert_eq!(node2.stats().mounted_scopes, 0);
+            }
+            (Err(CoreError::AlreadyPublished), Ok(())) => {
+                assert_eq!(node1.stats().mounted_scopes, 0);
+                assert_eq!(node2.stats().mounted_scopes, 1);
+            }
+            other => panic!("DG-02: expected exactly one winner and one AlreadyPublished, got {:?}", other),
+        }
+    }
+
+    // Part B (DG-02 rollback): Failed port adoption (`Busy`) MUST release the atomic Node claim
+    // so the scope can immediately be mounted onto another Node!
+    {
+        let tr = TestRuntime::new();
+        let node_full = Node::builder(tr.runtime.clone())
+            .with_limits(NodeLimits {
+                max_pending: 16,
+                max_datagram_ports: 1,
+            })
+            .build();
+        let node_ok = Node::builder(tr.runtime.clone()).build();
+
+        let p_fill = MemoryDatagramPair::pair(1_400);
+        let _i_fill = node_full.attach_datagram(p_fill.b).unwrap();
+
+        let scope = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone()).build();
+        let p_s = MemoryDatagramPair::pair(1_400);
+        let _i_s = scope.attach_datagram(p_s.b).unwrap();
+
+        assert_eq!(
+            node_full.add_scope(Arc::clone(&scope)).unwrap_err(),
+            CoreError::Busy
+        );
+        // Claim was rolled back cleanly -> mounting on `node_ok` MUST succeed!
+        node_ok.add_scope(Arc::clone(&scope)).unwrap();
+        assert_eq!(node_ok.stats().mounted_scopes, 1);
+        assert_eq!(node_ok.stats().active_datagram_ports, 1);
+        assert_eq!(scope.stats().active_datagram_ports, 0);
+    }
+
+    // Part C (DG-03): Concurrent `scope.attach_datagram(link)` racing `node.add_scope(scope)`
+    // and `node.remove_scope(kid)` MUST NEVER leave an orphan standalone port while mounted,
+    // NEVER spawn duplicate pumps for the same LinkId, and NEVER reinsert an unmounted ScopeKid!
+    for _ in 0..24 {
+        let tr = TestRuntime::new();
+        let scope = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone())
+            .with_authorizer(Arc::new(AllowAll(Duration::from_secs(60))))
+            .build();
+        let node = Node::builder(tr.runtime.clone()).build();
+        let pair = MemoryDatagramPair::pair(1_500);
+        let link = Arc::clone(&pair.b);
+        let barrier = Arc::new(Barrier::new(2));
+
+        let b1 = Arc::clone(&barrier);
+        let s1 = Arc::clone(&scope);
+        let l1 = Arc::clone(&link);
+        let t_attach = thread::spawn(move || {
+            b1.wait();
+            s1.attach_datagram(l1)
+        });
+
+        let b2 = Arc::clone(&barrier);
+        let n2 = Arc::clone(&node);
+        let s2 = Arc::clone(&scope);
+        let t_mount = thread::spawn(move || {
+            b2.wait();
+            n2.add_scope(s2)
+        });
+
+        let attach_res = t_attach.join().unwrap();
+        let mount_res = t_mount.join().unwrap();
+        assert!(attach_res.is_ok());
+        assert!(mount_res.is_ok());
+
+        // Regardless of ordering, the scope is now mounted, so ALL ports MUST live in `node`
+        // (ZERO orphan standalone ports!), and attaching the same link on `node` deduplicates to 1!
+        assert_eq!(
+            scope.stats().active_datagram_ports,
+            0,
+            "DG-03: attach_datagram racing add_scope MUST NOT leave orphan standalone port"
+        );
+        let _ing_node = node.attach_datagram(Arc::clone(&link)).unwrap();
+        assert_eq!(node.stats().active_datagram_ports, 1);
+
+        // Now race `scope.attach_datagram(link2)` against `node.remove_scope(scope.scope_kid())`!
+        let pair2 = MemoryDatagramPair::pair(1_500);
+        let link2 = Arc::clone(&pair2.b);
+        let barrier2 = Arc::new(Barrier::new(2));
+
+        let b3 = Arc::clone(&barrier2);
+        let s3 = Arc::clone(&scope);
+        let l3 = Arc::clone(&link2);
+        let t_attach2 = thread::spawn(move || {
+            b3.wait();
+            s3.attach_datagram(l3)
+        });
+
+        let b4 = Arc::clone(&barrier2);
+        let n4 = Arc::clone(&node);
+        let kid = scope.scope_kid();
+        let t_unmount = thread::spawn(move || {
+            b4.wait();
+            n4.remove_scope(kid)
+        });
+
+        let _ = t_attach2.join().unwrap().unwrap();
+        assert!(t_unmount.join().unwrap().is_some());
+        tr.drive_until_idle();
+
+        // After unmount:
+        // - If attach2 landed BEFORE unmount, detach_scope removed scope.kid and retired unowned link2!
+        //   So node has ONLY `link` (node_wide = true, active_datagram_ports == 1) and scope has 0.
+        // - If attach2 landed AFTER unmount, it landed cleanly in `scope`'s standalone registry!
+        //   So node STILL has ONLY `link` (active_datagram_ports == 1) and scope has 1.
+        // In NEITHER case can `node` ever retain `link2` or `scope.kid`!
+        assert_eq!(
+            node.stats().active_datagram_ports,
+            1,
+            "DG-03: attach_datagram racing remove_scope MUST NEVER strand unmounted scope link in Node"
+        );
+    }
+}
+
+#[test]
+fn regression_dg04_dying_port_during_adoption_never_blocks_link_id() {
+    let tr = TestRuntime::new();
+    let origin = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone()).build();
+    let scope = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone())
+        .with_authorizer(Arc::new(AllowAll(Duration::from_secs(60))))
+        .build();
+    let node = Node::builder(tr.runtime.clone())
+        .with_limits(NodeLimits {
+            max_pending: 16,
+            max_datagram_ports: 1,
+        })
+        .build();
+
+    let shared_id = LinkId::allocate();
+
+    struct FixedIdLink {
+        inner: Arc<MemoryDatagramLink>,
+        id: LinkId,
+    }
+    impl DatagramLink for FixedIdLink {
+        fn caps(&self) -> ChannelCaps {
+            self.inner.caps()
+        }
+        fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), CoreError>> {
+            self.inner.poll_send_ready(cx)
+        }
+        fn try_send(&self, packet: PacketBuf) -> Result<(), CoreError> {
+            self.inner.try_send(packet)
+        }
+        fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Result<PacketBuf, CoreError>> {
+            self.inner.poll_recv(cx)
+        }
+        fn source_tag(&self) -> [u8; 16] {
+            self.inner.source_tag()
+        }
+        fn link_id(&self) -> LinkId {
+            self.id
+        }
+    }
+
+    // Attach link #1 with `shared_id` to standalone `scope`, fail its carrier pipe, then adopt into `node`!
+    let dead_pair = MemoryDatagramPair::pair(1_500);
+    let ing_dead = scope
+        .attach_datagram(FixedIdLink {
+            inner: Arc::clone(&dead_pair.b),
+            id: shared_id,
+        })
+        .unwrap();
+    tr.drive_until_idle();
+
+    // Inject fatal failure BEFORE mounting (pump wakes and exits cleanly during/before adoption).
+    dead_pair
+        .a_faults
+        .inject_fatal_error(CoreError::Carrier("dead link".into()));
+    tr.drive_until_idle();
+    assert_eq!(
+        tr.spawner.try_block_on(ing_dead.closed()),
+        Some(CoreError::Carrier("dead link".into()))
+    );
+
+    node.add_scope(Arc::clone(&scope)).unwrap();
+    assert_eq!(node.stats().active_datagram_ports, 0);
+
+    // Now attach a live link #2 with the EXACT SAME `shared_id` on `node` and verify traffic works!
+    let live_pair = MemoryDatagramPair::pair(1_500);
+    let _ep = scope
+        .publish_datagram_endpoint("echo", 1_200, Arc::new(DatagramEcho { rt: tr.clone() }))
+        .unwrap();
+    origin
+        .register_datagram_carrier("mem", SharedDgCarrier(Arc::clone(&live_pair.a)))
+        .unwrap();
+    let _ing_live = node
+        .attach_datagram(FixedIdLink {
+            inner: Arc::clone(&live_pair.b),
+            id: shared_id,
+        })
+        .unwrap();
+    assert_eq!(node.stats().active_datagram_ports, 1);
+    tr.drive_until_idle();
+
+    let dg = tr
+        .spawner
+        .try_block_on(origin.dial_datagram_via(
+            scope.public_key(),
+            "echo",
+            1_200,
+            ExplicitPath::direct(1, "mem", b"b".to_vec()),
+        ))
+        .unwrap()
+        .unwrap();
+    let ok = tr.spawner.try_block_on(async {
+        dg.send(PacketBuf::from_payload(b"dg04-alive"))?;
+        assert_eq!(dg.recv().await?.payload(), b"dg04-alive");
+        Ok::<(), CoreError>(())
+    });
+    assert_eq!(ok, Some(Ok(())));
+
+    // Part B: Race pump termination directly against `node.add_scope()` across OS threads so
+    // `adopt_from` and `run_pump` teardown interleave under contention — `shared_id` MUST NEVER
+    // be stranded in `node`!
+    for _ in 0..24 {
+        let tr_r = TestRuntime::new();
+        let sc = ScopeInstance::builder(ScopeKeypair::generate(), tr_r.runtime.clone()).build();
+        let nd = Node::builder(tr_r.runtime.clone())
+            .with_limits(NodeLimits {
+                max_pending: 8,
+                max_datagram_ports: 1,
+            })
+            .build();
+        let link_id = LinkId::allocate();
+        let p_dead = MemoryDatagramPair::pair(1_500);
+        let ing = sc
+            .attach_datagram(FixedIdLink {
+                inner: Arc::clone(&p_dead.b),
+                id: link_id,
+            })
+            .unwrap();
+        tr_r.drive_until_idle();
+        p_dead
+            .a_faults
+            .inject_fatal_error(CoreError::Carrier("mid-adopt fail".into()));
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let b1 = Arc::clone(&barrier);
+        let sp = Arc::clone(&tr_r.spawner);
+        let t_pump = std::thread::spawn(move || {
+            b1.wait();
+            sp.drive_until_idle();
+        });
+        let b2 = Arc::clone(&barrier);
+        let nd_c = Arc::clone(&nd);
+        let sc_c = Arc::clone(&sc);
+        let t_adopt = std::thread::spawn(move || {
+            b2.wait();
+            nd_c.add_scope(sc_c).unwrap();
+        });
+        t_pump.join().unwrap();
+        t_adopt.join().unwrap();
+        tr_r.drive_until_idle();
+
+        assert_eq!(
+            tr_r.spawner.try_block_on(ing.closed()),
+            Some(CoreError::Carrier("mid-adopt fail".into()))
+        );
+        assert_eq!(
+            nd.stats().active_datagram_ports,
+            0,
+            "DG-04: port dying mid-adoption MUST NOT leave stale entry or leak permit"
+        );
+        // Reattaching the exact same `LinkId` on the 1-port Node MUST succeed!
+        let p_live = MemoryDatagramPair::pair(1_500);
+        let _ing2 = nd
+            .attach_datagram(FixedIdLink {
+                inner: Arc::clone(&p_live.b),
+                id: link_id,
+            })
+            .expect("DG-04: LinkId MUST NOT be permanently blocked after mid-adoption death");
+        assert_eq!(nd.stats().active_datagram_ports, 1);
+    }
+}
+
+#[test]
+fn regression_dg05_drop_standalone_scope_and_node_stops_pumps_and_releases_scopes() {
+    /// DatagramLink wrapper that stays pending in `poll_recv` forever and increments `drops`
+    /// when dropped — proving the background inbound pump exited rather than leaking!
+    struct DropCountingLink {
+        id: LinkId,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for DropCountingLink {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl DatagramLink for DropCountingLink {
+        fn caps(&self) -> ChannelCaps {
+            ChannelCaps::fixed(1_500, false)
+        }
+        fn poll_send_ready(&self, _cx: &mut Context<'_>) -> Poll<Result<(), CoreError>> {
+            Poll::Ready(Ok(()))
+        }
+        fn try_send(&self, _packet: PacketBuf) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn poll_recv(&self, _cx: &mut Context<'_>) -> Poll<Result<PacketBuf, CoreError>> {
+            Poll::Pending
+        }
+        fn link_id(&self) -> LinkId {
+            self.id
+        }
+    }
+
+    // Part A: Dropping final standalone `Arc<ScopeInstance>` stops its inbound pump cleanly!
+    {
+        let tr = TestRuntime::new();
+        let link_drops = Arc::new(AtomicUsize::new(0));
+        let scope = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone()).build();
+        let ingress = scope
+            .attach_datagram(DropCountingLink {
+                id: LinkId::allocate(),
+                drops: Arc::clone(&link_drops),
+            })
+            .unwrap();
+        tr.drive_until_idle();
+        assert_eq!(link_drops.load(Ordering::SeqCst), 0);
+
+        drop(scope);
+        tr.drive_until_idle();
+        assert_eq!(
+            tr.spawner.try_block_on(ingress.closed()),
+            Some(CoreError::Closed),
+            "DG-05: dropping standalone ScopeInstance MUST close inbound ports"
+        );
+        assert_eq!(
+            link_drops.load(Ordering::SeqCst),
+            1,
+            "DG-05: standalone inbound pump MUST exit and drop its DatagramLink"
+        );
+    }
+
+    // Part B: Dropping `Node` stops all node-wide & adopted pumps AND restores retained scopes
+    // to unmounted standalone state so they can mount onto a replacement `Node`!
+    {
+        let tr = TestRuntime::new();
+        let origin = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone()).build();
+        let scope = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone())
+            .with_authorizer(Arc::new(AllowAll(Duration::from_secs(60))))
+            .build();
+        let _ep = scope
+            .publish_datagram_endpoint("echo", 1_200, Arc::new(DatagramEcho { rt: tr.clone() }))
+            .unwrap();
+
+        let node1 = Node::builder(tr.runtime.clone()).build();
+        let link_drops = Arc::new(AtomicUsize::new(0));
+
+        // Attach one standalone link (adopted on add_scope) and one node-wide link!
+        let ing_adopted = scope
+            .attach_datagram(DropCountingLink {
+                id: LinkId::allocate(),
+                drops: Arc::clone(&link_drops),
+            })
+            .unwrap();
+        node1.add_scope(Arc::clone(&scope)).unwrap();
+        let ing_node_wide = node1
+            .attach_datagram(DropCountingLink {
+                id: LinkId::allocate(),
+                drops: Arc::clone(&link_drops),
+            })
+            .unwrap();
+        tr.drive_until_idle();
+        assert_eq!(link_drops.load(Ordering::SeqCst), 0);
+
+        // Drop `node1` while retaining `scope`!
+        drop(node1);
+        tr.drive_until_idle();
+
+        assert_eq!(
+            tr.spawner.try_block_on(ing_adopted.closed()),
+            Some(CoreError::Closed)
+        );
+        assert_eq!(
+            tr.spawner.try_block_on(ing_node_wide.closed()),
+            Some(CoreError::Closed)
+        );
+        assert_eq!(
+            link_drops.load(Ordering::SeqCst),
+            2,
+            "DG-05: dropping Node MUST stop ALL inbound pumps (adopted + node-wide)"
+        );
+
+        // Retained `scope` MUST now be cleanly unmounted and mountable on a replacement `Node2`!
+        let node2 = Node::builder(tr.runtime.clone()).build();
+        node2
+            .add_scope(Arc::clone(&scope))
+            .expect("DG-05: retained scope MUST join replacement Node after previous Node drops");
+        assert_eq!(node2.stats().mounted_scopes, 1);
+
+        let (dg_c, _dg_l, _a, dg_b, _, _) = dg_pair_channel(1_500);
+        origin.register_datagram_carrier("dg", dg_c).unwrap();
+        let _ing2 = node2.attach_datagram(dg_b).unwrap();
+        tr.drive_until_idle();
+
+        let dg = tr
+            .spawner
+            .try_block_on(origin.dial_datagram_via(
+                scope.public_key(),
+                "echo",
+                1_200,
+                ExplicitPath::direct(1, "dg", b"n2".to_vec()),
+            ))
+            .unwrap()
+            .unwrap();
+        let ok = tr.spawner.try_block_on(async {
+            dg.send(PacketBuf::from_payload(b"dg05-node2"))?;
+            assert_eq!(dg.recv().await?.payload(), b"dg05-node2");
+            Ok::<(), CoreError>(())
+        });
+        assert_eq!(ok, Some(Ok(())));
+    }
+}
+
+#[test]
+fn regression_dg06_unmounting_last_attached_scope_frees_node_port_capacity() {
+    let tr = TestRuntime::new();
+    let origin = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone()).build();
+    let scope = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone())
+        .with_authorizer(Arc::new(AllowAll(Duration::from_secs(60))))
+        .build();
+    let _ep = scope
+        .publish_datagram_endpoint("echo", 1_200, Arc::new(DatagramEcho { rt: tr.clone() }))
+        .unwrap();
+
+    // Node with strict 1-port capacity!
+    let node = Node::builder(tr.runtime.clone())
+        .with_limits(NodeLimits {
+            max_pending: 16,
+            max_datagram_ports: 1,
+        })
+        .build();
+
+    // Part A: Idle adopted port (even while caller retains `DatagramIngress` handle!) MUST retire
+    // immediately on `remove_scope` and free the single port slot without returning `Busy`!
+    let p1 = MemoryDatagramPair::pair(1_500);
+    let ing1 = scope.attach_datagram(Arc::clone(&p1.b)).unwrap();
+    node.add_scope(Arc::clone(&scope)).unwrap();
+    assert_eq!(node.stats().active_datagram_ports, 1);
+
+    let removed = node.remove_scope(scope.scope_kid());
+    assert!(removed.is_some());
+    assert_eq!(
+        node.stats().active_datagram_ports,
+        0,
+        "DG-06: unmounting last attached scope MUST immediately retire unowned idle port"
+    );
+
+    // Even BEFORE driving executor (and while `ing1` is still alive), a new link MUST succeed!
+    let p2 = MemoryDatagramPair::pair(1_500);
+    let _ing2 = node
+        .attach_datagram(Arc::clone(&p2.b))
+        .expect("DG-06: 1-port Node MUST NOT return Busy after unmounting last attached scope");
+    assert_eq!(node.stats().active_datagram_ports, 1);
+
+    tr.drive_until_idle();
+    assert_eq!(
+        tr.spawner.try_block_on(ing1.closed()),
+        Some(CoreError::Closed)
+    );
+
+    // Part B: Adopted port with an ACTIVE circuit stays alive through `remove_scope`, then retires
+    // automatically once the last circuit drops, freeing capacity for a replacement link!
+    drop(node);
+    tr.drive_until_idle();
+
+    let node_b = Node::builder(tr.runtime.clone())
+        .with_limits(NodeLimits {
+            max_pending: 16,
+            max_datagram_ports: 1,
+        })
+        .build();
+    let (dg_c, _l, _a, dg_b, _, _) = dg_pair_channel(1_500);
+    origin.register_datagram_carrier("dg", dg_c).unwrap();
+    let ing_active = scope.attach_datagram(dg_b).unwrap();
+    node_b.add_scope(Arc::clone(&scope)).unwrap();
+    tr.drive_until_idle();
+
+    let dg = tr
+        .spawner
+        .try_block_on(origin.dial_datagram_via(
+            scope.public_key(),
+            "echo",
+            1_200,
+            ExplicitPath::direct(1, "dg", b"b".to_vec()),
+        ))
+        .unwrap()
+        .unwrap();
+    assert_eq!(node_b.stats().active_datagram_ports, 1);
+
+    // Unmount while circuit is still active: port remains open for the active circuit!
+    assert!(node_b.remove_scope(scope.scope_kid()).is_some());
+    assert_eq!(node_b.stats().active_datagram_ports, 1);
+
+    // Active circuit continues working cleanly until dropped, then port retires and frees capacity!
+    let ok = tr.spawner.try_block_on(async {
+        dg.send(PacketBuf::from_payload(b"dg06-in-flight"))?;
+        assert_eq!(dg.recv().await?.payload(), b"dg06-in-flight");
+        Ok::<(), CoreError>(())
+    });
+    assert_eq!(ok, Some(Ok(())));
+
+    drop(dg);
+    tr.drive_until_idle();
+    assert_eq!(
+        node_b.stats().active_datagram_ports,
+        0,
+        "DG-06: unowned port MUST retire once its last circuit releases"
+    );
+    assert_eq!(
+        tr.spawner.try_block_on(ing_active.closed()),
+        Some(CoreError::Closed)
+    );
+
+    let p3 = MemoryDatagramPair::pair(1_500);
+    let _ing3 = node_b
+        .attach_datagram(p3.b)
+        .expect("DG-06: freed port slot MUST accept new link");
+    assert_eq!(node_b.stats().active_datagram_ports, 1);
+}

@@ -1,6 +1,8 @@
 //! Stream Destination 1.0 RTT deferred open (`AwaitingConfirm` -> `EndpointHandler::open`
 //! -> `OPEN_OK` / `TARGET_*` -> bidirectional local application bridge, Spec §6.3).
 
+use core::future::{Future, poll_fn};
+use core::task::Poll;
 use std::sync::Arc;
 
 use crate::constants::{CLOSE_SEND_TIMEOUT, SETUP_TIMEOUT, ST_OVERHEAD, STREAM_CHUNK};
@@ -19,6 +21,7 @@ use crate::engine::stream::session::{
     spawn_stream_session,
 };
 use crate::error::CoreError;
+use crate::runtime::sync::WatchReceiver;
 use crate::seam::auth::StreamAction;
 use crate::seam::channel::{
     BoxedStream, IntoStreamHalves, MtuWatch, StreamRead, StreamReadExt, StreamWrite,
@@ -322,60 +325,125 @@ async fn send_best_effort_terminal_close<W: StreamWrite + ?Sized>(
     .await;
 }
 
+enum AppToE2eExit {
+    CleanOrHalfClosed,
+    Fatal,
+}
+
+async fn wait_session_closed(rx: &mut WatchReceiver<Option<CoreError>>) -> CoreError {
+    loop {
+        if let Some(err) = rx.borrow_cloned() {
+            return err;
+        }
+        if !rx.changed().await {
+            return rx.borrow_cloned().unwrap_or(CoreError::Closed);
+        }
+    }
+}
+
 fn spawn_stream_bridge(scope: Arc<ScopeCore>, e2e: E2eStream, app: BoxedStream) {
     let guard = BridgeGuard::acquire(Arc::clone(&scope));
+    let mut session_closed = e2e.subscribe_closed();
+    let session_closed_dir2 = session_closed.clone();
     let spawner = Arc::clone(&scope.runtime.spawner);
     spawner.spawn(Box::pin(async move {
         let _guard = guard;
         let (mut e2e_r, mut e2e_w) = e2e.split();
         let (mut app_r, mut app_w) = app.into_halves();
 
-        let (done_tx, done_rx) = async_channel::bounded::<()>(2);
-
-        // Direction 1: e2e -> app (e2e EOF -> app.shutdown()).
-        let d1 = done_tx.clone();
-        scope.runtime.spawner.spawn(Box::pin(async move {
+        // Direction 1: e2e -> app (clean e2e ST_FIN -> app.shutdown(); fatal error aborts bridge).
+        let mut dir1 = Some(Box::pin(async move {
             let mut buf = vec![0u8; 8192];
             loop {
                 match e2e_r.read(&mut buf).await {
                     Ok(0) => {
                         let _ = app_w.shutdown().await;
-                        break;
+                        return Ok::<(), CoreError>(());
                     }
                     Ok(n) => {
-                        if app_w.write_all(&buf[..n]).await.is_err() {
-                            break;
-                        }
+                        app_w.write_all(&buf[..n]).await?;
                     }
-                    Err(_) => break,
+                    Err(err) => return Err(err),
                 }
             }
-            let _ = d1.try_send(());
         }));
 
-        // Direction 2: app -> e2e (app EOF -> e2e.shutdown()).
-        let d2 = done_tx;
-        scope.runtime.spawner.spawn(Box::pin(async move {
+        // Direction 2: app -> e2e (clean app EOF -> e2e.shutdown(); fatal error aborts bridge).
+        let mut dir2 = Some(Box::pin(async move {
             let mut buf = vec![0u8; 8192];
             loop {
                 match app_r.read(&mut buf).await {
                     Ok(0) => {
                         let _ = e2e_w.shutdown().await;
-                        break;
+                        return AppToE2eExit::CleanOrHalfClosed;
                     }
-                    Ok(n) => {
-                        if e2e_w.write_all(&buf[..n]).await.is_err() {
-                            break;
+                    Ok(n) => match e2e_w.write_all(&buf[..n]).await {
+                        Ok(()) => {}
+                        Err(CoreError::Closed) => {
+                            // If outbound ST_FIN was initiated by scope `begin_shutdown()` while
+                            // the session is still alive (or completed cleanly), preserve dir1!
+                            let fatal = session_closed_dir2
+                                .borrow_cloned()
+                                .is_some_and(|err| err != CoreError::Closed);
+                            return if fatal {
+                                AppToE2eExit::Fatal
+                            } else {
+                                AppToE2eExit::CleanOrHalfClosed
+                            };
                         }
-                    }
-                    Err(_) => break,
+                        Err(_) => return AppToE2eExit::Fatal,
+                    },
+                    Err(_) => return AppToE2eExit::Fatal,
                 }
             }
-            let _ = d2.try_send(());
         }));
 
-        // Hold BridgeGuard until BOTH bridge directions finish cleanly.
-        let _ = done_rx.recv().await;
-        let _ = done_rx.recv().await;
+        let mut closed_fut = Box::pin(wait_session_closed(&mut session_closed));
+        let mut session_terminated = false;
+
+        // Supervise both directions in one task (ST-09): preserve independent clean half-closes,
+        // while cancelling any blocked/idle opposite half immediately on fatal session termination
+        // or fatal bridge I/O errors so `BridgeGuard` drops promptly.
+        poll_fn(|cx| {
+            if let Some(f1) = dir1.as_mut() {
+                if let Poll::Ready(res) = f1.as_mut().poll(cx) {
+                    dir1 = None;
+                    if res.is_err() {
+                        dir2 = None;
+                        return Poll::Ready(());
+                    }
+                }
+            }
+            if let Some(f2) = dir2.as_mut() {
+                if let Poll::Ready(exit) = f2.as_mut().poll(cx) {
+                    dir2 = None;
+                    if matches!(exit, AppToE2eExit::Fatal) {
+                        dir1 = None;
+                        return Poll::Ready(());
+                    }
+                }
+            }
+            if dir1.is_none() && dir2.is_none() {
+                return Poll::Ready(());
+            }
+            if !session_terminated {
+                if let Poll::Ready(reason) = closed_fut.as_mut().poll(cx) {
+                    session_terminated = true;
+                    if reason != CoreError::Closed {
+                        dir1 = None;
+                        dir2 = None;
+                        return Poll::Ready(());
+                    }
+                    // Clean two-way session completion: outbound half is already closed, so cancel
+                    // any idle app read while letting `dir1` finish flushing buffered E2E data/EOF.
+                    dir2 = None;
+                    if dir1.is_none() {
+                        return Poll::Ready(());
+                    }
+                }
+            }
+            Poll::Pending
+        })
+        .await;
     }));
 }

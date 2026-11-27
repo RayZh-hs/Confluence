@@ -15,7 +15,9 @@ use crate::constants::{
     STREAM_WRITE_BACKOFF_CAP, STREAM_WRITE_BACKOFF_INITIAL, STREAM_WRITE_RETRY_BUDGET,
 };
 use crate::crypto::cipher::StreamCipher;
-use crate::engine::context::{Either, ScopeCore, ScopeResolver, race2, with_deadline};
+use crate::engine::context::{
+    Either, ScopeCore, ScopeResolver, race2, wait_signal, with_deadline,
+};
 use crate::error::CoreError;
 use crate::runtime::sync::{Watch, WatchReceiver};
 use crate::runtime::{Clock, MonotonicTime, TaskSpawner};
@@ -183,6 +185,39 @@ pub(crate) async fn read_setup_reply<R: StreamRead + ?Sized>(
 // Reliable Stream Frame Writing (Spec §6.4)
 // ---------------------------------------------------------------------------
 
+enum BudgetStep<T> {
+    Expired,
+    Done(Result<T, CoreError>),
+}
+
+/// Polls `fut`, enforcing `budget_deadline` once anchored across both wait time and completion
+/// (`clock.now() >= deadline` fails closed with `BudgetStep::Expired`, Spec §6.4 / ST-02).
+async fn await_budgeted<F, T>(
+    clock: &dyn Clock,
+    budget_deadline: Option<MonotonicTime>,
+    fut: F,
+) -> BudgetStep<T>
+where
+    F: core::future::Future<Output = Result<T, CoreError>>,
+{
+    let Some(deadline) = budget_deadline else {
+        return BudgetStep::Done(fut.await);
+    };
+    if clock.now() >= deadline {
+        return BudgetStep::Expired;
+    }
+    match race2(fut, clock.sleep_until(deadline)).await {
+        Either::Left(res) => {
+            if clock.now() >= deadline {
+                BudgetStep::Expired
+            } else {
+                BudgetStep::Done(res)
+            }
+        }
+        Either::Right(()) => BudgetStep::Expired,
+    }
+}
+
 /// Writes `data` completely and flushes once, resuming exact unwritten slices across retryable
 /// carrier errors with exponential backoff (`10 -> 20 -> 40 -> 80 -> 160 -> 200 ms`, resetting
 /// to `10 ms` on any written byte) within a `3 s` budget from the first retryable error.
@@ -191,18 +226,34 @@ pub(crate) async fn write_frame<W: StreamWrite + ?Sized>(
     data: &[u8],
     clock: &dyn Clock,
 ) -> Result<(), CoreError> {
+    let mut dirty = false;
+    write_frame_tracked(writer, data, clock, &mut dirty).await
+}
+
+/// Same as [`write_frame`], additionally maintaining `frame_dirty == true` strictly while a
+/// partial prefix (`0 < offset < data.len()`) has been committed to `writer`.
+async fn write_frame_tracked<W: StreamWrite + ?Sized>(
+    writer: &mut W,
+    data: &[u8],
+    clock: &dyn Clock,
+    frame_dirty: &mut bool,
+) -> Result<(), CoreError> {
     let mut offset = 0usize;
     let mut budget_deadline: Option<MonotonicTime> = None;
     let mut backoff = STREAM_WRITE_BACKOFF_INITIAL;
 
     while offset < data.len() {
-        match writer.write(&data[offset..]).await {
-            Ok(0) => return Err(CoreError::UnexpectedEof),
-            Ok(n) => {
-                offset += n;
+        let step = await_budgeted(clock, budget_deadline, writer.write(&data[offset..])).await;
+        match step {
+            BudgetStep::Expired => return Err(CoreError::Timeout),
+            BudgetStep::Done(Ok(0)) => return Err(CoreError::UnexpectedEof),
+            BudgetStep::Done(Ok(n)) => {
+                let advanced = n.min(data.len().saturating_sub(offset));
+                offset += advanced;
+                *frame_dirty = offset > 0 && offset < data.len();
                 backoff = STREAM_WRITE_BACKOFF_INITIAL;
             }
-            Err(err) if err.is_retryable() => {
+            BudgetStep::Done(Err(err)) if err.is_retryable() => {
                 let now = clock.now();
                 let deadline = *budget_deadline
                     .get_or_insert_with(|| now.saturating_add(STREAM_WRITE_RETRY_BUDGET));
@@ -216,14 +267,19 @@ pub(crate) async fn write_frame<W: StreamWrite + ?Sized>(
                 }
                 backoff = backoff.saturating_mul(2).min(STREAM_WRITE_BACKOFF_CAP);
             }
-            Err(err) => return Err(err),
+            BudgetStep::Done(Err(err)) => return Err(err),
         }
     }
 
     loop {
-        match writer.flush().await {
-            Ok(()) => return Ok(()),
-            Err(err) if err.is_retryable() => {
+        let step = await_budgeted(clock, budget_deadline, writer.flush()).await;
+        match step {
+            BudgetStep::Expired => return Err(CoreError::Timeout),
+            BudgetStep::Done(Ok(())) => {
+                *frame_dirty = false;
+                return Ok(());
+            }
+            BudgetStep::Done(Err(err)) if err.is_retryable() => {
                 let now = clock.now();
                 let deadline = *budget_deadline
                     .get_or_insert_with(|| now.saturating_add(STREAM_WRITE_RETRY_BUDGET));
@@ -237,7 +293,7 @@ pub(crate) async fn write_frame<W: StreamWrite + ?Sized>(
                 }
                 backoff = backoff.saturating_mul(2).min(STREAM_WRITE_BACKOFF_CAP);
             }
-            Err(err) => return Err(err),
+            BudgetStep::Done(Err(err)) => return Err(err),
         }
     }
 }
@@ -260,6 +316,18 @@ pub(crate) async fn write_hop_control<W: StreamWrite + ?Sized>(
     body: &[u8],
     clock: &dyn Clock,
 ) -> Result<(), CoreError> {
+    let mut dirty = false;
+    write_hop_control_tracked(writer, kind, ttl_or_dist, body, clock, &mut dirty).await
+}
+
+async fn write_hop_control_tracked<W: StreamWrite + ?Sized>(
+    writer: &mut W,
+    kind: u8,
+    ttl_or_dist: u8,
+    body: &[u8],
+    clock: &dyn Clock,
+    frame_dirty: &mut bool,
+) -> Result<(), CoreError> {
     let len = u16::try_from(body.len()).map_err(|_| CoreError::Malformed)?;
     let hdr = StHopHeader {
         kind,
@@ -273,7 +341,7 @@ pub(crate) async fn write_hop_control<W: StreamWrite + ?Sized>(
     }
     stack[..ST_HOP_HEADER].copy_from_slice(&hdr.encode());
     stack[ST_HOP_HEADER..total].copy_from_slice(body);
-    write_frame(writer, &stack[..total], clock).await
+    write_frame_tracked(writer, &stack[..total], clock, frame_dirty).await
 }
 
 /// Seals one E2E stream record into `e2e_scratch` and writes it sliced across `ST_DATA` chunks
@@ -306,6 +374,18 @@ pub(crate) async fn write_st_data_chunks<W: StreamWrite + ?Sized>(
     clock: &dyn Clock,
     chunk_scratch: &mut Vec<u8>,
 ) -> Result<(), CoreError> {
+    let mut dirty = false;
+    write_st_data_chunks_tracked(writer, raw, chunk_cap, clock, chunk_scratch, &mut dirty).await
+}
+
+async fn write_st_data_chunks_tracked<W: StreamWrite + ?Sized>(
+    writer: &mut W,
+    raw: &[u8],
+    chunk_cap: usize,
+    clock: &dyn Clock,
+    chunk_scratch: &mut Vec<u8>,
+    frame_dirty: &mut bool,
+) -> Result<(), CoreError> {
     let limit = chunk_cap.clamp(1, STREAM_CHUNK);
     for slice in raw.chunks(limit) {
         let len = u16::try_from(slice.len()).map_err(|_| CoreError::Malformed)?;
@@ -318,7 +398,7 @@ pub(crate) async fn write_st_data_chunks<W: StreamWrite + ?Sized>(
         chunk_scratch.reserve(ST_HOP_HEADER + slice.len());
         chunk_scratch.extend_from_slice(&hdr.encode());
         chunk_scratch.extend_from_slice(slice);
-        write_frame(writer, chunk_scratch, clock).await?;
+        write_frame_tracked(writer, chunk_scratch, clock, frame_dirty).await?;
     }
     Ok(())
 }
@@ -499,29 +579,52 @@ impl PriorityCtrlFrame {
 
 /// Priority outer hop control command processed before regular `ST_DATA` chunks.
 ///
-/// Outer hop controls use independent `ControlCipher`s and may safely interleave between any
-/// two `ST_DATA` chunks without disturbing E2E `StreamCipher` sequence ordering.
+/// Non-terminal hop controls (`ST_RENEW`, `ST_RENEW_OK`) use independent `ControlCipher`s and may
+/// safely interleave between any two `ST_DATA` chunks without disturbing E2E `StreamCipher` order.
 pub(crate) enum WriterCtrlCmd {
-    /// Emit one outer hop control frame (`ST_CLOSE`, `ST_RENEW`, `ST_RENEW_OK`).
+    /// Emit one outer hop control frame (`ST_RENEW`, `ST_RENEW_OK`, etc.).
     HopControl(PriorityCtrlFrame),
-    /// Best-effort teardown sequence: flush final hop control frames within `50 ms` and shut down carrier.
-    Teardown {
-        close_frames: Vec<PriorityCtrlFrame>,
-        shutdown_carrier: bool,
-    },
 }
 
 /// Strictly-FIFO data-plane command queued on [`StreamWriterHandle`].
 ///
-/// All E2E stream records (`ST_DATA`, `ST_FIN`, `e2e::ST_RENEW`, `e2e::ST_RENEW_OK`) MUST pass
-/// through this single FIFO channel in exact `StreamCipher` sealing order.
+/// All E2E stream records (`ST_DATA`, `ST_FIN`, `e2e::ST_RENEW`, `e2e::ST_RENEW_OK`),
+/// FIFO-ordered reverse `ST_CLOSE` frames, and flush barriers pass through this single FIFO channel.
 pub(crate) enum WriterDataCmd {
     /// Pre-sealed E2E record bytes sliced across `ST_DATA` chunks using live MTU.
     E2eBytes(Vec<u8>),
     /// Pre-framed outer `ST_DATA` chunk (already carries 4-byte `StHopHeader`, used by transit splice).
     PreFramed(Vec<u8>),
+    /// FIFO-ordered outer hop control frame emitted strictly after preceding `ST_DATA` chunks.
+    HopControl(Box<PriorityCtrlFrame>),
     /// Completes once all preceding FIFO items have been written and flushed to the carrier.
     FlushAck(async_channel::Sender<Result<(), CoreError>>),
+}
+
+/// Non-blocking enqueue outcome returned by [`StreamWriterHandle::try_send_hop_control`] and
+/// [`StreamWriterHandle::try_send_data`].
+pub(crate) enum TryWriterSend<T> {
+    Sent,
+    Full(T),
+    Closed(CoreError),
+}
+
+struct TeardownRequest {
+    close_frames: Vec<PriorityCtrlFrame>,
+    shutdown_carrier: bool,
+}
+
+async fn wait_teardown(
+    rx: &mut WatchReceiver<Option<Arc<TeardownRequest>>>,
+) -> Option<Arc<TeardownRequest>> {
+    loop {
+        if let Some(req) = rx.borrow_cloned() {
+            return Some(req);
+        }
+        if !rx.changed().await {
+            return rx.borrow_cloned();
+        }
+    }
 }
 
 /// Handle to a single-owner Stream writer task (zero async mutexes!).
@@ -529,13 +632,14 @@ pub(crate) enum WriterDataCmd {
 pub(crate) struct StreamWriterHandle {
     ctrl_tx: async_channel::Sender<WriterCtrlCmd>,
     data_tx: async_channel::Sender<WriterDataCmd>,
+    teardown_tx: Watch<Option<Arc<TeardownRequest>>>,
     err_rx: WatchReceiver<Option<CoreError>>,
     done_rx: WatchReceiver<bool>,
 }
 
 impl StreamWriterHandle {
-    /// Spawns a dedicated single-owner task driving `writer` with priority control interleaving
-    /// and reusable scratch buffers.
+    /// Spawns a dedicated single-owner task driving `writer` with priority control interleaving,
+    /// interruptible teardown, and reusable scratch buffers.
     pub fn spawn(
         mut writer: Box<dyn StreamWrite>,
         mtu_watch: MtuWatch,
@@ -545,89 +649,144 @@ impl StreamWriterHandle {
     ) -> Self {
         let (ctrl_tx, ctrl_rx) = async_channel::bounded::<WriterCtrlCmd>(32);
         let (data_tx, data_rx) = async_channel::bounded::<WriterDataCmd>(16);
+        let (teardown_tx, mut teardown_rx) = Watch::new(None::<Arc<TeardownRequest>>);
         let (err_tx, err_rx) = Watch::new(None::<CoreError>);
         let (done_tx, done_rx) = Watch::new(false);
 
         spawner.spawn(Box::pin(async move {
             let mut chunk_scratch = Vec::with_capacity(4096);
+            let mut teardown_req: Option<Arc<TeardownRequest>> = None;
+            let mut fatal_err: Option<CoreError> = None;
+            let mut frame_dirty = false;
+
             loop {
-                // Always prefer priority control frames over regular data.
+                if let Some(req) = teardown_rx.borrow_cloned() {
+                    teardown_req = Some(req);
+                    break;
+                }
+
+                // Always prefer teardown over channel closure, and priority control over FIFO data.
                 let next_cmd = if let Ok(c) = ctrl_rx.try_recv() {
-                    Either::Left(Ok(c))
+                    Either::Right(Either::Left(Ok(c)))
                 } else {
-                    recv_priority(&ctrl_rx, &data_rx).await
+                    race2(
+                        wait_teardown(&mut teardown_rx),
+                        recv_priority(&ctrl_rx, &data_rx),
+                    )
+                    .await
                 };
 
-                match next_cmd {
+                let cmd = match next_cmd {
+                    Either::Left(req) => {
+                        teardown_req = req;
+                        break;
+                    }
+                    Either::Right(cmd) => cmd,
+                };
+
+                match cmd {
                     Either::Left(Ok(WriterCtrlCmd::HopControl(frame))) => {
-                        if let Err(err) = write_hop_control(
-                            &mut *writer,
-                            frame.kind,
-                            frame.ttl_or_dist,
-                            &frame.body[..frame.len],
-                            &*clock,
+                        match race2(
+                            write_hop_control_tracked(
+                                &mut *writer,
+                                frame.kind,
+                                frame.ttl_or_dist,
+                                &frame.body[..frame.len],
+                                &*clock,
+                                &mut frame_dirty,
+                            ),
+                            wait_teardown(&mut teardown_rx),
                         )
                         .await
                         {
-                            err_tx.send(Some(err));
-                            break;
-                        }
-                    }
-                    Either::Left(Ok(WriterCtrlCmd::Teardown {
-                        close_frames,
-                        shutdown_carrier,
-                    })) => {
-                        let deadline = clock.now().saturating_add(CLOSE_SEND_TIMEOUT);
-                        for frame in close_frames {
-                            let res = with_deadline(
-                                &*clock,
-                                deadline,
-                                write_hop_control(
-                                    &mut *writer,
-                                    frame.kind,
-                                    frame.ttl_or_dist,
-                                    &frame.body[..frame.len],
-                                    &*clock,
-                                ),
-                            )
-                            .await;
-                            if res.is_err() {
+                            Either::Left(Ok(())) => {}
+                            Either::Left(Err(err)) => {
+                                fatal_err = Some(err.clone());
+                                err_tx.send(Some(err));
+                                break;
+                            }
+                            Either::Right(req) => {
+                                teardown_req = req;
                                 break;
                             }
                         }
-                        if shutdown_carrier {
-                            let _ = with_deadline(
-                                &*clock,
-                                clock.now().saturating_add(CLOSE_SEND_TIMEOUT),
-                                writer.shutdown(),
-                            )
-                            .await;
-                        }
-                        break;
                     }
                     Either::Right(Ok(WriterDataCmd::E2eBytes(raw))) => {
                         let mtu = mtu_watch.current();
                         if mtu < floor {
-                            err_tx.send(Some(CoreError::MtuTooSmall(mtu)));
+                            let err = CoreError::MtuTooSmall(mtu);
+                            fatal_err = Some(err.clone());
+                            err_tx.send(Some(err));
                             break;
                         }
-                        if let Err(err) = write_st_data_chunks(
-                            &mut *writer,
-                            &raw,
-                            usize::from(mtu).min(STREAM_CHUNK),
-                            &*clock,
-                            &mut chunk_scratch,
+                        match race2(
+                            write_st_data_chunks_tracked(
+                                &mut *writer,
+                                &raw,
+                                usize::from(mtu).min(STREAM_CHUNK),
+                                &*clock,
+                                &mut chunk_scratch,
+                                &mut frame_dirty,
+                            ),
+                            wait_teardown(&mut teardown_rx),
                         )
                         .await
                         {
-                            err_tx.send(Some(err));
-                            break;
+                            Either::Left(Ok(())) => {}
+                            Either::Left(Err(err)) => {
+                                fatal_err = Some(err.clone());
+                                err_tx.send(Some(err));
+                                break;
+                            }
+                            Either::Right(req) => {
+                                teardown_req = req;
+                                break;
+                            }
                         }
                     }
                     Either::Right(Ok(WriterDataCmd::PreFramed(raw))) => {
-                        if let Err(err) = write_frame(&mut *writer, &raw, &*clock).await {
-                            err_tx.send(Some(err));
-                            break;
+                        match race2(
+                            write_frame_tracked(&mut *writer, &raw, &*clock, &mut frame_dirty),
+                            wait_teardown(&mut teardown_rx),
+                        )
+                        .await
+                        {
+                            Either::Left(Ok(())) => {}
+                            Either::Left(Err(err)) => {
+                                fatal_err = Some(err.clone());
+                                err_tx.send(Some(err));
+                                break;
+                            }
+                            Either::Right(req) => {
+                                teardown_req = req;
+                                break;
+                            }
+                        }
+                    }
+                    Either::Right(Ok(WriterDataCmd::HopControl(frame))) => {
+                        match race2(
+                            write_hop_control_tracked(
+                                &mut *writer,
+                                frame.kind,
+                                frame.ttl_or_dist,
+                                &frame.body[..frame.len],
+                                &*clock,
+                                &mut frame_dirty,
+                            ),
+                            wait_teardown(&mut teardown_rx),
+                        )
+                        .await
+                        {
+                            Either::Left(Ok(())) => {}
+                            Either::Left(Err(err)) => {
+                                fatal_err = Some(err.clone());
+                                err_tx.send(Some(err));
+                                break;
+                            }
+                            Either::Right(req) => {
+                                teardown_req = req;
+                                break;
+                            }
                         }
                     }
                     Either::Right(Ok(WriterDataCmd::FlushAck(ack_tx))) => {
@@ -636,20 +795,79 @@ impl StreamWriterHandle {
                     Either::Left(Err(_)) | Either::Right(Err(_)) => break,
                 }
             }
+
+            if fatal_err.is_none() && teardown_req.is_none() {
+                teardown_req = teardown_rx.borrow_cloned();
+            }
+
+            if let Some(req) = teardown_req {
+                if !frame_dirty && !req.close_frames.is_empty() {
+                    let deadline = clock.now().saturating_add(CLOSE_SEND_TIMEOUT);
+                    for frame in &req.close_frames {
+                        let res = with_deadline(
+                            &*clock,
+                            deadline,
+                            write_hop_control(
+                                &mut *writer,
+                                frame.kind,
+                                frame.ttl_or_dist,
+                                &frame.body[..frame.len],
+                                &*clock,
+                            ),
+                        )
+                        .await;
+                        if res.is_err() {
+                            break;
+                        }
+                    }
+                }
+                if req.shutdown_carrier {
+                    let _ = with_deadline(
+                        &*clock,
+                        clock.now().saturating_add(CLOSE_SEND_TIMEOUT),
+                        writer.shutdown(),
+                    )
+                    .await;
+                }
+            }
+
             ctrl_rx.close();
             data_rx.close();
-            // Drain any queued FlushAck/commands immediately so callers awaiting flush_fifo() wake
-            // with the terminal error even while `StreamWriterHandle` still holds `data_tx`.
+            // Drain any queued FlushAck/commands immediately so callers awaiting flush_fifo() or
+            // app Flush wake promptly with the exact terminal error even while handles remain alive.
             while ctrl_rx.try_recv().is_ok() {}
-            while data_rx.try_recv().is_ok() {}
+            while let Ok(cmd) = data_rx.try_recv() {
+                if let WriterDataCmd::FlushAck(ack_tx) = cmd {
+                    if let Some(ref err) = fatal_err {
+                        let _ = ack_tx.try_send(Err(err.clone()));
+                    }
+                }
+            }
+            drop(writer);
             done_tx.send(true);
         }));
 
         Self {
             ctrl_tx,
             data_tx,
+            teardown_tx,
             err_rx,
             done_rx,
+        }
+    }
+
+    pub fn try_send_hop_control(
+        &self,
+        frame: PriorityCtrlFrame,
+    ) -> TryWriterSend<PriorityCtrlFrame> {
+        match self.ctrl_tx.try_send(WriterCtrlCmd::HopControl(frame)) {
+            Ok(()) => TryWriterSend::Sent,
+            Err(async_channel::TrySendError::Full(WriterCtrlCmd::HopControl(frame))) => {
+                TryWriterSend::Full(frame)
+            }
+            Err(async_channel::TrySendError::Closed(_)) => {
+                TryWriterSend::Closed(self.last_error().unwrap_or(CoreError::Closed))
+            }
         }
     }
 
@@ -660,18 +878,30 @@ impl StreamWriterHandle {
             .map_err(|_| self.last_error().unwrap_or(CoreError::Closed))
     }
 
-    pub async fn send_e2e_bytes(&self, sealed: Vec<u8>) -> Result<(), CoreError> {
+    pub fn try_send_data(&self, cmd: WriterDataCmd) -> TryWriterSend<WriterDataCmd> {
+        match self.data_tx.try_send(cmd) {
+            Ok(()) => TryWriterSend::Sent,
+            Err(async_channel::TrySendError::Full(cmd)) => TryWriterSend::Full(cmd),
+            Err(async_channel::TrySendError::Closed(_)) => {
+                TryWriterSend::Closed(self.last_error().unwrap_or(CoreError::Closed))
+            }
+        }
+    }
+
+    pub async fn send_data(&self, cmd: WriterDataCmd) -> Result<(), CoreError> {
         self.data_tx
-            .send(WriterDataCmd::E2eBytes(sealed))
+            .send(cmd)
             .await
             .map_err(|_| self.last_error().unwrap_or(CoreError::Closed))
     }
 
     pub async fn send_preframed(&self, frame: Vec<u8>) -> Result<(), CoreError> {
-        self.data_tx
-            .send(WriterDataCmd::PreFramed(frame))
+        self.send_data(WriterDataCmd::PreFramed(frame)).await
+    }
+
+    pub async fn send_fifo_hop_control(&self, frame: PriorityCtrlFrame) -> Result<(), CoreError> {
+        self.send_data(WriterDataCmd::HopControl(Box::new(frame)))
             .await
-            .map_err(|_| self.last_error().unwrap_or(CoreError::Closed))
     }
 
     /// Waits until all previously enqueued FIFO data items have been written and flushed.
@@ -687,35 +917,18 @@ impl StreamWriterHandle {
         }
     }
 
-    /// Requests best-effort teardown (sending final close frames within 50 ms) and waits for exit.
-    pub async fn teardown(
-        &self,
-        close_frames: Vec<PriorityCtrlFrame>,
-        shutdown_carrier: bool,
-        clock: &dyn Clock,
-    ) {
-        let _ = self
-            .ctrl_tx
-            .try_send(WriterCtrlCmd::Teardown {
-                close_frames,
-                shutdown_carrier,
-            });
+    /// Interrupts any blocked carrier write immediately, executes best-effort teardown (sending
+    /// final close frames within 50 ms when on a clean frame boundary and shutting down the
+    /// carrier within 50 ms), and awaits writer task completion and carrier drop.
+    pub async fn teardown(&self, close_frames: Vec<PriorityCtrlFrame>, shutdown_carrier: bool) {
+        self.teardown_tx.send(Some(Arc::new(TeardownRequest {
+            close_frames,
+            shutdown_carrier,
+        })));
+        self.ctrl_tx.close();
         self.data_tx.close();
         let mut done = self.done_rx.clone();
-        let deadline = clock
-            .now()
-            .saturating_add(CLOSE_SEND_TIMEOUT.saturating_mul(2));
-        let _ = race2(
-            async {
-                while !done.borrow_cloned() {
-                    if !done.changed().await {
-                        break;
-                    }
-                }
-            },
-            clock.sleep_until(deadline),
-        )
-        .await;
+        wait_signal(&mut done).await;
     }
 
     pub fn last_error(&self) -> Option<CoreError> {
@@ -868,5 +1081,121 @@ mod tests {
             }
         });
         assert_eq!(res, Some(()));
+    }
+
+    #[test]
+    fn write_frame_enforces_anchored_3s_deadline_on_stalled_and_late_completion() {
+        use core::task::Context;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Case 1: First write returns a retryable error, anchoring the 3s budget; the second write
+        // stalls forever (Poll::Pending). write_frame MUST fail with Timeout at exactly 3 s.
+        struct StallAfterOneRetryable {
+            calls: AtomicUsize,
+        }
+        impl StreamWrite for StallAfterOneRetryable {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<Result<usize, CoreError>> {
+                if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                    Poll::Ready(Err(CoreError::CarrierFailure {
+                        message: "transient".into(),
+                        transient: true,
+                    }))
+                } else {
+                    Poll::Pending
+                }
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Result<(), CoreError>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Result<(), CoreError>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let rt = TestRuntime::new();
+        let (tx, mut rx) = Watch::new(None::<Result<(), CoreError>>);
+        let clk = Arc::clone(&rt.clock);
+        rt.runtime.spawner.spawn(Box::pin(async move {
+            let mut w = StallAfterOneRetryable {
+                calls: AtomicUsize::new(0),
+            };
+            let res = write_frame(&mut w, b"hello", &*clk).await;
+            tx.send(Some(res));
+        }));
+
+        rt.drive_until_idle();
+        rt.advance_and_drive(Duration::from_millis(2_999));
+        assert_eq!(
+            rx.borrow_cloned(),
+            None,
+            "must not time out before 3s budget"
+        );
+        rt.advance_and_drive(Duration::from_millis(1));
+        assert_eq!(rx.borrow_cloned(), Some(Err(CoreError::Timeout)));
+        rx.mark_seen();
+
+        // Case 2: First write returns a retryable error (anchoring 3s), second write succeeds,
+        // then flush completes with Ok(()) AFTER the clock jumps past 3s -> MUST still return Timeout!
+        struct LateFlushAfterRetryable {
+            writes: AtomicUsize,
+            clock: Arc<crate::testing::VirtualClock>,
+        }
+        impl StreamWrite for LateFlushAfterRetryable {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<Result<usize, CoreError>> {
+                if self.writes.fetch_add(1, Ordering::AcqRel) == 0 {
+                    Poll::Ready(Err(CoreError::CarrierFailure {
+                        message: "transient".into(),
+                        transient: true,
+                    }))
+                } else {
+                    Poll::Ready(Ok(buf.len()))
+                }
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Result<(), CoreError>> {
+                // Simulate a slow synchronous flush completing at/past the 3s anchored budget.
+                self.clock.advance(Duration::from_secs(3));
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Result<(), CoreError>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let rt2 = TestRuntime::new();
+        let (tx2, rx2) = Watch::new(None::<Result<(), CoreError>>);
+        let clk2 = Arc::clone(&rt2.clock);
+        let clk2_w = Arc::clone(&rt2.clock);
+        rt2.runtime.spawner.spawn(Box::pin(async move {
+            let mut w = LateFlushAfterRetryable {
+                writes: AtomicUsize::new(0),
+                clock: clk2_w,
+            };
+            let res = write_frame(&mut w, b"hello", &*clk2).await;
+            tx2.send(Some(res));
+        }));
+
+        rt2.drive_until_idle();
+        rt2.advance_and_drive(Duration::from_millis(10));
+        assert_eq!(rx2.borrow_cloned(), Some(Err(CoreError::Timeout)));
     }
 }

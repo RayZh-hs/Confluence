@@ -609,6 +609,18 @@ pub(crate) async fn wait_shutdown(rx: &mut WatchReceiver<bool>) {
     }
 }
 
+/// Future that waits until a `WatchReceiver<bool>` becomes `true` OR all senders drop.
+pub(crate) async fn wait_signal(rx: &mut WatchReceiver<bool>) {
+    loop {
+        if rx.borrow_cloned() {
+            return;
+        }
+        if !rx.changed().await {
+            return;
+        }
+    }
+}
+
 /// Future that waits until a live `MtuWatch` drops strictly below `floor`, returning the violating MTU.
 pub(crate) async fn wait_mtu_below_floor(
     watch: &mut crate::seam::channel::MtuWatch,

@@ -20,18 +20,19 @@ use crate::constants::{
 use crate::crypto::cipher::{ControlCipher, StreamCipher};
 use crate::engine::context::{
     CredFetchFut, Either, RenewalAuthFut, ScopeCore, SessionPermit, poll_optional, race2,
-    sleep_optional, wait_mtu_below_floor, wait_shutdown, with_deadline,
+    sleep_optional, wait_mtu_below_floor, wait_shutdown, wait_signal, with_deadline,
 };
 use crate::engine::stream::framing::{
-    InboundStreamFrame, PriorityCtrlFrame, StreamFrameReader, StreamWriterHandle,
+    InboundStreamFrame, PriorityCtrlFrame, StreamFrameReader, StreamWriterHandle, TryWriterSend,
+    WriterDataCmd,
 };
 use crate::error::CoreError;
 use crate::protocol::renewal::{
     CredentialFetchOutcome, RenewalAction, RenewalDriver, RenewalSlot, RenewalVerifierState,
     VerifierRenewalAction,
 };
+use crate::runtime::sync::{CloseableSemaphore, SemaphorePermit, Watch, WatchReceiver};
 use crate::runtime::{Clock, MonotonicTime};
-use crate::runtime::sync::{Watch, WatchReceiver};
 use crate::seam::auth::{AuthRequest, CredentialRequest, Lease, StreamAction};
 use crate::seam::channel::{
     ChannelCaps, IntoStreamHalves, MtuWatch, StreamRead, StreamReadExt, StreamWrite,
@@ -50,8 +51,11 @@ use crate::wire::stream::StHopHeader;
 // Public Stream Handles (`E2eStream`, `E2eStreamRead`, `E2eStreamWrite`)
 // ---------------------------------------------------------------------------
 
+const APP_WRITE_CAPACITY: usize = 16;
+const APP_WRITE_CHANNEL_CAPACITY: usize = 64;
+
 enum AppWriteMsg {
-    Data(Vec<u8>),
+    Data(Vec<u8>, SemaphorePermit),
     Flush(async_channel::Sender<Result<(), CoreError>>),
     Shutdown(async_channel::Sender<Result<(), CoreError>>),
 }
@@ -66,6 +70,7 @@ pub struct E2eStreamRead {
     pos: usize,
     eof: bool,
     closed_err: WatchReceiver<Option<CoreError>>,
+    _alive: Watch<()>,
     peer: PublicKey,
 }
 
@@ -148,16 +153,23 @@ impl fmt::Debug for E2eStreamRead {
     }
 }
 
+type PendingPermitFuture =
+    Pin<Box<dyn Future<Output = Result<SemaphorePermit, CoreError>> + Send>>;
 type PendingSendFuture =
     Pin<Box<dyn Future<Output = Result<(), async_channel::SendError<AppWriteMsg>>> + Send>>;
 
 /// Concurrent write half of an established [`E2eStream`] (obtained via [`E2eStream::split`]).
 pub struct E2eStreamWrite {
     tx: async_channel::Sender<AppWriteMsg>,
+    data_sem: Arc<CloseableSemaphore>,
     max_write_size: usize,
     closed_err: WatchReceiver<Option<CoreError>>,
-    pending_send: Option<(PendingSendFuture, usize)>,
+    /// Capacity waiter for backpressured `poll_write` (never captures caller bytes or length!).
+    pending_permit: Option<PendingPermitFuture>,
+    /// Separate pending control-send and ack states for `poll_flush` and `poll_shutdown`.
+    pending_flush_send: Option<PendingSendFuture>,
     flush_rx: Option<AckRx>,
+    pending_shutdown_send: Option<PendingSendFuture>,
     shutdown_rx: Option<AckRx>,
     shutdown_done: bool,
     peer: PublicKey,
@@ -207,51 +219,75 @@ impl StreamWrite for E2eStreamWrite {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, CoreError>> {
-        if self.shutdown_done || self.shutdown_rx.is_some() {
+        if self.shutdown_done
+            || self.shutdown_rx.is_some()
+            || self.pending_shutdown_send.is_some()
+        {
+            self.pending_permit = None;
             return Poll::Ready(Err(CoreError::Closed));
+        }
+        if self.data_sem.is_closed() {
+            self.pending_permit = None;
+            return Poll::Ready(Err(self.terminal_err()));
         }
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
 
-        if let Some((mut fut, accepted_len)) = self.pending_send.take() {
+        // Wait purely for a capacity permit before reading or copying `buf` (ST-03):
+        // cancelling a backpressured write never leaks stale bytes or lengths into later calls.
+        let permit = if let Some(mut fut) = self.pending_permit.take() {
             match fut.as_mut().poll(cx) {
-                Poll::Ready(Ok(())) => return Poll::Ready(Ok(accepted_len)),
+                Poll::Ready(Ok(permit)) => permit,
                 Poll::Ready(Err(_)) => return Poll::Ready(Err(self.terminal_err())),
                 Poll::Pending => {
-                    self.pending_send = Some((fut, accepted_len));
+                    self.pending_permit = Some(fut);
                     return Poll::Pending;
                 }
             }
-        }
-
-        let len = buf.len().min(self.max_write_size.max(1));
-        let msg = AppWriteMsg::Data(buf[..len].to_vec());
-        match self.tx.try_send(msg) {
-            Ok(()) => Poll::Ready(Ok(len)),
-            Err(async_channel::TrySendError::Closed(_)) => Poll::Ready(Err(self.terminal_err())),
-            Err(async_channel::TrySendError::Full(msg)) => {
-                let tx = self.tx.clone();
-                let mut fut: PendingSendFuture = Box::pin(async move { tx.send(msg).await });
-                match fut.as_mut().poll(cx) {
-                    Poll::Ready(Ok(())) => Poll::Ready(Ok(len)),
-                    Poll::Ready(Err(_)) => Poll::Ready(Err(self.terminal_err())),
-                    Poll::Pending => {
-                        self.pending_send = Some((fut, len));
-                        Poll::Pending
+        } else {
+            match self.data_sem.try_acquire() {
+                Ok(permit) => permit,
+                Err(CoreError::Closed) => return Poll::Ready(Err(self.terminal_err())),
+                Err(_) => {
+                    let sem = Arc::clone(&self.data_sem);
+                    let mut fut: PendingPermitFuture = Box::pin(async move { sem.acquire().await });
+                    match fut.as_mut().poll(cx) {
+                        Poll::Ready(Ok(permit)) => permit,
+                        Poll::Ready(Err(_)) => return Poll::Ready(Err(self.terminal_err())),
+                        Poll::Pending => {
+                            self.pending_permit = Some(fut);
+                            return Poll::Pending;
+                        }
                     }
                 }
             }
+        };
+
+        let len = buf.len().min(self.max_write_size.max(1));
+        let msg = AppWriteMsg::Data(buf[..len].to_vec(), permit);
+        match self.tx.try_send(msg) {
+            Ok(()) => {
+                // Any previous uncompleted flush no longer covers this newly accepted data.
+                self.pending_flush_send = None;
+                self.flush_rx = None;
+                Poll::Ready(Ok(len))
+            }
+            Err(async_channel::TrySendError::Closed(_)) => Poll::Ready(Err(self.terminal_err())),
+            Err(async_channel::TrySendError::Full(_)) => Poll::Ready(Err(CoreError::Busy)),
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), CoreError>> {
-        if let Some((mut fut, len)) = self.pending_send.take() {
+        if let Some(mut fut) = self.pending_flush_send.take() {
             match fut.as_mut().poll(cx) {
                 Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(_)) => return Poll::Ready(Err(self.terminal_err())),
+                Poll::Ready(Err(_)) => {
+                    self.flush_rx = None;
+                    return Poll::Ready(Err(self.terminal_err()));
+                }
                 Poll::Pending => {
-                    self.pending_send = Some((fut, len));
+                    self.pending_flush_send = Some(fut);
                     return Poll::Pending;
                 }
             }
@@ -271,7 +307,7 @@ impl StreamWrite for E2eStreamWrite {
                         Poll::Ready(Ok(())) => self.flush_rx = Some(Box::pin(ack_rx)),
                         Poll::Ready(Err(_)) => return Poll::Ready(Err(self.terminal_err())),
                         Poll::Pending => {
-                            self.pending_send = Some((fut, 0));
+                            self.pending_flush_send = Some(fut);
                             self.flush_rx = Some(Box::pin(ack_rx));
                             return Poll::Pending;
                         }
@@ -301,12 +337,21 @@ impl StreamWrite for E2eStreamWrite {
         if self.shutdown_done {
             return Poll::Ready(Ok(()));
         }
-        if let Some((mut fut, len)) = self.pending_send.take() {
+        self.pending_permit = None;
+
+        if let Some(mut fut) = self.pending_shutdown_send.take() {
             match fut.as_mut().poll(cx) {
                 Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(_)) => return Poll::Ready(Err(self.terminal_err())),
+                Poll::Ready(Err(_)) => {
+                    self.shutdown_rx = None;
+                    if self.closed_err.borrow_cloned() == Some(CoreError::Closed) {
+                        self.shutdown_done = true;
+                        return Poll::Ready(Ok(()));
+                    }
+                    return Poll::Ready(Err(self.terminal_err()));
+                }
                 Poll::Pending => {
-                    self.pending_send = Some((fut, len));
+                    self.pending_shutdown_send = Some(fut);
                     return Poll::Pending;
                 }
             }
@@ -329,9 +374,15 @@ impl StreamWrite for E2eStreamWrite {
                     let mut fut: PendingSendFuture = Box::pin(async move { tx.send(msg).await });
                     match fut.as_mut().poll(cx) {
                         Poll::Ready(Ok(())) => self.shutdown_rx = Some(Box::pin(ack_rx)),
-                        Poll::Ready(Err(_)) => return Poll::Ready(Err(self.terminal_err())),
+                        Poll::Ready(Err(_)) => {
+                            if self.closed_err.borrow_cloned() == Some(CoreError::Closed) {
+                                self.shutdown_done = true;
+                                return Poll::Ready(Ok(()));
+                            }
+                            return Poll::Ready(Err(self.terminal_err()));
+                        }
                         Poll::Pending => {
-                            self.pending_send = Some((fut, 0));
+                            self.pending_shutdown_send = Some(fut);
                             self.shutdown_rx = Some(Box::pin(ack_rx));
                             return Poll::Pending;
                         }
@@ -442,6 +493,11 @@ impl E2eStream {
     pub async fn shutdown(&mut self) -> Result<(), CoreError> {
         self.write.shutdown().await
     }
+
+    /// Subscribes to this session's terminal close status (internal bridge supervision, ST-09).
+    pub(crate) fn subscribe_closed(&self) -> WatchReceiver<Option<CoreError>> {
+        self.read.closed_err.clone()
+    }
 }
 
 impl StreamRead for E2eStream {
@@ -539,13 +595,17 @@ pub(crate) struct StreamSessionParams {
 
 enum InboundCtrlMsg {
     HopControl {
+        after_seq: u64,
         hdr: StHopHeader,
         body: [u8; crate::constants::MAX_CONTROL],
         len: usize,
     },
     E2eRenew(Zeroizing<Vec<u8>>),
     E2eRenewOk(Vec<u8>),
-    ReadError(CoreError),
+    ReadError {
+        after_seq: u64,
+        err: CoreError,
+    },
 }
 
 enum InboundDataMsg {
@@ -554,21 +614,191 @@ enum InboundDataMsg {
     CarrierEof,
 }
 
+/// Terminal control/read event causally deferred until all preceding `data_in` records (`<= after_seq`)
+/// have been processed (Spec §6.4 / ST-04).
+enum DeferredTerminal {
+    HopClose {
+        after_seq: u64,
+        dist: u8,
+        reason: CoreError,
+    },
+    ReadError {
+        after_seq: u64,
+        err: CoreError,
+    },
+}
+
+enum TerminalAction {
+    Continue,
+    Terminate(CoreError),
+}
+
+type UnitResultFut = Pin<Box<dyn Future<Output = Result<(), CoreError>> + Send>>;
+
+/// Non-blocking outbound writer queue polled directly inside the session event loop (ST-01).
+///
+/// Preserves strict FIFO order for E2E `StreamCipher` records & `FlushAck`s while keeping
+/// priority hop controls (`hop::ST_RENEW`) on an independent queue.
+struct OutboundWriterQueue {
+    writer: StreamWriterHandle,
+    pending_ctrl: VecDeque<PriorityCtrlFrame>,
+    in_flight_ctrl: Option<UnitResultFut>,
+    pending_data: VecDeque<(WriterDataCmd, Option<SemaphorePermit>)>,
+    in_flight_data: Option<UnitResultFut>,
+}
+
+impl OutboundWriterQueue {
+    fn new(writer: StreamWriterHandle) -> Self {
+        Self {
+            writer,
+            pending_ctrl: VecDeque::new(),
+            in_flight_ctrl: None,
+            pending_data: VecDeque::new(),
+            in_flight_data: None,
+        }
+    }
+
+    fn writer(&self) -> &StreamWriterHandle {
+        &self.writer
+    }
+
+    fn is_data_idle(&self) -> bool {
+        self.in_flight_data.is_none() && self.pending_data.is_empty()
+    }
+
+    fn enqueue_ctrl(&mut self, frame: PriorityCtrlFrame) -> Result<(), CoreError> {
+        if self.in_flight_ctrl.is_none() && self.pending_ctrl.is_empty() {
+            match self.writer.try_send_hop_control(frame) {
+                TryWriterSend::Sent => Ok(()),
+                TryWriterSend::Full(frame) => {
+                    let wh = self.writer.clone();
+                    self.in_flight_ctrl =
+                        Some(Box::pin(async move { wh.send_hop_control(frame).await }));
+                    Ok(())
+                }
+                TryWriterSend::Closed(err) => Err(err),
+            }
+        } else {
+            self.pending_ctrl.push_back(frame);
+            Ok(())
+        }
+    }
+
+    fn pump_ctrl(&mut self) -> Result<(), CoreError> {
+        while self.in_flight_ctrl.is_none() {
+            let Some(frame) = self.pending_ctrl.pop_front() else {
+                break;
+            };
+            match self.writer.try_send_hop_control(frame) {
+                TryWriterSend::Sent => {}
+                TryWriterSend::Full(frame) => {
+                    let wh = self.writer.clone();
+                    self.in_flight_ctrl =
+                        Some(Box::pin(async move { wh.send_hop_control(frame).await }));
+                    break;
+                }
+                TryWriterSend::Closed(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+
+    fn enqueue_data(
+        &mut self,
+        cmd: WriterDataCmd,
+        permit: Option<SemaphorePermit>,
+    ) -> Result<(), CoreError> {
+        if self.in_flight_data.is_none() && self.pending_data.is_empty() {
+            match self.writer.try_send_data(cmd) {
+                TryWriterSend::Sent => {
+                    drop(permit);
+                    Ok(())
+                }
+                TryWriterSend::Full(cmd) => {
+                    let wh = self.writer.clone();
+                    self.in_flight_data = Some(Box::pin(async move {
+                        let _permit = permit;
+                        wh.send_data(cmd).await
+                    }));
+                    Ok(())
+                }
+                TryWriterSend::Closed(err) => Err(err),
+            }
+        } else {
+            self.pending_data.push_back((cmd, permit));
+            Ok(())
+        }
+    }
+
+    fn pump_data(&mut self) -> Result<(), CoreError> {
+        while self.in_flight_data.is_none() {
+            let Some((cmd, permit)) = self.pending_data.pop_front() else {
+                break;
+            };
+            match self.writer.try_send_data(cmd) {
+                TryWriterSend::Sent => drop(permit),
+                TryWriterSend::Full(cmd) => {
+                    let wh = self.writer.clone();
+                    self.in_flight_data = Some(Box::pin(async move {
+                        let _permit = permit;
+                        wh.send_data(cmd).await
+                    }));
+                    break;
+                }
+                TryWriterSend::Closed(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+
+    fn poll_ctrl(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), CoreError>> {
+        poll_optional(&mut self.in_flight_ctrl, cx)
+    }
+
+    fn poll_data(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), CoreError>> {
+        poll_optional(&mut self.in_flight_data, cx)
+    }
+
+    fn fail_pending_waiters(&mut self, err: &CoreError) {
+        self.in_flight_ctrl = None;
+        self.in_flight_data = None;
+        self.pending_ctrl.clear();
+        while let Some((cmd, _)) = self.pending_data.pop_front() {
+            if let WriterDataCmd::FlushAck(ack_tx) = cmd {
+                let _ = ack_tx.try_send(Err(err.clone()));
+            }
+        }
+    }
+}
+
 /// Spawns the steady-state E2E Stream worker (with zero-mutex single-owner writer and
 /// concurrent reader) and returns the [`E2eStream`] handle.
 pub(crate) fn spawn_stream_session(params: StreamSessionParams) -> E2eStream {
     let max_write_size =
         usize::from(params.negotiated_mtu.min(STREAM_CHUNK as u16)).saturating_sub(ST_OVERHEAD);
     let (app_read_tx, app_read_rx) = async_channel::bounded::<Result<Vec<u8>, CoreError>>(16);
-    let (app_write_tx, app_write_rx) = async_channel::bounded::<AppWriteMsg>(16);
+    let (app_write_tx, app_write_rx) =
+        async_channel::bounded::<AppWriteMsg>(APP_WRITE_CHANNEL_CAPACITY);
+    let data_sem = CloseableSemaphore::new(APP_WRITE_CAPACITY);
     let (closed_tx, closed_rx) = Watch::new(None::<CoreError>);
+    let (read_alive_tx, read_alive_rx) = Watch::new(());
 
     let peer = params.peer;
     let negotiated_mtu = params.negotiated_mtu;
     let spawner = Arc::clone(&params.scope.runtime.spawner);
+    let worker_sem = Arc::clone(&data_sem);
 
     spawner.spawn(Box::pin(async move {
-        run_stream_session(params, max_write_size, app_read_tx, app_write_rx, closed_tx).await;
+        run_stream_session(
+            params,
+            max_write_size,
+            app_read_tx,
+            app_write_rx,
+            worker_sem,
+            closed_tx,
+            read_alive_rx,
+        )
+        .await;
     }));
 
     E2eStream {
@@ -578,14 +808,18 @@ pub(crate) fn spawn_stream_session(params: StreamSessionParams) -> E2eStream {
             pos: 0,
             eof: false,
             closed_err: closed_rx.clone(),
+            _alive: read_alive_tx,
             peer,
         },
         write: E2eStreamWrite {
             tx: app_write_tx,
+            data_sem,
             max_write_size,
             closed_err: closed_rx,
-            pending_send: None,
+            pending_permit: None,
+            pending_flush_send: None,
             flush_rx: None,
+            pending_shutdown_send: None,
             shutdown_rx: None,
             shutdown_done: false,
             peer,
@@ -601,7 +835,9 @@ async fn run_stream_session(
     max_write_size: usize,
     app_read_tx: async_channel::Sender<Result<Vec<u8>, CoreError>>,
     app_write_rx: async_channel::Receiver<AppWriteMsg>,
+    data_sem: Arc<CloseableSemaphore>,
     closed_tx: Watch<Option<CoreError>>,
+    mut read_alive_rx: WatchReceiver<()>,
 ) {
     let StreamSessionParams {
         scope,
@@ -636,7 +872,7 @@ async fn run_stream_session(
         }
     }
 
-    // Spawn single-owner writer task (ZERO async mutexes).
+    // Spawn single-owner writer task (ZERO async mutexes, interruptible teardown).
     let writer_handle = StreamWriterHandle::spawn(
         writer,
         mtu_watch.clone(),
@@ -644,78 +880,122 @@ async fn run_stream_session(
         Arc::clone(&clock),
         &*scope.runtime.spawner,
     );
+    let mut outbound = OutboundWriterQueue::new(writer_handle.clone());
 
-    // Spawn concurrent carrier reader task splitting control frames from ordered ST_DATA/ST_FIN.
+    // Spawn concurrent carrier reader task splitting renewal controls from ordered ST_DATA/ST_FIN
+    // with causal `data_seq` tagging (ST-04) and session-termination cancellation (ST-08).
     let (ctrl_in_tx, ctrl_in_rx) = async_channel::bounded::<InboundCtrlMsg>(32);
-    let (data_in_tx, data_in_rx) = async_channel::bounded::<InboundDataMsg>(16);
+    let (data_in_tx, data_in_rx) = async_channel::bounded::<(u64, InboundDataMsg)>(16);
+    let (reader_cancel_tx, mut reader_cancel_rx) = Watch::new(false);
+    let (reader_done_tx, mut reader_done_rx) = Watch::new(false);
     {
         let ctrl_tx = ctrl_in_tx.clone();
         let data_tx = data_in_tx.clone();
         scope.runtime.spawner.spawn(Box::pin(async move {
-            loop {
-                match frame_reader.next_frame(&mut *reader, &mut rx_cipher).await {
-                    Ok(InboundStreamFrame::Eof) => {
-                        let _ = data_tx.send(InboundDataMsg::CarrierEof).await;
-                        break;
-                    }
-                    Ok(InboundStreamFrame::HopControl { hdr, body, len }) => {
-                        if ctrl_tx
-                            .send(InboundCtrlMsg::HopControl { hdr, body, len })
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Ok(InboundStreamFrame::E2eRenew(body)) => {
-                        if ctrl_tx.send(InboundCtrlMsg::E2eRenew(body)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(InboundStreamFrame::E2eRecord { opcode, body }) => match opcode {
-                        e2e_st::ST_DATA => {
-                            if data_tx.send(InboundDataMsg::Data(body)).await.is_err() {
+            let _ = race2(
+                async move {
+                    let mut data_seq: u64 = 0;
+                    loop {
+                        match frame_reader.next_frame(&mut *reader, &mut rx_cipher).await {
+                            Ok(InboundStreamFrame::Eof) => {
+                                data_seq = data_seq.saturating_add(1);
+                                let _ = data_tx.send((data_seq, InboundDataMsg::CarrierEof)).await;
                                 break;
                             }
-                        }
-                        e2e_st::ST_FIN => {
-                            if !body.is_empty() {
+                            Ok(InboundStreamFrame::HopControl { hdr, body, len }) => {
+                                if ctrl_tx
+                                    .send(InboundCtrlMsg::HopControl {
+                                        after_seq: data_seq,
+                                        hdr,
+                                        body,
+                                        len,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Ok(InboundStreamFrame::E2eRenew(body)) => {
+                                if ctrl_tx.send(InboundCtrlMsg::E2eRenew(body)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(InboundStreamFrame::E2eRecord { opcode, body }) => match opcode {
+                                e2e_st::ST_DATA => {
+                                    data_seq = data_seq.saturating_add(1);
+                                    if data_tx
+                                        .send((data_seq, InboundDataMsg::Data(body)))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                e2e_st::ST_FIN => {
+                                    if !body.is_empty() {
+                                        let _ = ctrl_tx
+                                            .send(InboundCtrlMsg::ReadError {
+                                                after_seq: data_seq,
+                                                err: CoreError::Malformed,
+                                            })
+                                            .await;
+                                        break;
+                                    }
+                                    data_seq = data_seq.saturating_add(1);
+                                    if data_tx
+                                        .send((data_seq, InboundDataMsg::Fin))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                e2e_st::ST_RENEW => {
+                                    if ctrl_tx
+                                        .send(InboundCtrlMsg::E2eRenew(Zeroizing::new(body)))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                e2e_st::ST_RENEW_OK => {
+                                    if ctrl_tx
+                                        .send(InboundCtrlMsg::E2eRenewOk(body))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                _ => {
+                                    let _ = ctrl_tx
+                                        .send(InboundCtrlMsg::ReadError {
+                                            after_seq: data_seq,
+                                            err: CoreError::Malformed,
+                                        })
+                                        .await;
+                                    break;
+                                }
+                            },
+                            Err(err) => {
                                 let _ = ctrl_tx
-                                    .send(InboundCtrlMsg::ReadError(CoreError::Malformed))
+                                    .send(InboundCtrlMsg::ReadError {
+                                        after_seq: data_seq,
+                                        err,
+                                    })
                                     .await;
                                 break;
                             }
-                            if data_tx.send(InboundDataMsg::Fin).await.is_err() {
-                                break;
-                            }
                         }
-                        e2e_st::ST_RENEW => {
-                            if ctrl_tx
-                                .send(InboundCtrlMsg::E2eRenew(Zeroizing::new(body)))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        e2e_st::ST_RENEW_OK => {
-                            if ctrl_tx.send(InboundCtrlMsg::E2eRenewOk(body)).await.is_err() {
-                                break;
-                            }
-                        }
-                        _ => {
-                            let _ = ctrl_tx
-                                .send(InboundCtrlMsg::ReadError(CoreError::Malformed))
-                                .await;
-                            break;
-                        }
-                    },
-                    Err(err) => {
-                        let _ = ctrl_tx.send(InboundCtrlMsg::ReadError(err)).await;
-                        break;
                     }
-                }
-            }
+                },
+                wait_signal(&mut reader_cancel_rx),
+            )
+            .await;
+            // `reader`, `frame_reader`, and `rx_cipher` are dropped above before signalling done.
+            reader_done_tx.send(true);
         }));
     }
     drop(ctrl_in_tx);
@@ -730,19 +1010,28 @@ async fn run_stream_session(
     let mut dest_verifier = RenewalVerifierState::new();
     let mut dest_auth_fut: Option<RenewalAuthFut> = None;
 
+    let mut fin_queued = false;
     let mut sent_fin = false;
     let mut received_fin = false;
     let mut carrier_eof = false;
     let mut ctrl_in_closed = false;
     let mut shutdown_initiated = false;
     let mut deferred_shutdown_fin = false;
+    let mut app_read_closed = false;
     let mut app_write_closed = false;
 
-    // Paced TrafficGate delays (never stall control frames!).
+    // Causal inbound ordering state (ST-04).
+    let mut processed_data_seq: u64 = 0;
+    let mut deferred_terminals: VecDeque<DeferredTerminal> = VecDeque::new();
+
+    // Paced TrafficGate delays & non-blocking app/writer states (never stall control frames!).
     let mut delayed_ingress: Option<(Vec<u8>, MonotonicTime)> = None;
-    let mut delayed_egress: Option<(Vec<u8>, MonotonicTime)> = None;
+    let mut delayed_egress: Option<(Vec<u8>, SemaphorePermit, MonotonicTime)> = None;
     let mut pending_app_read: Option<Pin<Box<dyn Future<Output = ()> + Send>>> = None;
     let mut pending_app_writes: VecDeque<AppWriteMsg> = VecDeque::new();
+    let mut pending_fin_ack: Option<UnitResultFut> = None;
+    let mut pending_shutdown_waiters: Vec<async_channel::Sender<Result<(), CoreError>>> =
+        Vec::new();
 
     // Check live MTU immediately at startup and synchronize watch baseline.
     let initial_mtu = mtu_watch.sample();
@@ -750,10 +1039,60 @@ async fn run_stream_session(
         CoreError::MtuTooSmall(initial_mtu)
     } else {
         loop {
+            // 1. Evaluate any causally-deferred terminal events whose preceding data/FIN completed.
+            let mut deferred_fatal: Option<CoreError> = None;
+            while let Some(front) = deferred_terminals.front() {
+                let ready = match front {
+                    DeferredTerminal::HopClose { after_seq, .. } => {
+                        processed_data_seq >= *after_seq
+                    }
+                    DeferredTerminal::ReadError { after_seq, .. } => {
+                        processed_data_seq >= *after_seq
+                            || pending_app_read.is_some()
+                            || delayed_ingress.is_some()
+                    }
+                };
+                if !ready {
+                    break;
+                }
+                let Some(term) = deferred_terminals.pop_front() else {
+                    break;
+                };
+                match term {
+                    DeferredTerminal::HopClose { dist, reason, .. } => {
+                        if let TerminalAction::Terminate(err) = eval_hop_close(
+                            &role,
+                            dist,
+                            reason,
+                            received_fin,
+                            sent_fin,
+                            pending_app_read.is_some(),
+                        ) {
+                            deferred_fatal = Some(err);
+                            break;
+                        }
+                    }
+                    DeferredTerminal::ReadError { err, .. } => {
+                        if received_fin && sent_fin {
+                            if pending_app_read.is_none() {
+                                deferred_fatal = Some(CoreError::Closed);
+                                break;
+                            }
+                        } else {
+                            deferred_fatal = Some(err);
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(err) = deferred_fatal {
+                break err;
+            }
+
             if sent_fin && received_fin && pending_app_read.is_none() {
                 break CoreError::Closed;
             }
-            if app_read_tx.is_closed() && app_write_closed {
+            if (app_read_closed || app_read_tx.is_closed()) && app_write_closed {
                 break CoreError::Closed;
             }
 
@@ -763,21 +1102,25 @@ async fn run_stream_session(
                 StreamSessionRole::Destination(_) => None,
             };
             let ingress_dl = delayed_ingress.as_ref().map(|(_, dl)| *dl);
-            let egress_dl = delayed_egress.as_ref().map(|(_, dl)| *dl);
+            let egress_dl = delayed_egress.as_ref().map(|(_, _, dl)| *dl);
             let next_timer = [renewal_dl, ingress_dl, egress_dl]
                 .into_iter()
                 .flatten()
                 .min();
 
-            // Event step: poll all concurrent sources with zero locks!
+            // Event step: poll ALL concurrent sources including pending writer sends & FIN flush ack!
             enum StepEvent {
                 LeaseCancelled(CoreError),
                 MtuBelowFloor(u16),
                 WriterFailed(CoreError),
                 ScopeShutdown,
+                WriterCtrlSent(Result<(), CoreError>),
+                WriterDataSent(Result<(), CoreError>),
+                FinFlushed(Result<(), CoreError>),
                 CtrlIn(Result<InboundCtrlMsg, async_channel::RecvError>),
-                DataIn(Result<InboundDataMsg, async_channel::RecvError>),
+                DataIn(Result<(u64, InboundDataMsg), async_channel::RecvError>),
                 AppReadDrained,
+                AppReadClosed,
                 AppWrite(Result<AppWriteMsg, async_channel::RecvError>),
                 CredFetched(RenewalSlot, Result<Credential, CoreError>),
                 DestAuthDone(u64, Result<Lease, CoreError>),
@@ -786,8 +1129,8 @@ async fn run_stream_session(
 
             let can_poll_data_in =
                 !carrier_eof && delayed_ingress.is_none() && pending_app_read.is_none();
-            let can_poll_app_write =
-                delayed_egress.is_none() && !app_write_closed && !sent_fin && pending_app_writes.is_empty();
+            // Always observe app_write_rx until closed (even after ST_FIN / under backpressure, ST-06)!
+            let can_poll_app_write = !app_write_closed;
 
             let event = {
                 let mut lease_fut = Box::pin(lease.cancelled());
@@ -814,6 +1157,13 @@ async fn run_stream_session(
                         core::future::pending().await
                     }
                 });
+                let mut read_alive_fut = Box::pin(async {
+                    if app_read_closed {
+                        core::future::pending::<()>().await;
+                    } else {
+                        while read_alive_rx.changed().await {}
+                    }
+                });
                 let mut app_w_fut = Box::pin(async {
                     if can_poll_app_write {
                         app_write_rx.recv().await
@@ -836,6 +1186,15 @@ async fn run_stream_session(
                     if let Poll::Ready(()) = shut_fut.as_mut().poll(cx) {
                         return Poll::Ready(StepEvent::ScopeShutdown);
                     }
+                    if let Poll::Ready(res) = outbound.poll_ctrl(cx) {
+                        return Poll::Ready(StepEvent::WriterCtrlSent(res));
+                    }
+                    if let Poll::Ready(res) = outbound.poll_data(cx) {
+                        return Poll::Ready(StepEvent::WriterDataSent(res));
+                    }
+                    if let Poll::Ready(res) = poll_optional(&mut pending_fin_ack, cx) {
+                        return Poll::Ready(StepEvent::FinFlushed(res));
+                    }
                     if let Poll::Ready(msg) = ctrl_fut.as_mut().poll(cx) {
                         return Poll::Ready(StepEvent::CtrlIn(msg));
                     }
@@ -843,12 +1202,17 @@ async fn run_stream_session(
                         return Poll::Ready(StepEvent::DestAuthDone(id, res));
                     }
                     if !cred_futs.is_empty() {
-                        if let Poll::Ready(Some((slot, res))) = Pin::new(&mut cred_futs).poll_next(cx) {
+                        if let Poll::Ready(Some((slot, res))) =
+                            Pin::new(&mut cred_futs).poll_next(cx)
+                        {
                             return Poll::Ready(StepEvent::CredFetched(slot, res));
                         }
                     }
                     if let Poll::Ready(()) = poll_optional(&mut pending_app_read, cx) {
                         return Poll::Ready(StepEvent::AppReadDrained);
+                    }
+                    if let Poll::Ready(()) = read_alive_fut.as_mut().poll(cx) {
+                        return Poll::Ready(StepEvent::AppReadClosed);
                     }
                     if let Poll::Ready(()) = timer_fut.as_mut().poll(cx) {
                         return Poll::Ready(StepEvent::TimerFired);
@@ -868,42 +1232,84 @@ async fn run_stream_session(
                 StepEvent::LeaseCancelled(err) => break err,
                 StepEvent::MtuBelowFloor(mtu) => break CoreError::MtuTooSmall(mtu),
                 StepEvent::WriterFailed(err) => {
-                    if sent_fin && received_fin {
+                    if sent_fin && received_fin && pending_app_read.is_none() {
+                        break CoreError::Closed;
+                    }
+                    break err;
+                }
+                StepEvent::WriterCtrlSent(Ok(())) => {
+                    if let Err(err) = outbound.pump_ctrl() {
+                        break err;
+                    }
+                }
+                StepEvent::WriterCtrlSent(Err(err)) | StepEvent::WriterDataSent(Err(err)) => {
+                    if sent_fin && received_fin && pending_app_read.is_none() {
+                        break CoreError::Closed;
+                    }
+                    break err;
+                }
+                StepEvent::WriterDataSent(Ok(())) => {
+                    if let Err(err) = outbound.pump_data() {
+                        break err;
+                    }
+                }
+                StepEvent::FinFlushed(Ok(())) => {
+                    sent_fin = true;
+                    for tx in pending_shutdown_waiters.drain(..) {
+                        let _ = tx.try_send(Ok(()));
+                    }
+                }
+                StepEvent::FinFlushed(Err(err)) => {
+                    if sent_fin && received_fin && pending_app_read.is_none() {
                         break CoreError::Closed;
                     }
                     break err;
                 }
                 StepEvent::ScopeShutdown => {
                     shutdown_initiated = true;
-                    if !sent_fin {
+                    data_sem.close();
+                    if !fin_queued {
                         if delayed_egress.is_some() {
                             deferred_shutdown_fin = true;
-                        } else {
-                            // Initiate authenticated ST_FIN with no drain timeout bound (Spec §6.8).
-                            if let Err(err) =
-                                seal_and_send_e2e(&mut tx_cipher, e2e_st::ST_FIN, &[], &mut e2e_scratch, &writer_handle).await
-                            {
-                                break err;
-                            }
-                            let _ = writer_handle.flush_fifo().await;
-                            sent_fin = true;
+                        } else if let Err(err) = initiate_fin(
+                            &data_sem,
+                            &mut fin_queued,
+                            &mut tx_cipher,
+                            &mut e2e_scratch,
+                            &mut outbound,
+                            &mut pending_fin_ack,
+                        ) {
+                            break err;
                         }
                     }
                 }
                 StepEvent::CtrlIn(Err(_)) => {
                     ctrl_in_closed = true;
                     // Reader exited; data_in_rx will deliver any trailing Eof or Fin.
-                    if received_fin && sent_fin {
+                    if received_fin && sent_fin && pending_app_read.is_none() {
                         break CoreError::Closed;
                     }
                 }
-                StepEvent::CtrlIn(Ok(InboundCtrlMsg::ReadError(err))) => {
-                    if sent_fin && received_fin {
-                        break CoreError::Closed;
+                StepEvent::CtrlIn(Ok(InboundCtrlMsg::ReadError { after_seq, err })) => {
+                    if processed_data_seq < after_seq
+                        && pending_app_read.is_none()
+                        && delayed_ingress.is_none()
+                    {
+                        deferred_terminals.push_back(DeferredTerminal::ReadError { after_seq, err });
+                    } else if received_fin && sent_fin {
+                        if pending_app_read.is_none() {
+                            break CoreError::Closed;
+                        }
+                    } else {
+                        break err;
                     }
-                    break err;
                 }
-                StepEvent::CtrlIn(Ok(InboundCtrlMsg::HopControl { hdr, body, len })) => {
+                StepEvent::CtrlIn(Ok(InboundCtrlMsg::HopControl {
+                    after_seq,
+                    hdr,
+                    body,
+                    len,
+                })) => {
                     let wire_body = &body[..len];
                     match &mut role {
                         StreamSessionRole::Origin(orig) => {
@@ -926,28 +1332,38 @@ async fn run_stream_session(
                                         Ok(e) => e,
                                         Err(e) => break e,
                                     };
-                                    if received_fin && sent_fin {
-                                        break CoreError::Closed;
-                                    }
-                                    // Spec §6.4: Once ST_FIN is received, hop ST_CLOSE(Closed/UnexpectedEof)
-                                    // does NOT abort outbound half until local ST_FIN is also sent.
-                                    if received_fin
-                                        && !sent_fin
-                                        && matches!(decoded, CoreError::Closed | CoreError::UnexpectedEof)
-                                    {
-                                        continue;
-                                    }
-                                    if dist == n {
-                                        break decoded;
-                                    } else {
-                                        break CoreError::hop_rejected(hdr.ttl_or_dist, decoded);
+                                    let should_defer = processed_data_seq < after_seq
+                                        && (matches!(
+                                            decoded,
+                                            CoreError::Closed | CoreError::UnexpectedEof
+                                        ) || (sent_fin
+                                            && pending_app_read.is_none()
+                                            && delayed_ingress.is_none()));
+                                    if should_defer {
+                                        deferred_terminals.push_back(DeferredTerminal::HopClose {
+                                            after_seq,
+                                            dist: hdr.ttl_or_dist,
+                                            reason: decoded,
+                                        });
+                                    } else if let TerminalAction::Terminate(err) = eval_hop_close(
+                                        &role,
+                                        hdr.ttl_or_dist,
+                                        decoded,
+                                        received_fin,
+                                        sent_fin,
+                                        pending_app_read.is_some(),
+                                    ) {
+                                        break err;
                                     }
                                 }
                                 outer::ST_RENEW_OK => {
                                     if dist >= n {
                                         break CoreError::Authentication;
                                     }
-                                    let pt = match orig.hops[dist].2.open(outer::ST_RENEW_OK, wire_body) {
+                                    let pt = match orig.hops[dist]
+                                        .2
+                                        .open(outer::ST_RENEW_OK, wire_body)
+                                    {
                                         Ok(pt) => pt,
                                         Err(err) => break err,
                                     };
@@ -993,16 +1409,29 @@ async fn run_stream_session(
                                     Ok(e) => e,
                                     Err(e) => break e,
                                 };
-                                if received_fin && sent_fin {
-                                    break CoreError::Closed;
+                                let should_defer = processed_data_seq < after_seq
+                                    && (matches!(
+                                        decoded,
+                                        CoreError::Closed | CoreError::UnexpectedEof
+                                    ) || (sent_fin
+                                        && pending_app_read.is_none()
+                                        && delayed_ingress.is_none()));
+                                if should_defer {
+                                    deferred_terminals.push_back(DeferredTerminal::HopClose {
+                                        after_seq,
+                                        dist: 0,
+                                        reason: decoded,
+                                    });
+                                } else if let TerminalAction::Terminate(err) = eval_hop_close(
+                                    &role,
+                                    0,
+                                    decoded,
+                                    received_fin,
+                                    sent_fin,
+                                    pending_app_read.is_some(),
+                                ) {
+                                    break err;
                                 }
-                                if received_fin
-                                    && !sent_fin
-                                    && matches!(decoded, CoreError::Closed | CoreError::UnexpectedEof)
-                                {
-                                    continue;
-                                }
-                                break decoded;
                             } else {
                                 break CoreError::Malformed;
                             }
@@ -1028,15 +1457,14 @@ async fn run_stream_session(
                             };
                             let rem_ms = u64::try_from(rem.as_millis()).unwrap_or(u64::MAX).max(1);
                             let payload = encode_renew_ok_payload(ack_id, rem_ms);
-                            if let Err(err) = seal_and_send_e2e(
+                            if let Err(err) = seal_and_queue_e2e(
                                 &mut tx_cipher,
                                 e2e_st::ST_RENEW_OK,
                                 &payload,
                                 &mut e2e_scratch,
-                                &writer_handle,
-                            )
-                            .await
-                            {
+                                &mut outbound,
+                                None,
+                            ) {
                                 break err;
                             }
                         }
@@ -1104,8 +1532,8 @@ async fn run_stream_session(
                 }
                 StepEvent::DestAuthDone(id, res) => match res {
                     Ok(new_lease) => {
-                        if let Err(err) =
-                            lease.renew_lease_with_max_ttl(new_lease, scope.auth_limits.max_lease_ttl)
+                        if let Err(err) = lease
+                            .renew_lease_with_max_ttl(new_lease, scope.auth_limits.max_lease_ttl)
                         {
                             scope
                                 .metrics
@@ -1126,15 +1554,14 @@ async fn run_stream_session(
                         };
                         let rem_ms = u64::try_from(rem.as_millis()).unwrap_or(u64::MAX).max(1);
                         let payload = encode_renew_ok_payload(id, rem_ms);
-                        if let Err(err) = seal_and_send_e2e(
+                        if let Err(err) = seal_and_queue_e2e(
                             &mut tx_cipher,
                             e2e_st::ST_RENEW_OK,
                             &payload,
                             &mut e2e_scratch,
-                            &writer_handle,
-                        )
-                        .await
-                        {
+                            &mut outbound,
+                            None,
+                        ) {
                             break err;
                         }
                     }
@@ -1164,17 +1591,15 @@ async fn run_stream_session(
                             renewal_id,
                             credential,
                         } => {
-                            if let Err(err) = send_origin_stream_renewal(
+                            if let Err(err) = queue_origin_stream_renewal(
                                 slot,
                                 renewal_id,
                                 &credential,
                                 &mut tx_cipher,
                                 &mut orig.hops,
                                 &mut e2e_scratch,
-                                &writer_handle,
-                            )
-                            .await
-                            {
+                                &mut outbound,
+                            ) {
                                 break err;
                             }
                         }
@@ -1207,41 +1632,37 @@ async fn run_stream_session(
                         }
                     }
                     // 2. Check delayed egress write (Destination TrafficGate).
-                    if let Some((_, dl)) = &delayed_egress {
+                    if let Some((_, _, dl)) = &delayed_egress {
                         if now >= *dl {
-                            if let Some((data, _)) = delayed_egress.take() {
+                            if let Some((data, permit, _)) = delayed_egress.take() {
                                 if let Err(err) = lease.remaining() {
                                     break err;
                                 }
                                 let len = data.len();
-                                if let Err(err) = seal_and_send_e2e(
+                                if let Err(err) = seal_and_queue_e2e(
                                     &mut tx_cipher,
                                     e2e_st::ST_DATA,
                                     &data,
                                     &mut e2e_scratch,
-                                    &writer_handle,
-                                )
-                                .await
-                                {
+                                    &mut outbound,
+                                    Some(permit),
+                                ) {
                                     break err;
                                 }
                                 scope.metrics.record_tx(Plane::Stream, len as u64, false);
 
-                                if deferred_shutdown_fin && !sent_fin {
+                                if deferred_shutdown_fin && !fin_queued {
                                     deferred_shutdown_fin = false;
-                                    if let Err(err) = seal_and_send_e2e(
+                                    if let Err(err) = initiate_fin(
+                                        &data_sem,
+                                        &mut fin_queued,
                                         &mut tx_cipher,
-                                        e2e_st::ST_FIN,
-                                        &[],
                                         &mut e2e_scratch,
-                                        &writer_handle,
-                                    )
-                                    .await
-                                    {
+                                        &mut outbound,
+                                        &mut pending_fin_ack,
+                                    ) {
                                         break err;
                                     }
-                                    let _ = writer_handle.flush_fifo().await;
-                                    sent_fin = true;
                                 }
                             }
                         }
@@ -1278,12 +1699,12 @@ async fn run_stream_session(
                                     }
                                     let (verifier, target_name) = match slot {
                                         RenewalSlot::Endpoint => (peer, orig.endpoint.clone()),
-                                        RenewalSlot::Hop(i) => (orig.hops[i].0, orig.hops[i].1.clone()),
+                                        RenewalSlot::Hop(i) => {
+                                            (orig.hops[i].0, orig.hops[i].1.clone())
+                                        }
                                     };
-                                    let timeout = scope
-                                        .auth_limits
-                                        .auth_timeout
-                                        .min(remaining / 2);
+                                    let timeout =
+                                        scope.auth_limits.auth_timeout.min(remaining / 2);
                                     let deadline = clock.now().saturating_add(timeout);
                                     let creds = Arc::clone(&scope.credentials);
                                     let clk = Arc::clone(&clock);
@@ -1334,17 +1755,15 @@ async fn run_stream_session(
                                             .renewal_retries
                                             .fetch_add(1, Ordering::Relaxed);
                                     }
-                                    if let Err(err) = send_origin_stream_renewal(
+                                    if let Err(err) = queue_origin_stream_renewal(
                                         slot,
                                         renewal_id,
                                         &credential,
                                         &mut tx_cipher,
                                         &mut orig.hops,
                                         &mut e2e_scratch,
-                                        &writer_handle,
-                                    )
-                                    .await
-                                    {
+                                        &mut outbound,
+                                    ) {
                                         fatal_err = Some(err);
                                         break;
                                     }
@@ -1357,19 +1776,38 @@ async fn run_stream_session(
                     }
                 }
                 StepEvent::AppReadDrained => {}
-                StepEvent::DataIn(Err(_)) | StepEvent::DataIn(Ok(InboundDataMsg::CarrierEof)) => {
+                StepEvent::AppReadClosed => {
+                    app_read_closed = true;
+                    if app_write_closed {
+                        break CoreError::Closed;
+                    }
+                }
+                StepEvent::DataIn(Err(_)) => {
+                    carrier_eof = true;
+                    processed_data_seq = u64::MAX;
+                    if !received_fin {
+                        break CoreError::UnexpectedEof;
+                    }
+                    if sent_fin && pending_app_read.is_none() {
+                        break CoreError::Closed;
+                    }
+                    data_in_rx.close();
+                }
+                StepEvent::DataIn(Ok((seq, InboundDataMsg::CarrierEof))) => {
+                    processed_data_seq = seq;
                     carrier_eof = true;
                     if !received_fin {
                         break CoreError::UnexpectedEof;
                     }
-                    if sent_fin {
+                    if sent_fin && pending_app_read.is_none() {
                         break CoreError::Closed;
                     }
                     // Spec §6.4: Once ST_FIN is received, carrier EOF does NOT abort outbound half
                     // until local ST_FIN is also sent!
                     data_in_rx.close();
                 }
-                StepEvent::DataIn(Ok(InboundDataMsg::Fin)) => {
+                StepEvent::DataIn(Ok((seq, InboundDataMsg::Fin))) => {
+                    processed_data_seq = seq;
                     if received_fin {
                         // Duplicate ST_FIN is Malformed (Spec §5.8.2).
                         break CoreError::Malformed;
@@ -1377,7 +1815,8 @@ async fn run_stream_session(
                     received_fin = true;
                     enqueue_app_read(&app_read_tx, Ok(Vec::new()), &mut pending_app_read);
                 }
-                StepEvent::DataIn(Ok(InboundDataMsg::Data(body))) => {
+                StepEvent::DataIn(Ok((seq, InboundDataMsg::Data(body)))) => {
+                    processed_data_seq = seq;
                     if received_fin {
                         // ST_DATA after ST_FIN is Malformed (Spec §5.8.2).
                         break CoreError::Malformed;
@@ -1409,7 +1848,7 @@ async fn run_stream_session(
                 }
                 StepEvent::AppWrite(Err(_)) => {
                     app_write_closed = true;
-                    if app_read_tx.is_closed() {
+                    if app_read_closed || app_read_tx.is_closed() {
                         break CoreError::Closed;
                     }
                 }
@@ -1418,15 +1857,47 @@ async fn run_stream_session(
                 }
             }
 
-            // Drain any pending app writes while not egress-delayed.
+            // Drain pending app writes non-blockingly (ST-01, ST-06):
+            // - Once `fin_queued` is true, immediately discard any stray Data and service Flush/Shutdown.
+            // - Otherwise, drain while neither egress-delayed nor waiting on writer backpressure.
             let mut fatal_write: Option<CoreError> = None;
-            while delayed_egress.is_none() {
+            loop {
+                if fin_queued {
+                    let Some(msg) = pending_app_writes.pop_front() else {
+                        break;
+                    };
+                    match msg {
+                        AppWriteMsg::Data(_, _permit) => {}
+                        AppWriteMsg::Flush(ack_tx) => {
+                            if sent_fin {
+                                let _ = ack_tx.try_send(Ok(()));
+                            } else if let Err(err) =
+                                outbound.enqueue_data(WriterDataCmd::FlushAck(ack_tx), None)
+                            {
+                                fatal_write = Some(err);
+                                break;
+                            }
+                        }
+                        AppWriteMsg::Shutdown(ack_tx) => {
+                            if sent_fin {
+                                let _ = ack_tx.try_send(Ok(()));
+                            } else {
+                                pending_shutdown_waiters.push(ack_tx);
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                if delayed_egress.is_some() || !outbound.is_data_idle() {
+                    break;
+                }
                 let Some(msg) = pending_app_writes.pop_front() else {
                     break;
                 };
                 match msg {
-                    AppWriteMsg::Data(data) => {
-                        if sent_fin {
+                    AppWriteMsg::Data(data, permit) => {
+                        if deferred_shutdown_fin {
                             continue;
                         }
                         if matches!(role, StreamSessionRole::Destination(_)) {
@@ -1435,7 +1906,7 @@ async fn run_stream_session(
                                     StreamAction::Allow => {}
                                     StreamAction::Delay(d) => {
                                         let dl = clock.now().saturating_add(d);
-                                        delayed_egress = Some((data, dl));
+                                        delayed_egress = Some((data, permit, dl));
                                         break;
                                     }
                                     StreamAction::Close(err) => {
@@ -1446,53 +1917,41 @@ async fn run_stream_session(
                             }
                         }
                         let len = data.len();
-                        if let Err(err) = seal_and_send_e2e(
+                        if let Err(err) = seal_and_queue_e2e(
                             &mut tx_cipher,
                             e2e_st::ST_DATA,
                             &data,
                             &mut e2e_scratch,
-                            &writer_handle,
-                        )
-                        .await
-                        {
+                            &mut outbound,
+                            Some(permit),
+                        ) {
                             fatal_write = Some(err);
                             break;
                         }
                         scope.metrics.record_tx(Plane::Stream, len as u64, false);
                     }
                     AppWriteMsg::Flush(ack_tx) => {
-                        let res = writer_handle.flush_fifo().await;
-                        let _ = ack_tx.try_send(res.clone());
-                        if let Err(err) = res {
+                        if let Err(err) =
+                            outbound.enqueue_data(WriterDataCmd::FlushAck(ack_tx), None)
+                        {
                             fatal_write = Some(err);
                             break;
                         }
                     }
                     AppWriteMsg::Shutdown(ack_tx) => {
-                        if !sent_fin {
-                            if let Err(err) = seal_and_send_e2e(
-                                &mut tx_cipher,
-                                e2e_st::ST_FIN,
-                                &[],
-                                &mut e2e_scratch,
-                                &writer_handle,
-                            )
-                            .await
-                            {
-                                let _ = ack_tx.try_send(Err(err.clone()));
-                                fatal_write = Some(err);
-                                break;
-                            }
-                            let res = writer_handle.flush_fifo().await;
-                            let _ = ack_tx.try_send(res.clone());
-                            if let Err(err) = res {
-                                fatal_write = Some(err);
-                                break;
-                            }
-                            sent_fin = true;
-                        } else {
-                            let _ = ack_tx.try_send(Ok(()));
+                        if let Err(err) = initiate_fin(
+                            &data_sem,
+                            &mut fin_queued,
+                            &mut tx_cipher,
+                            &mut e2e_scratch,
+                            &mut outbound,
+                            &mut pending_fin_ack,
+                        ) {
+                            let _ = ack_tx.try_send(Err(err.clone()));
+                            fatal_write = Some(err);
+                            break;
                         }
+                        pending_shutdown_waiters.push(ack_tx);
                     }
                 }
             }
@@ -1508,17 +1967,41 @@ async fn run_stream_session(
         "stream session terminating"
     );
 
-    // Notify local app handles of terminal status.
+    // 1. Publish terminal status to local app handles & bridge supervisor BEFORE closing queues.
     closed_tx.send(Some(terminal_reason.clone()));
+    data_sem.close();
     if !received_fin {
         let _ = app_read_tx.try_send(Err(terminal_reason.clone()));
     }
     app_read_tx.close();
     app_write_rx.close();
 
-    // Teardown per Spec §6.4:
-    // - Origin: best-effort 50 ms hop::ST_CLOSE(reason) to hops N-1..0, shut down carrier, report PathOutcome.
-    // - Destination: best-effort 50 ms hop::ST_CLOSE(reason) (ttl = 0, terminal_key) + carrier shutdown ONLY if reason != Closed.
+    // Wake any pending flush/shutdown waiters deterministically with the terminal error.
+    for tx in pending_shutdown_waiters.drain(..) {
+        let _ = tx.try_send(Err(terminal_reason.clone()));
+    }
+    while let Some(msg) = pending_app_writes.pop_front() {
+        match msg {
+            AppWriteMsg::Flush(tx) | AppWriteMsg::Shutdown(tx) => {
+                let _ = tx.try_send(Err(terminal_reason.clone()));
+            }
+            AppWriteMsg::Data(_, _) => {}
+        }
+    }
+    outbound.fail_pending_waiters(&terminal_reason);
+    drop(pending_fin_ack);
+    drop(pending_app_read);
+    drop(delayed_egress);
+
+    // 2. Cancel carrier reader task immediately (ST-08).
+    reader_cancel_tx.send(true);
+    ctrl_in_rx.close();
+    data_in_rx.close();
+
+    // 3. Teardown writer task (interrupting blocked carrier writes, ST-01) per Spec §6.4:
+    //    - Origin: best-effort 50 ms hop::ST_CLOSE(reason) to hops N-1..0, shut down carrier, report PathOutcome.
+    //    - Destination: best-effort 50 ms hop::ST_CLOSE(reason) (ttl = 0, terminal_key) ONLY if reason != Closed,
+    //      plus carrier shutdown.
     let err_bytes = encode_wire_error_bytes(&terminal_reason);
     match &mut role {
         StreamSessionRole::Origin(orig) => {
@@ -1534,7 +2017,7 @@ async fn run_stream_session(
                     }
                 }
             }
-            writer_handle.teardown(close_frames, true, &*clock).await;
+            writer_handle.teardown(close_frames, true).await;
             let outcome = if terminal_reason == CoreError::Closed {
                 PathOutcome::Closed
             } else {
@@ -1550,13 +2033,49 @@ async fn run_stream_session(
                         close_frames.push(frame);
                     }
                 }
-                writer_handle.teardown(close_frames, true, &*clock).await;
-            } else {
-                // Clean close: flush carrier shutdown without sending hop::ST_CLOSE.
-                writer_handle.teardown(close_frames, true, &*clock).await;
             }
+            writer_handle.teardown(close_frames, true).await;
         }
     }
+
+    // 4. Await carrier reader task completion before releasing `_session_permit` (ST-08).
+    wait_signal(&mut reader_done_rx).await;
+}
+
+fn eval_hop_close(
+    role: &StreamSessionRole,
+    dist: u8,
+    reason: CoreError,
+    received_fin: bool,
+    sent_fin: bool,
+    pending_app_read: bool,
+) -> TerminalAction {
+    if received_fin && sent_fin {
+        return if pending_app_read {
+            TerminalAction::Continue
+        } else {
+            TerminalAction::Terminate(CoreError::Closed)
+        };
+    }
+    // Spec §6.4: Once ST_FIN is received, hop ST_CLOSE(Closed/UnexpectedEof)
+    // does NOT abort outbound half until local ST_FIN is also sent.
+    if received_fin
+        && !sent_fin
+        && matches!(reason, CoreError::Closed | CoreError::UnexpectedEof)
+    {
+        return TerminalAction::Continue;
+    }
+    let err = match role {
+        StreamSessionRole::Origin(orig) => {
+            if usize::from(dist) == orig.hops.len() {
+                reason
+            } else {
+                CoreError::hop_rejected(dist, reason)
+            }
+        }
+        StreamSessionRole::Destination(_) => reason,
+    };
+    TerminalAction::Terminate(err)
 }
 
 fn enqueue_app_read(
@@ -1572,30 +2091,58 @@ fn enqueue_app_read(
     }
 }
 
-async fn seal_and_send_e2e(
+fn seal_and_queue_e2e(
     tx_cipher: &mut StreamCipher,
     opcode: u8,
     body: &[u8],
     scratch: &mut Vec<u8>,
-    writer: &StreamWriterHandle,
+    outbound: &mut OutboundWriterQueue,
+    permit: Option<SemaphorePermit>,
 ) -> Result<(), CoreError> {
     tx_cipher.seal_into(opcode, body, scratch)?;
-    writer.send_e2e_bytes(scratch.clone()).await
+    outbound.enqueue_data(WriterDataCmd::E2eBytes(scratch.clone()), permit)
 }
 
-async fn send_origin_stream_renewal(
+fn initiate_fin(
+    data_sem: &CloseableSemaphore,
+    fin_queued: &mut bool,
+    tx_cipher: &mut StreamCipher,
+    e2e_scratch: &mut Vec<u8>,
+    outbound: &mut OutboundWriterQueue,
+    pending_fin_ack: &mut Option<UnitResultFut>,
+) -> Result<(), CoreError> {
+    data_sem.close();
+    if *fin_queued {
+        return Ok(());
+    }
+    *fin_queued = true;
+    tx_cipher.seal_into(e2e_st::ST_FIN, &[], e2e_scratch)?;
+    outbound.enqueue_data(WriterDataCmd::E2eBytes(e2e_scratch.clone()), None)?;
+    let (fin_tx, fin_rx) = async_channel::bounded::<Result<(), CoreError>>(1);
+    outbound.enqueue_data(WriterDataCmd::FlushAck(fin_tx), None)?;
+    let wh = outbound.writer().clone();
+    *pending_fin_ack = Some(Box::pin(async move {
+        match fin_rx.recv().await {
+            Ok(res) => res,
+            Err(_) => Err(wh.last_error().unwrap_or(CoreError::Closed)),
+        }
+    }));
+    Ok(())
+}
+
+fn queue_origin_stream_renewal(
     slot: RenewalSlot,
     renewal_id: u64,
     credential: &Credential,
     tx_cipher: &mut StreamCipher,
     hops: &mut [(PublicKey, String, ControlCipher)],
     scratch: &mut Vec<u8>,
-    writer: &StreamWriterHandle,
+    outbound: &mut OutboundWriterQueue,
 ) -> Result<(), CoreError> {
     let payload = encode_renew_payload(renewal_id, credential.as_bytes())?;
     match slot {
         RenewalSlot::Endpoint => {
-            seal_and_send_e2e(tx_cipher, e2e_st::ST_RENEW, &payload, scratch, writer).await
+            seal_and_queue_e2e(tx_cipher, e2e_st::ST_RENEW, &payload, scratch, outbound, None)
         }
         RenewalSlot::Hop(i) => {
             let ttl = u8::try_from(i).map_err(|_| CoreError::Malformed)?;
@@ -1605,7 +2152,7 @@ async fn send_origin_stream_renewal(
                 .2
                 .seal(outer::ST_RENEW, &payload)?;
             let frame = PriorityCtrlFrame::from_slice(outer::ST_RENEW, ttl, &sealed)?;
-            writer.send_hop_control(frame).await
+            outbound.enqueue_ctrl(frame)
         }
     }
 }

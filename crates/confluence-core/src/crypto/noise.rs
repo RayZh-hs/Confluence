@@ -43,7 +43,7 @@ pub(crate) fn nonce_from_seq(seq: u64) -> Nonce {
 }
 
 /// Symmetric Noise_IK state zeroized on drop.
-#[derive(Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 struct NoiseState {
     ck: [u8; 32],
     h: [u8; 32],
@@ -368,11 +368,15 @@ impl Initiator {
         self.hop_key
     }
 
-    /// Processes Destination's 58-byte Noise_IK Message 2 reply and derives `(dest_mtu, dest_ttl_ms, SessionKeys)`.
-    pub fn finish_message2(
-        mut self,
+    /// Non-consuming verification of Destination's 58-byte Noise_IK Message 2 reply.
+    ///
+    /// Used on the Datagram plane so spoofed/corrupted `SETUP_OK` packets can be silently
+    /// ignored without consuming the active handshake state (Spec §6.1 Step 7).
+    pub fn try_finish_message2(
+        &self,
         reply: &[u8; REPLY_LEN],
-    ) -> Result<(u16, u64, SessionKeys, HopKey), CoreError> {
+    ) -> Result<(u16, u64, SessionKeys), CoreError> {
+        let mut state = self.state.clone();
         let mut e_r_bytes = [0u8; 32];
         e_r_bytes.copy_from_slice(&reply[0..32]);
         let e_r = X25519PublicKey::from(e_r_bytes);
@@ -380,20 +384,27 @@ impl Initiator {
         let mut tag = [0u8; 16];
         tag.copy_from_slice(&reply[42..58]);
 
-        self.state.mix_hash(&e_r_bytes);
-        self.state
-            .mix_key(self.ephemeral.diffie_hellman(&e_r).to_bytes())?;
-        self.state
-            .mix_key(self.static_secret.diffie_hellman(&e_r).to_bytes())?;
+        state.mix_hash(&e_r_bytes);
+        state.mix_key(self.ephemeral.diffie_hellman(&e_r).to_bytes())?;
+        state.mix_key(self.static_secret.diffie_hellman(&e_r).to_bytes())?;
 
         let mut ack = [0u8; 10];
-        self.state.decrypt_into(&reply[32..42], &tag, &mut ack)?;
+        state.decrypt_into(&reply[32..42], &tag, &mut ack)?;
 
         let dest_mtu = u16::from_be_bytes([ack[0], ack[1]]);
         let mut ttl_bytes = [0u8; 8];
         ttl_bytes.copy_from_slice(&ack[2..10]);
         let dest_ttl_ms = u64::from_be_bytes(ttl_bytes);
-        let keys = self.state.split_session_keys(true);
+        let keys = state.split_session_keys(true);
+        Ok((dest_mtu, dest_ttl_ms, keys))
+    }
+
+    /// Processes Destination's 58-byte Noise_IK Message 2 reply and derives `(dest_mtu, dest_ttl_ms, SessionKeys)`.
+    pub fn finish_message2(
+        self,
+        reply: &[u8; REPLY_LEN],
+    ) -> Result<(u16, u64, SessionKeys, HopKey), CoreError> {
+        let (dest_mtu, dest_ttl_ms, keys) = self.try_finish_message2(reply)?;
         Ok((dest_mtu, dest_ttl_ms, keys, self.hop_key))
     }
 }

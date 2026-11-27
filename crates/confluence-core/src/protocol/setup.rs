@@ -344,6 +344,98 @@ impl OriginSetupState {
             responder_cid: hdr.responder_cid,
         })
     }
+
+    /// Datagram-safe `SETUP_OK` verifier (Spec §6.1 Step 7).
+    ///
+    /// Returns:
+    /// - `Ok(None)` if the packet is malformed, CID-mismatched, or fails Noise/trailer AEAD
+    ///   authentication (spoofed/stray packet -> caller silently ignores and keeps waiting).
+    /// - `Err(err)` if the packet IS cryptographically authentic but fails post-auth validation
+    ///   (invalid wire TTL or `path_mtu < min_mtu`).
+    /// - `Ok(Some(established))` on full authentication and validation (consuming `*slot`).
+    pub fn try_finish_datagram_ok(
+        slot: &mut Option<Self>,
+        expected_target_cid: Cid,
+        wire: &[u8],
+    ) -> Result<Option<OriginEstablished>, CoreError> {
+        let Some(state) = slot.as_ref() else {
+            return Err(CoreError::Closed);
+        };
+        if state.plane != Plane::Datagram {
+            return Err(CoreError::Malformed);
+        }
+        let Ok((hdr, reply, trailers)) = SetupOkHeader::parse(wire) else {
+            return Ok(None);
+        };
+        if hdr.target_cid != expected_target_cid || hdr.responder_cid.is_unbound() {
+            return Ok(None);
+        }
+        let n = state.hops.len();
+        if usize::from(hdr.hop_acks) != n {
+            return Ok(None);
+        }
+
+        // Authenticate Destination Noise Message 2 without consuming state.
+        let Ok((dest_local_mtu, dest_ttl_ms, session_keys)) =
+            state.dest_init.try_finish_message2(reply)
+        else {
+            return Ok(None);
+        };
+
+        // Authenticate all reverse-ordered hop trailers without consuming state.
+        let mut hop_raw = Vec::with_capacity(n);
+        for (i, hop_slot) in state.hops.iter().enumerate() {
+            let offset = (n - 1 - i) * HOP_ACK_SIZE;
+            let Ok(trailer): Result<&[u8; HOP_ACK_SIZE], _> =
+                trailers[offset..offset + HOP_ACK_SIZE].try_into()
+            else {
+                return Ok(None);
+            };
+            let Ok((hop_mtu, hop_ttl_ms)) = hop_slot.initiator.hop_key().open_setup_hop_ack(trailer)
+            else {
+                return Ok(None);
+            };
+            hop_raw.push((hop_mtu, hop_ttl_ms));
+        }
+
+        // Authentic SETUP_OK: post-auth validation errors DO fail setup!
+        let dest_ttl = validate_wire_ttl_ms(dest_ttl_ms)?;
+        let mut legs = Vec::with_capacity(n + 2);
+        legs.push(state.origin_local_mtu);
+        let mut hop_ttls = Vec::with_capacity(n);
+        for (hop_mtu, hop_ttl_ms) in hop_raw {
+            let hop_ttl = validate_wire_ttl_ms(hop_ttl_ms)?;
+            legs.push(hop_mtu);
+            hop_ttls.push(hop_ttl);
+        }
+        legs.push(dest_local_mtu);
+
+        let path_mtu = legs.iter().copied().min().unwrap_or(0);
+        if path_mtu < state.min_mtu {
+            return Err(CoreError::MtuTooSmall(path_mtu));
+        }
+
+        let Some(owned) = slot.take() else {
+            return Err(CoreError::Closed);
+        };
+        let terminal_hop_key = owned.dest_init.into_hop_key();
+        let hop_keys = owned
+            .hops
+            .into_iter()
+            .map(|h| h.initiator.into_hop_key())
+            .collect();
+
+        Ok(Some(OriginEstablished {
+            session_keys,
+            terminal_hop_key,
+            hop_keys,
+            dest_ttl,
+            hop_ttls,
+            legs,
+            path_mtu,
+            responder_cid: hdr.responder_cid,
+        }))
+    }
 }
 
 /// Parameters for [`HopSetupRewrite::rewrite_ok`].

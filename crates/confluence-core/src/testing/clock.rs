@@ -274,7 +274,11 @@ impl TestSpawner {
     /// Polls all ready tasks in FIFO order until no ready tasks remain, returning poll count.
     pub fn drive_until_idle(&self) -> usize {
         let mut polls = 0usize;
-        while let Some(task) = lock_unpoisoned(&self.queue).pop_front() {
+        loop {
+            let task = { lock_unpoisoned(&self.queue).pop_front() };
+            let Some(task) = task else {
+                break;
+            };
             task.queued.store(false, Ordering::Release);
             let mut slot = lock_unpoisoned(&task.future);
             let Some(mut fut) = slot.take() else {

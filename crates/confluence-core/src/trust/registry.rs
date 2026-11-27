@@ -52,6 +52,7 @@ pub struct ResolvedEndpoint {
 }
 
 #[allow(dead_code)]
+#[derive(Clone)]
 pub enum ResolvedTransitHandler {
     Stream(Arc<dyn StreamTransitHandler>),
     Datagram(Arc<dyn DatagramTransitHandler>),

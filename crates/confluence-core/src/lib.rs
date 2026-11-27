@@ -15,6 +15,89 @@
 //! - [`runtime`] — Executor-agnostic monotonic [`runtime::Clock`], [`runtime::TaskSpawner`], and [`runtime::Runtime`].
 //! - [`stats`] — Immutable atomic telemetry snapshots (`ScopeStats`, `NodeStats`).
 //! - [`constants`] — Normative v1 wire and behavioral protocol constants.
+//!
+//! # Quick Start Example
+//!
+//! (Requires the `test-support` feature for the in-memory channel & virtual runtime harness.)
+//!
+//! ```rust
+//! # #[cfg(feature = "test-support")]
+//! # fn main() {
+//! use std::sync::Arc;
+//! use std::time::Duration;
+//! use confluence_core::auth::{AuthDenied, AuthRequest, Authorizer, Lease};
+//! use confluence_core::channel::{BoxedStream, IntoStreamHalves, StreamReadExt, StreamWriteExt};
+//! use confluence_core::handler::StreamEndpointHandler;
+//! use confluence_core::path::ExplicitPath;
+//! use confluence_core::runtime::BoxFuture;
+//! use confluence_core::testing::{MemoryStreamPair, TestRuntime, memory_stream_channel};
+//! use confluence_core::{Node, ScopeInstance, ScopeKeypair};
+//!
+//! struct AllowAll;
+//! impl Authorizer for AllowAll {
+//!     fn authorize<'a>(&'a self, _req: AuthRequest<'a>) -> BoxFuture<'a, Result<Lease, AuthDenied>> {
+//!         Box::pin(async { Ok(Lease::new(Duration::from_secs(60))) })
+//!     }
+//! }
+//!
+//! struct EchoEndpoint {
+//!     rt: TestRuntime,
+//! }
+//! impl StreamEndpointHandler for EchoEndpoint {
+//!     fn open(&self, _auth: confluence_core::auth::SessionAuth) -> BoxFuture<'_, Result<BoxedStream, confluence_core::CoreError>> {
+//!         Box::pin(async {
+//!             let pair = MemoryStreamPair::pair(16_384);
+//!             let (mut r, mut w) = pair.b.into_halves();
+//!             self.rt.runtime.spawner.spawn(Box::pin(async move {
+//!                 let mut buf = [0u8; 64];
+//!                 while let Ok(n) = r.read(&mut buf).await {
+//!                     if n == 0 {
+//!                         let _ = w.shutdown().await;
+//!                         break;
+//!                     }
+//!                     if w.write_all(&buf[..n]).await.is_err() {
+//!                         break;
+//!                     }
+//!                 }
+//!             }));
+//!             Ok(BoxedStream::from_stream(pair.a))
+//!         })
+//!     }
+//! }
+//!
+//! let tr = TestRuntime::new();
+//! let origin = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone()).build();
+//! let dest = ScopeInstance::builder(ScopeKeypair::generate(), tr.runtime.clone())
+//!     .with_authorizer(Arc::new(AllowAll))
+//!     .build();
+//! let node = Node::builder(tr.runtime.clone()).build();
+//! node.add_scope(Arc::clone(&dest)).unwrap();
+//!
+//! let (carrier, listener, _mtu) = memory_stream_channel(16_384);
+//! origin.register_stream_carrier("mem", carrier).unwrap();
+//! let _guard = dest.publish_stream_endpoint("echo", Arc::new(EchoEndpoint { rt: tr.clone() })).unwrap();
+//!
+//! let node_srv = Arc::clone(&node);
+//! tr.runtime.spawner.spawn(Box::pin(async move {
+//!     let _ = node_srv.serve_stream_listener(listener).await;
+//! }));
+//!
+//! let res = tr.spawner.try_block_on(async {
+//!     let path = ExplicitPath::direct(1, "mem", b"dest".to_vec());
+//!     let mut st = origin.dial_stream_via(dest.public_key(), "echo", path).await?;
+//!     st.write_all(b"hello").await?;
+//!     st.shutdown().await?;
+//!     let mut out = [0u8; 5];
+//!     st.read_exact(&mut out).await?;
+//!     assert_eq!(&out, b"hello");
+//!     assert_eq!(st.read(&mut out).await?, 0);
+//!     Ok::<(), confluence_core::CoreError>(())
+//! });
+//! assert_eq!(res, Some(Ok(())));
+//! # }
+//! # #[cfg(not(feature = "test-support"))]
+//! # fn main() {}
+//! ```
 
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -31,17 +114,18 @@ pub mod runtime;
 mod seam;
 
 // Layer 2 — Pure v1 cryptography & wire codecs (zero async I/O, zero mutual dependency)
-// Consumed by Layer 4–5 engines (Phase 3B) and verified via `test-support` conformance tests.
-#[cfg_attr(not(feature = "test-support"), allow(dead_code))]
 mod crypto;
-#[cfg_attr(not(feature = "test-support"), allow(dead_code))]
 mod wire;
 
 // Layer 3 — Pure protocol state machines & trust/publication enforcement (zero mutual dependency)
-#[cfg_attr(not(feature = "test-support"), allow(dead_code))]
 mod protocol;
-#[cfg_attr(not(feature = "test-support"), allow(dead_code))]
 mod trust;
+
+// Layer 4 — Async Stream & Datagram plane engines (zero imports from `host`)
+mod engine;
+
+// Layer 5 — Multi-scope `Node` container & `ScopeInstance` public facade
+mod host;
 
 // Deterministic testing harness (compiled for unit/integration tests and `test-support` feature)
 #[cfg(any(test, feature = "test-support"))]
@@ -91,7 +175,12 @@ pub mod handler {
 // ---------------------------------------------------------------------------
 
 pub use crate::crypto::{ScopeKeypair, SecretHex};
+pub use crate::engine::context::ScopeLimits;
+pub use crate::engine::datagram::session::E2eDatagram;
+pub use crate::engine::origin::{StagedDatagram, StagedStream};
+pub use crate::engine::stream::session::{E2eStream, E2eStreamRead, E2eStreamWrite};
 pub use crate::error::{CoreError, FailureClass};
+pub use crate::host::{Node, NodeBuilder, NodeLimits, ScopeBuilder, ScopeInstance, WeakNode, WeakScope};
 pub use crate::packet::PacketBuf;
 pub use crate::seam::auth::{DenyAllAuthorizer, EmptyCredentials};
 pub use crate::seam::handler::{DynamicTransit, StaticTransit};
@@ -106,15 +195,18 @@ pub use crate::types::{
 // Internal Test-Only White-Box Conformance Bridge
 // ---------------------------------------------------------------------------
 // Exposes internal Layer 2/3 pure primitives solely under `#[cfg(feature = "test-support")]`
-// or `#[cfg(test)]` so external integration test binaries (`tests/primitives.rs`) with custom
-// `#[global_allocator]` can directly verify zero-allocation hot paths and v1 wire conformance.
+// so external integration test binaries (`tests/primitives.rs`) with custom `#[global_allocator]`
+// can directly verify zero-allocation hot paths and v1 wire conformance.
 #[doc(hidden)]
 #[cfg(feature = "test-support")]
 #[allow(missing_docs)]
 pub mod __conformance {
-    pub use crate::stats::internal::ScopeMetrics;
-    pub use crate::crypto::cipher::{ControlCipher, DatagramRx, DatagramTx, ReplayWindow, StreamCipher};
-    pub use crate::crypto::cookie::{CookieDecision, CookieProtector, LoadTracker, unseal_cookie_challenge};
+    pub use crate::crypto::cipher::{
+        ControlCipher, DatagramRx, DatagramTx, ReplayWindow, StreamCipher,
+    };
+    pub use crate::crypto::cookie::{
+        CookieDecision, CookieProtector, LoadTracker, unseal_cookie_challenge,
+    };
     pub use crate::crypto::identity::{
         compute_mac1, compute_mac2, derive_cookie_enc_key, derive_mac1_key, derive_mac2_key,
         derive_scope_kid,
@@ -139,6 +231,7 @@ pub mod __conformance {
         validate_wire_ttl_ms,
     };
     pub use crate::protocol::slab::SlabTable;
+    pub use crate::stats::internal::ScopeMetrics;
     pub use crate::trust::gate::{AuthGate, PendingSetup};
     pub use crate::trust::lease::{LeaseHandle, TrafficGateCache};
     pub use crate::trust::registry::PublishRegistry;
